@@ -11,6 +11,7 @@ import OvbRc003Settings 1.0
 Item {
     id: root
     property var tokens
+    MappingPresetsDialog { id: mappingPresetsDialog; tokens: root.tokens }
     readonly property var leftButtonIds: SettingsController.isRc003Device
         ? ["power", "up", "left", "back", "home", "menu"]
         : ["up", "left", "down", "back", "home", "youtube", "power"]
@@ -1025,7 +1026,7 @@ Item {
                     CompactToolTip {
                         tokens: root.tokens
                         active: longGestureTitleHover.hovered
-                        text: qsTr("按住约 0.55 秒触发一次；设置双击或长按后，此键不再支持按住连发")
+                        text: qsTr("按住约 0.55 秒触发；鼠标长按保持到松手，其它动作触发一次；设置后不再支持按住连发")
                     }
                 }
                 RowLayout {
@@ -1038,7 +1039,7 @@ Item {
                         tokens: root.tokens
                     Layout.fillWidth: true
                     enabled: !actionEditor.primaryIsVoice
-                    model: SettingsController.secondaryActionOptionsFor(actionEditor.buttonId)
+                    model: SettingsController.longPressActionOptionsFor(actionEditor.buttonId)
                     Accessible.name: actionEditor.buttonName + qsTr("长按动作")
                     onEditTextChanged: {
                             if (!actionEditor.syncing)
@@ -1177,7 +1178,17 @@ Item {
                     : Math.max(height, leftSideCards.implicitHeight, rightSideCards.implicitHeight)
                 flickableDirection: Flickable.VerticalFlick
                 boundsBehavior: Flickable.StopAtBounds
-                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                ScrollBar.vertical: ScrollBar {
+                    objectName: "mappingScrollBar"
+                    policy: ScrollBar.AsNeeded
+                    // Use the page gutter, not the right-hand mapping cards.
+                    // Reparent outside both the clipping Flickable and its
+                    // ColumnLayout so neither can position the bar over content.
+                    parent: rc003MappingLayout
+                    x: mappingList.parent.x + mappingList.x + mappingList.width
+                    y: mappingList.parent.y + mappingList.y
+                    height: mappingList.height
+                }
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 Layout.minimumHeight: 306
@@ -1562,6 +1573,16 @@ Item {
                         compactMinimumWidth: tokens.buttonWidth6Chars
                         text: qsTr("恢复内置默认")
                         onClicked: restoreMappingDefaultsDialog.open()
+                        KeyNavigation.tab: manageMappingPresetsButton
+                    }
+                    CompactButton {
+                        id: manageMappingPresetsButton
+                        objectName: "manageMappingPresetsButton"
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth6Chars
+                        text: qsTr("管理按键配置")
+                        enabled: !SettingsController.settingsSaveBusy && !SettingsController.keyDetectionActive
+                        onClicked: mappingPresetsDialog.open()
                         KeyNavigation.tab: root.tabTarget
                     }
                 }
