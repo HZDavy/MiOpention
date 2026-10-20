@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiOpention · 把遥控器变成 Windows 的输入设备</title>
+<meta name="description" content="MiOpention 是一个开源的 Windows 小工具：把小米蓝牙语音遥控器 2 Pro 的按键和麦克风变成快捷键与语音输入。">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<style>
+  :root{
+    --bg:#F7F6F2;
+    --ink:#16181D;
+    --muted:#6B7280;
+    --line:#E4E1D8;
+    --brand:#2F6BFF;
+    --card:#FFFFFF;
+    --radius:18px;
+    --max:1120px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--bg);
+    color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    font-size:16px;
+    line-height:1.7;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:inherit;text-decoration:none}
+  img{display:block;max-width:100%}
+  .wrap{width:min(calc(100% - 48px),var(--max));margin:0 auto}
+  .mono{font-family:ui-monospace,"SFMono-Regular",Consolas,monospace;font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+
+  /* nav */
+  header{
+    position:sticky;top:0;z-index:50;
+    background:rgba(247,246,242,.92);
+    border-bottom:1px solid var(--line);
+  }
+  .nav{display:flex;align-items:center;gap:28px;height:68px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:650;letter-spacing:-.01em}
+  .brand svg{width:26px;height:26px;flex:none}
+  .nav-links{display:flex;gap:24px;margin-left:auto;font-size:14px;color:var(--muted)}
+  .nav-links a:hover{color:var(--ink)}
+  .nav-cta{
+    font-size:14px;padding:9px 16px;border-radius:999px;
+    background:var(--ink);color:#fff;white-space:nowrap;
+  }
+
+  /* hero */
+  .hero{padding:96px 0 88px;border-bottom:1px solid var(--line)}
+  .hero .mono{margin-bottom:26px}
+  .hero h1{
+    font-size:clamp(42px,7.2vw,86px);
+    line-height:1.04;
+    letter-spacing:-.035em;
+    font-weight:600;
+    max-width:15em;
+  }
+  .hero h1 span{color:#A6A39A}
+  .hero p.lead{
+    margin-top:30px;max-width:34em;font-size:18px;color:#4B4F58;
+  }
+  .actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:38px}
+  .btn{
+    display:inline-flex;align-items:center;gap:10px;
+    padding:13px 22px;border-radius:999px;font-size:15px;font-weight:550;
+    border:1px solid transparent;transition:transform .18s ease,background .18s ease;
+  }
+  .btn:hover{transform:translateY(-1px)}
+  .btn-primary{background:var(--brand);color:#fff}
+  .btn-ghost{border-color:#CFCCC2;color:var(--ink);background:transparent}
+  .hero-meta{margin-top:26px;display:flex;flex-wrap:wrap;gap:8px 22px;font-size:13px;color:var(--muted)}
+
+  /* sections */
+  section{padding:88px 0;border-bottom:1px solid var(--line)}
+  .sec-head{display:flex;align-items:baseline;gap:22px;margin-bottom:38px}
+  .sec-head h2{
+    font-size:clamp(30px,4.4vw,52px);line-height:1.14;letter-spacing:-.03em;font-weight:600;
+  }
+  .sec-head h2 em{font-style:normal;color:#A6A39A}
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:64px;align-items:center}
+  .copy p{color:#4B4F58;max-width:30em}
+  .copy p + p{margin-top:16px}
+
+  .list{list-style:none;margin-top:26px;border-top:1px solid var(--line)}
+  .list li{display:flex;gap:18px;padding:18px 0;border-bottom:1px solid var(--line)}
+  .list b{font-weight:600;min-width:6.5em}
+  .list span{color:var(--muted);font-size:14px}
+
+  .shot{
+    background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+    padding:12px;box-shadow:0 18px 50px -30px rgba(20,24,35,.35);
+  }
+  .shot img{border-radius:10px;width:100%}
+  .caption{margin-top:12px;font-size:12px;color:var(--muted);text-align:center}
+
+  /* steps */
+  .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;margin-top:46px}
+  .step{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:26px}
+  .step .idx{font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--brand);letter-spacing:.12em}
+  .step h3{margin:14px 0 8px;font-size:19px;font-weight:600;letter-spacing:-.01em}
+  .step p{color:var(--muted);font-size:14px}
+  .step code{font-size:12.5px;background:#F1EFE9;padding:2px 6px;border-radius:5px}
+
+  /* statement */
+  .statement{max-width:44em}
+  .statement p{font-size:clamp(24px,3.2vw,38px);line-height:1.34;letter-spacing:-.025em;font-weight:500}
+  .statement p span{color:#A6A39A}
+  .statement .note{margin-top:26px;font-size:14px;color:var(--muted);max-width:36em;line-height:1.8}
+
+  /* download */
+  .download{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:32px}
+  .download h2{font-size:clamp(30px,4.4vw,52px);line-height:1.16;letter-spacing:-.03em;font-weight:600}
+  .download .meta{margin-top:14px;font-size:13px;color:var(--muted)}
+  .dl-card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:24px;min-width:300px}
+
+  /* guide */
+  #guide ol{counter-reset:g;list-style:none;border-top:1px solid var(--line);margin-top:8px}
+  #guide ol li{counter-increment:g;display:grid;grid-template-columns:44px 1fr;gap:18px;padding:20px 0;border-bottom:1px solid var(--line)}
+  #guide ol li::before{content:counter(g,decimal-leading-zero);font-family:ui-monospace,Consolas,monospace;font-size:12px;color:var(--brand);padding-top:4px}
+  #guide li b{display:block;font-weight:600;margin-bottom:4px}
+  #guide li span{color:var(--muted);font-size:14px}
+
+  footer{padding:52px 0 64px;color:var(--muted);font-size:13px}
+  .foot{display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between;align-items:center}
+  .foot a:hover{color:var(--ink)}
+  .foot-links{display:flex;gap:22px}
+
+  .reveal{opacity:0;transform:translateY(18px);transition:opacity .7s cubic-bezier(.22,.61,.36,1),transform .7s cubic-bezier(.22,.61,.36,1)}
+  .reveal.in{opacity:1;transform:none}
+
+  @media (max-width:860px){
+    .nav-links{display:none}
+    .hero{padding:72px 0 64px}
+    section{padding:64px 0}
+    .split{grid-template-columns:1fr;gap:36px}
+    .steps{grid-template-columns:1fr}
+    .download{flex-direction:column;align-items:flex-start}
+    .dl-card{width:100%}
+  }
+  @media (prefers-reduced-motion:reduce){
+    html{scroll-behavior:auto}
+    .reveal{opacity:1;transform:none;transition:none}
+    .btn{transition:none}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap nav">
+    <a class="brand" href="#top" aria-label="MiOpention 首页">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <rect width="24" height="24" rx="5.4" fill="#2F6BFF"/>
+        <rect x="8.1" y="4.6" width="7.8" height="14.8" rx="2.3" stroke="#fff" stroke-width="1.35"/>
+        <circle cx="12" cy="8.3" r="1.55" stroke="#fff" stroke-width="1.35"/>
+        <path d="M10.7 13.2h2.6M10.7 15.6h2.6" stroke="#fff" stroke-width="1.35" stroke-linecap="round"/>
+      </svg>
+      MiOpention
+    </a>
+    <nav class="nav-links" aria-label="页面导航">
+      <a href="#buttons">按键</a>
+      <a href="#voice">语音</a>
+      <a href="#apps">按应用</a>
+      <a href="#download">下载</a>
+      <a href="#guide">使用</a>
+    </nav>
+    <a class="nav-cta" href="https://github.com/HZDavy/MiOpention" target="_blank" rel="noopener">GitHub</a>
+  </div>
+</header>
+
+<main id="top">
+  <section class="hero">
+    <div class="wrap">
+      <p class="mono">MiOpention · Windows 10 / 11</p>
+      <h1>把遥控器，<br><span>变成你的输入设备。</span></h1>
+      <p class="lead">小米蓝牙语音遥控器 2 Pro 的每一个按键、每一次说话，都能直接落到 Windows 上：切应用、翻文档、按住说话、触发快捷键。坐在沙发上，也能把电脑用得顺手。</p>
+      <div class="actions">
+        <a class="btn btn-primary" href="https://github.com/HZDavy/MiOpention/releases/latest">下载 Windows 版</a>
+        <a class="btn btn-ghost" href="https://github.com/HZDavy/MiOpention" target="_blank" rel="noopener">查看源码</a>
+      </div>
+      <div class="hero-meta">
+        <span>开源 · GPL-3.0</span>
+        <span>免安装 ZIP</span>
+        <span>本地运行，不上传数据</span>
+        <span>当前版本 0.1.0</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="buttons">
+    <div class="wrap split">
+      <div class="copy reveal">
+        <div class="sec-head">
+          <span class="mono">01 / 按键</span>
+          <h2>一个按键，<br><em>三种按法。</em></h2>
+        </div>
+        <p>单击、双击、长按可以分别设置动作。方向键可以变成方向键，也可以变成音量、快捷键、鼠标点击，或者打开一个应用。</p>
+        <ul class="list">
+          <li><b>方向与确认</b><span>移动光标、翻页、确认，按你的习惯重新排。</span></li>
+          <li><b>组合快捷键</b><span>Ctrl+C、Alt+Tab 这类组合键可以直接映射到遥控器。</span></li>
+          <li><b>驱动级注入</b><span>可选用 Interception 驱动，让长按和组合键更接近真实键盘。</span></li>
+        </ul>
+      </div>
+      <figure class="shot reveal">
+        <img src="assets/xiaomi-buttons.jpg" alt="MiOpention 按键映射界面" loading="lazy">
+        <figcaption class="caption">按键映射：选中遥控器上的按键，分别设置单击、双击与长按。</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section id="voice">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <span class="mono">02 / 语音</span>
+        <h2>按住说话，<br><em>松手就是文字。</em></h2>
+      </div>
+      <p class="copy reveal" style="max-width:34em;color:#4B4F58">遥控器自带麦克风，或者电脑上插着的麦克风都行。MiOpention 把声音送进输入法，输入法负责把话变成字——搜狗、微信、豆包都可以。</p>
+      <div class="steps">
+        <div class="step reveal">
+          <div class="idx">STEP 01</div>
+          <h3>选麦克风</h3>
+          <p>遥控器模式直接用遥控器收音；本机模式用电脑麦克风，语音键可以绑到任意按键。</p>
+        </div>
+        <div class="step reveal">
+          <div class="idx">STEP 02</div>
+          <h3>对齐快捷键</h3>
+          <p>在 MiOpention 和输入法里填同一个语音快捷键。输出端点选 <code>CABLE Input</code>，输入法麦克风选 <code>CABLE Output</code>。</p>
+        </div>
+        <div class="step reveal">
+          <div class="idx">STEP 03</div>
+          <h3>按住说</h3>
+          <p>先在记事本里用键盘试一次快捷键，再用遥控器按住说话。短按补偿可以按输入法的习惯开关。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="apps">
+    <div class="wrap split">
+      <figure class="shot reveal">
+        <img src="assets/device-overview.jpg" alt="MiOpention 设备与连接界面" loading="lazy">
+        <figcaption class="caption">设备页：选择遥控器、启动服务、查看连接状态。</figcaption>
+      </figure>
+      <div class="copy reveal">
+        <div class="sec-head">
+          <span class="mono">03 / 按应用</span>
+          <h2>换一个窗口，<br><em>换一套按键。</em></h2>
+        </div>
+        <p>浏览器里方向键用来翻页，剪辑软件里用来逐帧，阅读器里用来滚动。为不同应用各存一套按键布局，切过去就自动生效。</p>
+        <p>没配置的按键回落到全局映射，不会因为忘了设置而失灵。配置可以复制、重命名、导出和导入。</p>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <span class="mono">04 / 数据边界</span>
+        <h2>先说清楚，<br><em>数据去哪儿。</em></h2>
+      </div>
+      <div class="statement reveal">
+        <p>遥控器地址、按键记录、录音、配置和日志，<span>只留在你自己的电脑上。</span></p>
+        <p class="note">MiOpention 不设账号、不上传录音，也不会把按键记录发给任何服务器。检查更新只向 GitHub 读取公开的发布信息。需要结束程序时，从通知区域选择“完全退出”。</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="download">
+    <div class="wrap download">
+      <div class="reveal">
+        <span class="mono">05 / 下载</span>
+        <h2 style="margin-top:18px">现在，<br>把遥控器拿起来。</h2>
+        <p class="meta">Windows 10 1809 及以上 · 64 位 · 未签名免安装包</p>
+      </div>
+      <div class="dl-card reveal">
+        <div class="mono">最新版本</div>
+        <div style="font-size:30px;font-weight:600;letter-spacing:-.02em;margin:6px 0 4px">0.1.0</div>
+        <p style="color:var(--muted);font-size:13px;margin-bottom:18px">完整解压 ZIP，再运行文件夹顶层的 MiOpention 0.1.0.exe。</p>
+        <div class="actions" style="margin-top:0">
+          <a class="btn btn-primary" href="https://github.com/HZDavy/MiOpention/releases/download/v0.1.0/MiOpention-0.1.0-免安装.zip">下载 ZIP</a>
+          <a class="btn btn-ghost" href="https://github.com/HZDavy/MiOpention/releases">全部版本</a>
+        </div>
+        <p style="color:var(--muted);font-size:12px;margin-top:16px">SHA-256 清单随发布页提供；首次运行若遇 SmartScreen，选择“更多信息 → 仍要运行”。</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="guide">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <span class="mono">使用</span>
+        <h2>第一次使用，<br><em>三步就够。</em></h2>
+      </div>
+      <ol class="reveal">
+        <li><div><b>连接遥控器</b><span>在 Windows 蓝牙设置里配对，再在 MiOpention 的“设备”页选择设备并启动服务，按提示处理未就绪的项目。</span></div></li>
+        <li><div><b>设置按键</b><span>到“按键”页选中遥控器按键，设置单击、双击或长按动作，点“完成”即保存。</span></div></li>
+        <li><div><b>设置语音</b><span>在“语音”页安装音频组件，填好与输入法一致的语音快捷键，输出端点选 CABLE Input，输入法麦克风选 CABLE Output。</span></div></li>
+        <li><div><b>完全退出</b><span>关闭设置窗口只是隐藏到通知区域；需要结束时右键通知区域图标，选择“完全退出”。</span></div></li>
+      </ol>
+      <p style="margin-top:26px;font-size:14px;color:var(--muted)">更细的配对、音频与排障步骤见 <a href="https://github.com/HZDavy/MiOpention/blob/main/apps/windows/rc003/README.md" style="color:var(--brand)">使用说明</a>。</p>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap foot">
+    <div>MiOpention · 个人开源项目，与小米／米家官方无关联。</div>
+    <div class="foot-links">
+      <a href="https://github.com/HZDavy/MiOpention" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/HZDavy/MiOpention/releases" target="_blank" rel="noopener">Releases</a>
+      <a href="https://github.com/HZDavy/MiOpention/issues" target="_blank" rel="noopener">Issues</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  (function () {
+    var items = document.querySelectorAll('.reveal');
+    if (!('IntersectionObserver' in window) ||
+        window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      items.forEach(function (el) { el.classList.add('in'); });
+      return;
+    }
+    var observer = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('in');
+          observer.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.12, rootMargin: '0px 0px -40px 0px' });
+    items.forEach(function (el) { observer.observe(el); });
+  })();
+</script>
+
+</body>
+</html>
