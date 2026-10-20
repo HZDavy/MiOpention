@@ -173,14 +173,6 @@ branding is included.
 
 ## Separately licensed assets and software
 
-### Chromecast product photo
-
-`Resources/Chromecast-remote-photo.png` is the user-supplied photo selected on
-2026-09-16 for the Chromecast mapping page. It was imported without changing
-pixels. The copyright owner confirmed on 2026-09-24 that this unchanged image
-may be publicly redistributed with Remote Mic. See `ASSET_LICENSES.md` for the
-permission boundary; this notice does not grant broader reuse or modification.
-
 ### RC003 product photo
 
 The bundled file `Resources/RC003-remote-photo.png` was independently created
@@ -207,6 +199,34 @@ as administrator under the current public-version workaround. It never reports a
 successful merely because a process was launched. Users may obtain the same
 package directly from VB-Audio and are encouraged to support the vendor through
 its Donationware model.
+
+### Interception
+
+- Project: Interception (oblitum/Interception)
+- Source: <https://github.com/oblitum/Interception>
+- Package: `Interception 1.0.1` (`Interception.zip`)
+- Archive SHA-256: `AD038963D6413055765128B0B931F6E765147C9916DBA79E65D872B261F9AF10`
+- Bundled client library: `interception.dll` (x64)
+- DLL SHA-256: `AB88164C11B1B48488772D4C3BFAA4509D5B0AE9DBC5A691DC4F96F0260443C8`
+- Bundled command-line installer: `install-interception.exe` (官方安装程序，未修改)
+- Installer SHA-256: `E137863A79DA797F08E7A137280FF2A123809044A888FD75CE9C973198915ABE`
+- License: LGPL-3.0 for non-commercial use; a separate commercial license is
+  required for commercial use (`licenses/non-commercial-usage/LGPL 3.0.txt`
+  and `licenses/commercial-usage/Interception.pdf` shipped inside the official
+  archive)
+
+The `fetch-interception.ps1` build helper downloads the official unmodified
+release archive and verifies its pinned SHA-256 before extracting the x64
+client library and the official command-line installer. The Interception kernel
+driver is a separate one-time, machine-wide administrator install with a reboot.
+The application never installs it silently: the driver page only offers an
+explicit "安装驱动/卸载驱动" button that launches the bundled, hash-verified
+official installer (`/install` or `/uninstall`) through Windows' own
+administrator-elevation verb, and the user confirms the UAC prompt. Nothing is
+installed or removed without that click, and the application never reports a
+driver install as successful merely because a process was launched. When the
+driver is absent the optional Interception backend stays disabled and the
+application falls back to `SendInput`.
 
 ## Microsoft runtime components
 

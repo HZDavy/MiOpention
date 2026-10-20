@@ -25,8 +25,7 @@ SCAN_FLAG = "--list-remote-devices"
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_DEVICES = 128
 RC003_PROFILE = "xiaomi-rc003"
-CHROMECAST_PROFILE = "chromecast-remote"
-KNOWN_PROFILES = frozenset({RC003_PROFILE, CHROMECAST_PROFILE})
+KNOWN_PROFILES = frozenset({RC003_PROFILE})
 
 
 class SelectionError(ValueError):
@@ -75,13 +74,18 @@ def normalize(value: object) -> dict:
     records = []
     for row in devices:
         if (not isinstance(row, dict) or set(row) != {"key", "profile"}
-                or not valid_key(row.get("key"))
-                or row.get("profile") not in KNOWN_PROFILES or row["key"] in keys):
+                or not valid_key(row.get("key")) or row["key"] in keys):
             raise SelectionError("设备记录不受支持或重复。")
         keys.add(row["key"])
+        if row["profile"] not in KNOWN_PROFILES:
+            # A record for a device type this build no longer supports is
+            # dropped instead of making the whole saved selection unusable.
+            continue
         records.append(dict(row))
     if not isinstance(active, str) or (active and active not in keys):
         raise SelectionError("当前设备不在已添加列表中。")
+    if active not in {row["key"] for row in records}:
+        active = ""
     return {"schema": 1, "devices": records, "active": active}
 
 
@@ -120,7 +124,7 @@ def active_profile(settings: dict) -> str:
 
 def runtime_ready(profile: str) -> bool:
     # Capability only, not a claim that live source/permission checks passed.
-    return profile in (RC003_PROFILE, CHROMECAST_PROFILE)
+    return profile == RC003_PROFILE
 
 
 def label(key: str, profile: str = RC003_PROFILE, peers=()) -> str:
@@ -295,8 +299,7 @@ async def _scan_paired() -> list[dict]:
         except (SelectionError, OSError, TypeError, ValueError):
             continue
         name = getattr(info, "name", "") or ""
-        profile = (RC003_PROFILE if identity.matches_rc003_name(name) else
-                   CHROMECAST_PROFILE if str(name).strip().casefold() == "chromecast remote" else "")
+        profile = RC003_PROFILE if identity.matches_rc003_name(name) else ""
         # Unsupported names are display-only; saved selection still contains only digests/profiles.
         row = {"key": key, "profile": profile,
                "label": label(key, profile) if profile else _unsupported_label(name, key)}

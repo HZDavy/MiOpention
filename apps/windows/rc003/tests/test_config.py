@@ -23,37 +23,16 @@ class ConfigRootTests(unittest.TestCase):
 
 
 class DefaultConfigPrivacyTests(unittest.TestCase):
-    def test_default_config_uses_rc003_and_the_right_alt_hold_shortcut(self):
+    def test_default_config_starts_with_no_voice_shortcut(self):
         defaults = config.default_config()
         self.assertEqual(defaults["selected_device_profile"], "xiaomi-rc003")
-        self.assertEqual(defaults["voice_hotkey"], "ralt")
-        self.assertEqual(defaults["voice_trigger_mode"], "hold")
-        self.assertEqual(defaults["voice_hotkeys"]["hold"], "ralt")
+        self.assertEqual(defaults["voice_hotkey"], "")
+        self.assertNotIn("voice_trigger_mode", defaults)
+        self.assertEqual(defaults["voice_hotkeys"]["hold"], "")
+        self.assertEqual(defaults["voice_slot_hotkeys"], {"1": "", "2": ""})
         self.assertNotIn("toggle", defaults["voice_hotkeys"])
         self.assertNotIn("voice_release_finish_tap_enabled", defaults)
-        self.assertEqual(
-            defaults["voice_hotkeys_by_provider"]["sogou"]["hold"],
-            "rctrl",
-        )
-        self.assertEqual(
-            defaults["voice_hotkeys_by_provider"]["wetype"]["hold"],
-            "lctrl+lwin",
-        )
-        self.assertEqual(
-            defaults["voice_hotkeys_by_provider"]["doubao_ime"]["hold"],
-            "ralt",
-        )
-        self.assertNotIn(
-            "windows_dictation",
-            defaults["voice_hotkeys_by_provider"],
-        )
-        for entry in defaults["voice_hotkeys_by_provider"].values():
-            self.assertEqual(entry["source"], config.VOICE_HOTKEY_SOURCE_DEFAULT)
         self.assertEqual(defaults["schema_version"], config.SCHEMA_VERSION)
-        self.assertEqual(
-            defaults["voice_program"]["launch_elevated_by_provider"],
-            {"sogou": True, "custom": False},
-        )
         self.assertEqual(defaults["gain_db"], 10.0)
         self.assertFalse(defaults["launch_bridge_on_app_start"])
         self.assertFalse(defaults["diagnostic_trace_enabled"])
@@ -78,11 +57,27 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
     def test_output_endpoint_defaults_to_empty_so_voice_fails_closed(self):
         self.assertEqual(config.default_config()["output_endpoint_name"], "")
 
-    def test_missing_config_file_uses_the_right_alt_hold_shortcut(self):
+    def test_short_press_dismiss_is_off_by_default(self):
+        # Several input methods toggle on the second press, so the 模式1
+        # compensation must never switch itself on.
+        self.assertFalse(config.default_config()["voice_short_press_dismiss"])
+        self.assertFalse(config.voice_short_press_dismiss({}))
+
+    def test_invalid_short_press_dismiss_is_normalized_to_a_bool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps({"voice_short_press_dismiss": "yes"}), encoding="utf-8"
+            )
+            loaded = config.load_config(path)
+        self.assertIs(loaded["voice_short_press_dismiss"], True)
+        self.assertIs(config.voice_short_press_dismiss(loaded), True)
+
+    def test_missing_config_file_fabricates_no_voice_shortcut(self):
         with tempfile.TemporaryDirectory() as tmp:
             loaded = config.load_config(Path(tmp) / "config.json")
-        self.assertEqual(loaded["voice_hotkey"], "ralt")
-        self.assertEqual(loaded["voice_hotkeys"], {"hold": "ralt"})
+        self.assertEqual(loaded["voice_hotkey"], "")
+        self.assertEqual(loaded["voice_hotkeys"], {"hold": ""})
 
     def test_invalid_desktop_behavior_falls_back_safely(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -267,235 +262,6 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         self.assertEqual(loaded["voice_hotkey"], "ctrl+l")
         self.assertEqual(loaded["voice_hotkeys"], {"hold": "ctrl+l"})
 
-    def test_legacy_global_shortcut_is_assigned_to_the_selected_provider(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "config.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 6,
-                        "voice_program": {"provider": "wetype"},
-                        "voice_hotkey": "lctrl+lshift+f9",
-                        "voice_hotkeys": {"hold": "lctrl+lshift+f9"},
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            loaded = config.load_config(path)
-
-        self.assertEqual(loaded["voice_hotkey"], "lctrl+lshift+f9")
-        self.assertEqual(
-            loaded["voice_hotkeys_by_provider"]["wetype"]["hold"],
-            "lctrl+lshift+f9",
-        )
-        self.assertEqual(
-            loaded["voice_hotkeys_by_provider"]["sogou"]["hold"],
-            "rctrl",
-        )
-        self.assertEqual(
-            loaded["voice_hotkeys_by_provider"]["wetype"]["source"],
-            config.VOICE_HOTKEY_SOURCE_MANUAL,
-        )
-
-    def test_switching_provider_uses_its_own_remembered_shortcut(self):
-        data = config.default_config()
-        data["voice_program"] = {"provider": "wetype"}
-        config.set_voice_hotkey_for_provider(
-            data, "wetype", "lctrl+lshift+f9"
-        )
-        config.set_voice_hotkey_for_provider(
-            data, "sogou", "lctrl+lshift+f7"
-        )
-        data["voice_program"] = {"provider": "sogou"}
-        config._normalize_voice_program(data)
-        config._normalize_voice_hotkey(data)
-
-        self.assertEqual(data["voice_hotkey"], "lctrl+lshift+f7")
-        self.assertEqual(data["voice_hotkeys"], {"hold": "lctrl+lshift+f7"})
-
-    def test_manual_and_auto_provider_sources_are_preserved(self):
-        data = config.default_config()
-        config.set_voice_hotkey_for_provider(
-            data,
-            "wetype",
-            "lctrl+lshift+f9",
-            source=config.VOICE_HOTKEY_SOURCE_MANUAL,
-        )
-        config.set_voice_hotkey_for_provider(
-            data,
-            "sogou",
-            "lctrl+lshift+f7",
-            source=config.VOICE_HOTKEY_SOURCE_AUTO,
-        )
-        config.set_voice_hotkey_for_provider(data, "wetype", "ralt")
-
-        self.assertEqual(
-            config.voice_hotkey_source_for_provider(data, "wetype"),
-            config.VOICE_HOTKEY_SOURCE_MANUAL,
-        )
-        self.assertEqual(
-            config.voice_hotkey_source_for_provider(data, "sogou"),
-            config.VOICE_HOTKEY_SOURCE_AUTO,
-        )
-
-    def test_empty_manual_shortcut_is_kept_empty_but_loses_manual_priority(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "config.json"
-            data = config.default_config()
-            data["voice_program"] = {"provider": "wetype"}
-            config.set_voice_hotkey_for_provider(
-                data,
-                "wetype",
-                "",
-                source=config.VOICE_HOTKEY_SOURCE_MANUAL,
-            )
-
-            config.save_config(path, data)
-            loaded = config.load_config(path)
-
-        self.assertEqual(loaded["voice_hotkey"], "")
-        self.assertEqual(
-            loaded["voice_hotkeys_by_provider"]["wetype"],
-            {"hold": "", "source": config.VOICE_HOTKEY_SOURCE_DEFAULT},
-        )
-        self.assertEqual(
-            config.voice_hotkey_source_for_provider(loaded, "wetype"),
-            config.VOICE_HOTKEY_SOURCE_DEFAULT,
-        )
-
-    def test_removed_windows_dictation_selection_migrates_to_none(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "config.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 12,
-                        "voice_program": {"provider": "windows_dictation"},
-                        "voice_hotkey": "win+h",
-                        "voice_hotkeys": {"hold": "win+h"},
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            loaded = config.load_config(path)
-            config.save_config(path, loaded)
-            persisted = json.loads(path.read_text(encoding="utf-8"))
-
-        self.assertEqual(loaded["voice_program"]["provider"], "none")
-        self.assertTrue(loaded[config.RUNTIME_REMOVED_WINDOWS_DICTATION_KEY])
-        self.assertEqual(persisted["voice_program"]["provider"], "none")
-        self.assertNotIn(config.RUNTIME_REMOVED_WINDOWS_DICTATION_KEY, persisted)
-
-    def test_provider_scoped_wetype_native_ctrl_win_is_not_legacy_repaired(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "config.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 7,
-                        "voice_program": {"provider": "wetype"},
-                        "voice_hotkeys_by_provider": {
-                            "wetype": {"hold": "lctrl+lwin"}
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            loaded = config.load_config(path)
-
-        self.assertEqual(loaded["voice_hotkey"], "lctrl+lwin")
-
-    def test_doubao_hold_and_handsfree_shortcuts_survive_round_trip_separately(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "config.json"
-            data = config.default_config()
-            data["voice_program"] = {"provider": "doubao_ime"}
-            data["remote_recording_mode"] = "toggle"
-            config.set_voice_hotkey_for_provider(
-                data,
-                "doubao_ime",
-                "ralt",
-                source="auto",
-                trigger="hold",
-            )
-            config.set_voice_hotkey_for_provider(
-                data,
-                "doubao_ime",
-                "lshift+f9",
-                source="auto",
-                trigger="toggle",
-            )
-            config.save_config(path, data)
-            loaded = config.load_config(path)
-
-        self.assertEqual(
-            config.voice_hotkey_for_provider(loaded, "doubao_ime"),
-            "ralt",
-        )
-        self.assertEqual(
-            config.voice_hotkey_for_provider(
-                loaded,
-                "doubao_ime",
-                trigger="toggle",
-            ),
-            "lshift+f9",
-        )
-        loaded["remote_recording_mode"] = "toggle"
-        self.assertEqual(config.voice_hotkey_trigger_for_settings(loaded), "toggle")
-
-    def test_schema_7_false_elevation_choice_is_not_replaced_by_sogou_default(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "config.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 7,
-                        "voice_program": {
-                            "provider": "sogou",
-                            "launch_on_bridge_start": True,
-                            "launch_elevated": False,
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            loaded = config.load_config(path)
-
-        self.assertFalse(loaded["voice_program"]["launch_elevated"])
-        self.assertEqual(
-            loaded["voice_program"]["launch_elevated_by_provider"],
-            {"sogou": False, "custom": False},
-        )
-
-    def test_schema_7_true_elevation_choice_is_preserved_for_both_programs(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "config.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "schema_version": 7,
-                        "voice_program": {
-                            "provider": "custom",
-                            "launch_on_bridge_start": True,
-                            "launch_elevated": True,
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            loaded = config.load_config(path)
-
-        self.assertTrue(loaded["voice_program"]["launch_elevated"])
-        self.assertEqual(
-            loaded["voice_program"]["launch_elevated_by_provider"],
-            {"sogou": True, "custom": True},
-        )
-
     def test_load_preserves_nested_hold_when_old_file_has_no_top_level_value(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
@@ -521,7 +287,7 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             )
             loaded = config.load_config(path)
         self.assertEqual(loaded["voice_hotkey"], "ralt")
-        self.assertEqual(loaded["voice_trigger_mode"], "hold")
+        self.assertNotIn("voice_trigger_mode", loaded)
         self.assertEqual(
             loaded[config.RUNTIME_LEGACY_VOICE_MODE_KEY],
             "toggle",
@@ -555,7 +321,7 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             config.save_config(path, data)
             loaded = config.load_config(path)
         self.assertEqual(loaded["voice_hotkey"], "ralt+space")
-        self.assertEqual(loaded["voice_trigger_mode"], "hold")
+        self.assertNotIn("voice_trigger_mode", loaded)
 
     def test_load_does_not_reinterpret_a_custom_toggle_shortcut_as_hold(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -605,7 +371,7 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
                         encoding="utf-8",
                     )
                     loaded = config.load_config(path)
-                    self.assertEqual(loaded["voice_trigger_mode"], "hold")
+                    self.assertNotIn("voice_trigger_mode", loaded)
                     self.assertEqual(loaded["voice_hotkey"], "ralt")
 
     def test_load_repairs_recorded_left_alt_to_right_alt_in_hold_mode(self):
@@ -616,7 +382,7 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
                 encoding="utf-8",
             )
             loaded = config.load_config(path)
-        self.assertEqual(loaded["voice_trigger_mode"], "hold")
+        self.assertNotIn("voice_trigger_mode", loaded)
         self.assertEqual(loaded["voice_hotkey"], "ralt")
 
 
@@ -785,6 +551,16 @@ class RoundTripTests(unittest.TestCase):
             loaded = config.load_config(path)
             self.assertEqual(loaded["gain_db"], 3.5)
             self.assertTrue(loaded["diagnostic_trace_enabled"])
+
+    def test_short_press_dismiss_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            original = config.default_config()
+            original["voice_short_press_dismiss"] = True
+
+            config.save_config(path, original)
+
+            self.assertTrue(config.load_config(path)["voice_short_press_dismiss"])
 
     def test_save_removes_the_retired_release_finish_setting(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1148,7 +924,7 @@ class EditableMicBindingTests(unittest.TestCase):
             {"kind": "voice_toggle", "keys": []},
         )
 
-    def test_non_mic_voice_binding_fails_closed_for_the_whole_button(self):
+    def test_non_mic_voice_binding_is_kept_for_its_own_button(self):
         stored = config.default_key_bindings()
         stored["bindings"]["up"] = {"kind": "voice_hold", "keys": []}
         stored["secondary_bindings"]["up"] = {
@@ -1160,7 +936,29 @@ class EditableMicBindingTests(unittest.TestCase):
             stored,
         )
 
+        self.assertEqual(removed, {})
+        self.assertEqual(
+            stored["bindings"]["up"],
+            {"kind": "voice_hold", "keys": []},
+        )
+
+    def test_secondary_voice_binding_still_fails_closed(self):
+        stored = config.default_key_bindings()
+        stored["bindings"]["up"] = {"kind": "voice_hold_2", "keys": []}
+        stored["secondary_bindings"]["up"] = {
+            "double_click": {"kind": "voice_hold", "keys": []}
+        }
+
+        removed = config.normalize_voice_product_boundary(
+            config.default_config(),
+            stored,
+        )
+
         self.assertEqual(removed, {"up": "voice_hold"})
+        self.assertEqual(
+            stored["bindings"]["up"],
+            {"kind": "voice_hold_2", "keys": []},
+        )
 
     def test_legacy_generic_voice_binding_is_preserved_for_cross_file_migration(self):
         with tempfile.TemporaryDirectory() as tmp:

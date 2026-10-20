@@ -5,7 +5,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from ovb_rc003 import config, device_catalog, mapping_presets as presets, key_mapping
+from ovb_rc003 import (app_profiles, config, device_catalog,
+                       mapping_presets as presets, key_mapping)
 from tests import test_qt_settings_app as qt_tests
 
 
@@ -116,24 +117,24 @@ class PresetStoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 presets.validate_mapping(value, self.profile)
 
-    def test_unsafe_keys_voice_conflicts_and_unknown_buttons_are_rejected(self):
+    def test_unsafe_keys_and_unknown_buttons_are_rejected(self):
         for raw in ({"kind": "key_combo", "keys": ["unknown-key"]},
-                    {"kind": "voice_hold"}, {"kind": "unknown"}):
+                    {"kind": "unknown"}):
             value = copy.deepcopy(self.mapping)
             value["bindings"]["ok"] = raw
             with self.assertRaises(ValueError):
                 presets.validate_mapping(value, self.profile)
         value = copy.deepcopy(self.mapping)
-        value["secondary_bindings"]["mic"] = {"long_press": {"kind": "mouse_left_hold"}}
+        value["secondary_bindings"]["mic"] = {"long_press": {"kind": "unknown"}}
         with self.assertRaises(ValueError):
             presets.validate_mapping(value, self.profile)
 
-    def test_both_supported_profiles_and_device_compatibility(self):
+    def test_supported_profiles_and_device_compatibility(self):
         for profile in presets.PROFILES:
             mapping = presets.snapshot(config.default_key_bindings(profile), profile)
             identity = self.store.create("默认", profile, mapping)
             presets.apply_to(config.default_key_bindings(profile), self.store.get(identity), profile)
-        other = self.store.load()[1]
+        other = dict(self.store.load()[0], profile="other")
         with self.assertRaises(ValueError):
             presets.apply_to(self.bindings, other, self.profile)
 
@@ -148,7 +149,7 @@ class PresetStoreTests(unittest.TestCase):
         self.assertFalse(self.store.path.exists())
         self.assertFalse(config.key_bindings_path(self.root).exists())
 
-    def test_applied_marker_survives_reopen_but_never_follows_browsing_or_changed_values(self):
+    def test_applied_marker_survives_reopen_but_never_follows_changed_values(self):
         first, second = self.create("A"), self.create("B")
         def applied(bindings=None):
             return [row["id"] for row in presets.PresetStore(self.root).view(
@@ -160,19 +161,21 @@ class PresetStoreTests(unittest.TestCase):
         changed = copy.deepcopy(self.bindings)
         changed["bindings"]["ok"] = {"kind": "escape", "keys": []}
         self.assertEqual(applied(changed), [presets.AUTO_ID])
-        other_profile = device_catalog.CHROMECAST_ID
-        self.store.view(config.default_key_bindings(other_profile), other_profile)
-        self.assertEqual(applied(), [second])
         self.store.delete(second)
         self.assertEqual(applied(), [presets.AUTO_ID])
         self.assertEqual(self.store.get(first)["name"], "A")
 
     def test_v1_upgrade_preserves_snapshots_and_failed_upgrade_keeps_original_file(self):
         identity = self.create()
-        old = {"schema_version": 1, "presets": self.store.load()}
+        entry = self.store.load()[0]
+        old_entry = {key: entry[key] for key in ("id", "name", "profile", "mapping")}
+        old = {"schema_version": 1, "presets": [old_entry]}
         self.store.path.write_text(json.dumps(old), encoding="utf-8")
         before = self.store.path.read_bytes()
-        self.assertEqual(self.store.load(), old["presets"])
+        loaded = self.store.load()
+        self.assertEqual([{key: row[key] for key in ("id", "name", "profile", "mapping")} for row in loaded],
+                         [old_entry])
+        self.assertEqual((loaded[0]["scope"], loaded[0]["process"], loaded[0]["hotkey"]), ("global", "", ""))
         rows = self.store.view(self.bindings, self.profile)
         self.assertEqual(rows[1]["id"], identity)
         self.assertEqual(self.store.path.read_bytes(), before)
@@ -181,8 +184,10 @@ class PresetStoreTests(unittest.TestCase):
                 self.store.mark_applied(self.profile, identity)
         self.assertEqual(self.store.path.read_bytes(), before)
         self.store.mark_applied(self.profile, identity)
-        self.assertEqual(json.loads(self.store.path.read_text())["presets"], old["presets"])
-        self.assertEqual(json.loads(self.store.path.read_text())["schema_version"], 2)
+        saved = json.loads(self.store.path.read_text())
+        self.assertEqual([{key: row[key] for key in ("id", "name", "profile", "mapping")}
+                          for row in saved["presets"]], [old_entry])
+        self.assertEqual(saved["schema_version"], 3)
 
     def test_automatic_export_roundtrip_and_reserved_name(self):
         row = self.store.view(self.bindings, self.profile)[0]
@@ -214,6 +219,179 @@ class PresetStoreTests(unittest.TestCase):
                 self.assertEqual(self.store.path.read_bytes(), before)
         with self.assertRaises(ValueError):
             self.store.view(self.bindings, "unsupported")
+
+    def test_status_roundtrip_and_resolvers(self):
+        identity = self.store.create("浏览器", self.profile, self.mapping,
+                                     scope="app", process="Chrome.exe", hotkey="ctrl+alt+1")
+        entry = self.store.get(identity)
+        self.assertEqual((entry["scope"], entry["process"], entry["hotkey"]),
+                         ("app", "Chrome.exe", "ctrl+alt+1"))
+        self.assertEqual(self.store.resolve_for_process(self.profile, "chrome.EXE"), identity)
+        self.assertEqual(self.store.resolve_for_process(self.profile, "  chrome.exe "), identity)
+        self.assertIsNone(self.store.resolve_for_process(self.profile, "notepad.exe"))
+        self.assertIsNone(self.store.resolve_for_process(self.profile, ""))
+        self.assertEqual(self.store.resolve_hotkey(self.profile, "CTRL+ALT+1"), identity)
+        self.assertIsNone(self.store.resolve_hotkey(self.profile, "ctrl+alt+9"))
+        self.assertIsNone(self.store.resolve_hotkey(self.profile, ""))
+        # A global preset never wins a process lookup.
+        self.create("全局")
+        self.assertIsNone(self.store.resolve_for_process(self.profile, "全局"))
+
+    def test_status_defaults_validation_and_duplicate_bindings_are_rejected(self):
+        self.store.create("一", self.profile, self.mapping,
+                          scope="app", process="chrome.exe", hotkey="ctrl+1")
+        before = self.store.path.read_bytes()
+        with self.assertRaises(ValueError):  # same process, different casing
+            self.store.create("二", self.profile, self.mapping,
+                              scope="app", process="CHROME.EXE", hotkey="ctrl+2")
+        with self.assertRaises(ValueError):  # same hotkey, different casing
+            self.store.create("三", self.profile, self.mapping, hotkey="CTRL+1")
+        with self.assertRaises(ValueError):  # an app scope needs a process name
+            self.store.create("四", self.profile, self.mapping, scope="app")
+        with self.assertRaises(ValueError):
+            self.store.create("五", self.profile, self.mapping, scope="device")
+        with self.assertRaises(ValueError):
+            self.store.create("六", self.profile, self.mapping, hotkey="unknown-key")
+        self.assertEqual(self.store.path.read_bytes(), before)
+        self.assertEqual([entry["name"] for entry in self.store.load()], ["一"])
+
+    def test_set_status_updates_only_state_and_survives_atomic_failure(self):
+        identity = self.create("原配置")
+        mapping_before = copy.deepcopy(self.store.get(identity)["mapping"])
+        self.store.set_status(identity, "app", "code.exe", "alt+2")
+        entry = self.store.get(identity)
+        self.assertEqual((entry["scope"], entry["process"], entry["hotkey"]),
+                         ("app", "code.exe", "alt+2"))
+        self.assertEqual(entry["mapping"], mapping_before)
+        # Switching back to a global scope clears the app binding but keeps hotkey.
+        self.store.set_status(identity, "global", "", "alt+2")
+        self.assertEqual(self.store.get(identity)["process"], "")
+        self.assertIsNone(self.store.resolve_for_process(self.profile, "code.exe"))
+        self.assertEqual(self.store.resolve_hotkey(self.profile, "alt+2"), identity)
+        before = self.store.path.read_bytes()
+        with mock.patch.object(config.os, "replace", side_effect=PermissionError("locked")):
+            with self.assertRaises(PermissionError):
+                self.store.set_status(identity, "app", "other.exe", "")
+        self.assertEqual(self.store.path.read_bytes(), before)
+        self.assertEqual(self.store.get(identity)["process"], "")
+
+    def test_v2_upgrade_adds_default_status_fields_and_keeps_applied_ids(self):
+        self.create("A")
+        second = self.create("B")
+        self.store.mark_applied(self.profile, second)
+        document = json.loads(self.store.path.read_text())
+        v2_entries = [{key: entry[key] for key in ("id", "name", "profile", "mapping")}
+                      for entry in document["presets"]]
+        v2 = {"schema_version": 2, "presets": v2_entries,
+              "applied_ids": {self.profile: second}}
+        self.store.path.write_text(json.dumps(v2), encoding="utf-8")
+        before = self.store.path.read_bytes()
+        loaded = self.store.load()
+        self.assertEqual([entry["name"] for entry in loaded], ["A", "B"])
+        for entry in loaded:
+            self.assertEqual((entry["scope"], entry["process"], entry["hotkey"]),
+                             ("global", "", ""))
+        rows = self.store.view(self.bindings, self.profile)
+        self.assertEqual([row["id"] for row in rows if row["applied"]], [second])
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+    def bundle(self, apps=None):
+        return {"format": presets.BUNDLE_FORMAT, "schema_version": 1, "profile": self.profile,
+                "global": self.mapping,
+                "apps": [{"name": "浏览器", "process": "chrome.exe", "hotkey": "",
+                          "mapping": self.mapping}] if apps is None else apps}
+
+    def test_bundle_replaces_only_app_presets(self):
+        global_id = self.create("我的全局")
+        app_id = self.store.create("浏览器", self.profile, self.mapping,
+                                   scope="app", process="chrome.exe", hotkey="ctrl+alt+1")
+        self.store.mark_applied(self.profile, app_id)
+        export = Path(self.tmp.name) / "full.json"
+        self.store.export_bundle(
+            self.profile, self.mapping,
+            [{"name": "浏览器", "process": "chrome.exe", "hotkey": "ctrl+alt+1",
+              "mapping": self.mapping},
+             {"name": "编辑器", "process": "code.exe", "hotkey": "",
+              "mapping": self.mapping}],
+            export)
+        value = json.loads(export.read_text(encoding="utf-8"))
+        self.assertEqual(value["format"], presets.BUNDLE_FORMAT)
+        self.assertNotIn(app_id, json.dumps(value))
+        bundle = presets.read_bundle(export, self.profile)
+        self.assertEqual(self.store.replace_apps(self.profile, bundle["apps"]), 2)
+        entries = self.store.load()
+        self.assertEqual([entry["name"] for entry in entries],
+                         ["我的全局", "浏览器", "编辑器"])
+        by_name = {entry["name"]: entry for entry in entries}
+        self.assertNotEqual(by_name["浏览器"]["id"], app_id)      # fresh identifier
+        self.assertEqual(by_name["浏览器"]["hotkey"], "ctrl+alt+1")
+        self.assertEqual(by_name["编辑器"]["process"], "code.exe")
+        self.assertEqual(by_name["我的全局"]["id"], global_id)     # global row kept
+        self.assertEqual(self.store.resolve_for_process(self.profile, "code.exe"),
+                         by_name["编辑器"]["id"])
+        applied = json.loads(self.store.path.read_text(encoding="utf-8"))["applied_ids"]
+        self.assertEqual(applied[self.profile], presets.AUTO_ID)
+
+    def test_bundle_import_dedupes_names_and_drops_taken_hotkeys(self):
+        self.store.create("浏览器", self.profile, self.mapping, hotkey="ctrl+alt+9")
+        count = self.store.replace_apps(self.profile, [
+            {"name": "浏览器", "process": "chrome.exe", "hotkey": "ctrl+alt+9",
+             "mapping": self.mapping},
+            {"name": "浏览器", "process": "code.exe", "hotkey": "", "mapping": self.mapping},
+        ])
+        self.assertEqual(count, 2)
+        entries = self.store.load()
+        self.assertEqual([entry["name"] for entry in entries],
+                         ["浏览器", "浏览器 (2)", "浏览器 (3)"])
+        self.assertEqual([entry["process"] for entry in entries[1:]], ["chrome.exe", "code.exe"])
+        # The global row already owns ctrl+alt+9, so the imported row drops it
+        # instead of failing the whole import.
+        self.assertEqual(entries[0]["hotkey"], "ctrl+alt+9")
+        self.assertEqual([entry["hotkey"] for entry in entries[1:]], ["", ""])
+
+    def test_bundle_validation_rejects_foreign_and_damaged_documents(self):
+        base = self.bundle()
+        presets.validate_bundle(base, self.profile)  # a well-formed bundle passes
+        damaged = [
+            lambda d: d.update(format=presets.FORMAT),
+            lambda d: d.update(schema_version=2),
+            lambda d: d.update(schema_version=True),
+            lambda d: d.update(extra="x"),
+            lambda d: d.update(profile="other-model"),
+            lambda d: d.pop("apps"),
+            lambda d: d.update(apps={}),
+            lambda d: d.update(apps=[{"name": "a"}]),
+            lambda d: d.update(apps=[{"name": "a", "process": "x.exe", "hotkey": "",
+                                      "mapping": self.mapping, "id": "z"}]),
+            lambda d: d.update(apps=[{"name": "a", "process": "x.exe",
+                                      "hotkey": "unknown-key", "mapping": self.mapping}]),
+            lambda d: d.update(apps=[{"name": "a", "process": "x.exe", "hotkey": "",
+                                      "mapping": {}}]),
+            lambda d: d.update(apps=[{"name": "a", "process": "CHROME.EXE", "hotkey": "",
+                                      "mapping": self.mapping},
+                                     {"name": "b", "process": "chrome.exe", "hotkey": "",
+                                      "mapping": self.mapping}]),
+            lambda d: d.update(apps=[{"name": f"应用{i}", "process": f"app{i}.exe",
+                                      "hotkey": "", "mapping": self.mapping}
+                                     for i in range(presets.MAX_PRESETS + 1)]),
+            lambda d: d["global"].update(physical_bindings={}),
+        ]
+        for mutate in damaged:
+            document = copy.deepcopy(base)
+            mutate(document)
+            with self.assertRaises(ValueError):
+                presets.validate_bundle(document, self.profile)
+        with self.assertRaises(ValueError):
+            presets.validate_bundle(base, "other-model")
+
+    def test_bundle_export_keeps_the_data_directory_off_limits(self):
+        with self.assertRaises(ValueError):
+            self.store.export_bundle(self.profile, self.mapping, [],
+                                     self.root / "full.json")
+        self.assertFalse((self.root / "full.json").exists())
+        export = Path(self.tmp.name) / "full.json"
+        self.store.export_bundle(self.profile, self.mapping, [], export)
+        self.assertEqual(json.loads(export.read_text(encoding="utf-8"))["apps"], [])
 
 
 @unittest.skipUnless(qt_tests._HAS_PYSIDE6, qt_tests._SKIP_REASON)
@@ -297,25 +475,26 @@ class PresetControllerTests(unittest.TestCase):
         saved = run("copy", presets.AUTO_ID, "保留副本")
         self.assertTrue(saved["ok"], saved)
         self.assertTrue(controller.mappingPresets[0]["applied"])
-        with mock.patch.object(presets.PresetStore, "mark_applied", side_effect=OSError("disk full")):
+        with mock.patch.object(app_profiles.AppProfileStore, "mark_applied", side_effect=OSError("disk full")):
             result = run("apply", saved["id"], "")
         self.assertTrue(result["ok"], result)
         self.assertIn("应用标记未能保存", result["message"])
-        self.assertTrue(controller.mappingPresets[1]["applied"])
+        self.assertTrue(controller.mappingPresets[0]["applied"])
+        self.assertFalse(controller.mappingPresets[1]["applied"])
         self.assertTrue(run("apply", saved["id"], "")["ok"])
-        controller._mapping_applied_overrides.clear()
+        self.assertTrue(controller.mappingPresets[1]["applied"])
         result = run("refresh", "", "")
         self.assertEqual(result["id"], saved["id"])
 
     def test_applied_marker_uses_effective_values_after_loader_normalization(self):
         controller, _ = self._make_controller()
         profile = device_catalog.RC003_ID
-        mapping = presets.snapshot(controller._bindings, profile)
+        mapping = app_profiles.snapshot(controller._bindings, profile)
         mapping["bindings"]["ok"] = {"kind": "key_combo", "keys": ["enter"]}
         mapping["secondary_bindings"]["ok"] = {"double_click": {"kind": "disabled"}}
         mapping["display_notes"]["ok"] = {"single_click": "  确定  ", "long_press": ""}
-        store = presets.PresetStore(controller._config_root)
-        identity = store.create("可兼容配置", profile, mapping)
+        store = app_profiles.AppProfileStore(controller._config_root)
+        identity = store.create("可兼容配置", mapping)
         result = controller.mappingPresetAction("apply", identity, "")
         self.assertTrue(result["ok"], result)
         self.assertEqual([row["id"] for row in controller.mappingPresets if row["applied"]], [identity])
@@ -342,9 +521,9 @@ class PresetControllerTests(unittest.TestCase):
         from PySide6.QtCore import QUrl
         controller, _ = self._make_controller()
         root = controller._config_root
-        store = presets.PresetStore(root)
-        identity = store.create("有效副本", device_catalog.RC003_ID,
-                                presets.snapshot(controller._bindings, device_catalog.RC003_ID))
+        store = app_profiles.AppProfileStore(root)
+        identity = store.create("有效副本",
+                                app_profiles.snapshot(controller._bindings, device_catalog.RC003_ID))
         export = Path(self._tmpdir.name) / "valid.json"
         store.export_file(identity, export)
         legacy = copy.deepcopy(controller._bindings)
@@ -366,8 +545,8 @@ class PresetControllerTests(unittest.TestCase):
         self.assertTrue(run("copy", identity, "命名副本")["ok"])
         self.assertTrue(run("rename", imported["id"], "导入后改名")["ok"])
         self.assertTrue(run("export", imported["id"], QUrl.fromLocalFile(str(export)).toString())["ok"])
-        for operation in ("copy", "export"):
-            self.assertFalse(run(operation, presets.AUTO_ID, "非法副本")["ok"])
+        for operation in ("rename", "delete"):
+            self.assertFalse(run(operation, presets.AUTO_ID, "非法操作")["ok"])
         self.assertTrue(run("delete", identity, "")["ok"])
         reopened, _ = self._make_controller()
         self.assertTrue(reopened.mappingPresetAction("refresh", "", "")["ok"])
@@ -377,9 +556,9 @@ class PresetControllerTests(unittest.TestCase):
     def test_committed_import_is_successful_when_only_the_list_refresh_fails(self):
         from PySide6.QtCore import QUrl
         controller, _ = self._make_controller()
-        store = presets.PresetStore(controller._config_root)
-        identity = store.create("备份", device_catalog.RC003_ID,
-                                presets.snapshot(controller._bindings, device_catalog.RC003_ID))
+        store = app_profiles.AppProfileStore(controller._config_root)
+        identity = store.create("备份",
+                                app_profiles.snapshot(controller._bindings, device_catalog.RC003_ID))
         export = Path(self._tmpdir.name) / "valid.json"
         store.export_file(identity, export)
         with mock.patch.object(type(controller), "_refresh_mapping_presets", side_effect=OSError("locked")):
@@ -397,9 +576,9 @@ class PresetControllerTests(unittest.TestCase):
     def test_failed_import_write_preserves_library_and_reports_failure(self):
         from PySide6.QtCore import QUrl
         controller, _ = self._make_controller()
-        store = presets.PresetStore(controller._config_root)
-        identity = store.create("备份", device_catalog.RC003_ID,
-                                presets.snapshot(controller._bindings, device_catalog.RC003_ID))
+        store = app_profiles.AppProfileStore(controller._config_root)
+        identity = store.create("备份",
+                                app_profiles.snapshot(controller._bindings, device_catalog.RC003_ID))
         export = Path(self._tmpdir.name) / "valid.json"
         store.export_file(identity, export)
         controller.mappingPresetAction("refresh", "", "")
@@ -409,3 +588,94 @@ class PresetControllerTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(store.path.read_bytes(), before)
         self.assertEqual(controller.mappingPresets, rows)
+
+    def test_set_status_roundtrips_and_lists_scope_fields(self):
+        controller, _ = self._make_controller(selected_remote=True)
+        controller.mappingPresetAction("refresh", "", "")
+        self.assertEqual([option["label"] for option in controller.mappingPresetScopeOptions],
+                         ["全局配置", "软件配置"])
+        saved = controller.mappingPresetAction("copy", presets.AUTO_ID, "带状态")
+        self.assertTrue(saved["ok"], saved)
+        result = controller.setMappingPresetStatus(saved["id"], "app", "chrome.exe", "ctrl+alt+2")
+        self.assertTrue(result["ok"], result)
+        row = next(row for row in controller.mappingPresets if row["id"] == saved["id"])
+        self.assertEqual((row["scope"], row["process"], row["hotkey"]),
+                         ("app", "chrome.exe", "ctrl+alt+2"))
+        reopened = app_profiles.AppProfileStore(controller._config_root).get(saved["id"])
+        self.assertEqual(reopened["process"], "chrome.exe")
+        self.assertFalse(controller.setMappingPresetStatus(
+            presets.AUTO_ID, "app", "chrome.exe", "")["ok"])
+        self.assertFalse(controller.setMappingPresetStatus(saved["id"], "app", "", "")["ok"])
+        self.assertEqual(
+            app_profiles.AppProfileStore(controller._config_root).get(saved["id"])["hotkey"], "ctrl+alt+2")
+
+    def test_bundle_moves_the_global_and_every_application_layout_together(self):
+        from PySide6.QtCore import QUrl
+        controller, _ = self._make_controller(selected_remote=True)
+        profile = device_catalog.RC003_ID
+        # Keep the app-icon lookup off the real registry so the test stays fast.
+        controller._app_executable_cache.update(
+            {"chrome.exe": "", "code.exe": "", "notepad.exe": ""})
+        controller._bindings["bindings"]["ok"] = {"kind": "mouse_right_click", "keys": []}
+        controller._load_bindings_into_model()
+        self.assertTrue(controller._save_mapping())
+        store = app_profiles.AppProfileStore(controller._config_root)
+        for name, process in (("浏览器", "chrome.exe"), ("编辑器", "code.exe")):
+            store.create(name, app_profiles.snapshot(controller._bindings, profile),
+                         scope="app", process=process)
+        controller._refresh_mapping_presets()
+        export = Path(self._tmpdir.name) / "full-config.json"
+        result = controller.exportMappingBundle(QUrl.fromLocalFile(str(export)).toString())
+        self.assertTrue(result["ok"], result)
+        self.assertIn("2 个应用配置", result["message"])
+        value = json.loads(export.read_text(encoding="utf-8"))
+        self.assertEqual(value["format"], presets.BUNDLE_FORMAT)
+        self.assertEqual([app["process"] for app in value["apps"]], ["chrome.exe", "code.exe"])
+        self.assertEqual(value["global"]["bindings"]["ok"]["kind"], "mouse_right_click")
+
+        # Move this machine somewhere else: a different global layout, an extra
+        # application profile, and a learned physical signature to preserve.
+        controller._bindings["bindings"]["ok"] = {"kind": "escape", "keys": []}
+        controller._load_bindings_into_model()
+        self.assertTrue(controller._save_mapping())
+        store.create("多余", app_profiles.snapshot(controller._bindings, profile),
+                     scope="app", process="notepad.exe")
+        controller._refresh_mapping_presets()
+        self.assertEqual(len(controller.mappingAppProfiles), 3)
+        controller._bindings["physical_bindings"] = {"sig-1": "mic"}
+
+        result = controller.importMappingBundle(QUrl.fromLocalFile(str(export)).toString())
+        self.assertTrue(result["ok"], result)
+        self.assertIn("已导入全局按键和 2 个应用配置", result["message"])
+        self.assertEqual(controller._bindings["bindings"]["ok"]["kind"], "mouse_right_click")
+        self.assertEqual(controller._bindings["physical_bindings"], {"sig-1": "mic"})
+        self.assertEqual([row["name"] for row in controller.mappingAppProfiles],
+                         ["浏览器", "编辑器"])
+        self.assertEqual(controller.mappingEditTarget, "")
+        self.assertEqual([row["name"] for row in controller.mappingPresets],
+                         [presets.AUTO_NAME, "浏览器", "编辑器"])
+
+    def test_bundle_import_rejects_foreign_files_and_export_guards_the_data_dir(self):
+        from PySide6.QtCore import QUrl
+        controller, _ = self._make_controller(selected_remote=True)
+        controller._app_executable_cache["chrome.exe"] = ""
+        store = app_profiles.AppProfileStore(controller._config_root)
+        store.create("浏览器",
+                     app_profiles.snapshot(controller._bindings, device_catalog.RC003_ID),
+                     scope="app", process="chrome.exe")
+        controller._refresh_mapping_presets()
+        library_before = store.path.read_bytes()
+        bindings_before = copy.deepcopy(controller._bindings)
+        # A single-preset file is not a full-configuration bundle.
+        single = Path(self._tmpdir.name) / "single.json"
+        store.export_file(store.load()[0]["id"], single)
+        result = controller.importMappingBundle(QUrl.fromLocalFile(str(single)).toString())
+        self.assertFalse(result["ok"])
+        self.assertIn("整体配置", result["message"])
+        self.assertEqual(store.path.read_bytes(), library_before)
+        self.assertEqual(controller._bindings, bindings_before)
+        self.assertEqual([row["name"] for row in controller.mappingAppProfiles], ["浏览器"])
+        # Exporting on top of the software's own data directory is refused.
+        guard = QUrl.fromLocalFile(str(controller._config_root / "full.json")).toString()
+        self.assertFalse(controller.exportMappingBundle(guard)["ok"])
+        self.assertFalse((controller._config_root / "full.json").exists())

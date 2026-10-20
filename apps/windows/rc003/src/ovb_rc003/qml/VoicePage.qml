@@ -14,132 +14,41 @@ Item {
     readonly property var firstFocusItem: installVirtualAudioButton
     readonly property var lastFocusItem: testVbCableChannelButton
     property bool voiceHotkeyRecording: false
+    property int voiceRecordingSlot: 1
     property string voiceHotkeyCaptureError: ""
     property string pendingVoiceHotkey: ""
+    // Status line of the saved-profile list; the C++ actions return {ok,message}.
+    property string voiceProfileMessage: ""
+    // Name of the profile currently applied, shown by the compact section row.
+    readonly property string activeVoiceProfileName: {
+        const rows = SettingsController.voiceProfiles
+        for (var i = 0; i < rows.length; i++) {
+            if (rows[i].applied)
+                return String(rows[i].name || "")
+        }
+        return ""
+    }
+    // Only the two voice slots exist; each owns one user-recorded shortcut.
+    readonly property var voiceSlots: {
+        const count = SettingsController.voiceSlotOptions.length
+        const slots = []
+        for (var i = 0; i < count; i++)
+            slots.push(i + 1)
+        return slots
+    }
     readonly property int settingsStateColumnWidth: 96
     readonly property int settingsActionColumnWidth: tokens.buttonWidth6Chars
-    // One group width for provider, shortcut (including refresh), and mode + limit.
-    // Long endpoint names and custom paths keep their own flexible columns.
-    readonly property real voiceEditorGroupWidth:
-        remoteRecordingModeComboWidth + tokens.spacingSmall + remoteRecordingLimitComboWidth
-    readonly property real voiceHotkeyEditorWidth: voiceEditorGroupWidth
-    readonly property real remoteRecordingModeComboWidth:
-        Math.max(tokens.buttonWidth4Chars, Math.ceil(remoteRecordingModeMetrics.advanceWidth) + 31)
-    readonly property real remoteRecordingLimitComboWidth:
-        Math.max(tokens.buttonWidth4Chars, Math.ceil(remoteRecordingLimitMetrics.advanceWidth) + 31)
-
-    TextMetrics {
-        id: remoteRecordingModeMetrics
-        font.family: root.tokens.fontFamily
-        font.pixelSize: root.tokens.fontSizeControl
-        font.weight: Font.Medium
-        text: qsTr("开关型")
-    }
-
-    TextMetrics {
-        id: remoteRecordingLimitMetrics
-        font.family: root.tokens.fontFamily
-        font.pixelSize: root.tokens.fontSizeControl
-        font.weight: Font.Medium
-        text: qsTr("10 分钟")
-    }
-
-    readonly property bool voiceProgramManaged:
-        SettingsController.voiceProgramManaged
-    readonly property bool voiceProgramLaunchable:
-        SettingsController.voiceProgramLaunchable
-    readonly property bool sogouSelected:
-        SettingsController.voiceProgramSogouSelected
-    readonly property bool wetypeSelected:
-        SettingsController.voiceProgramWeTypeSelected
-    readonly property bool doubaoSelected:
-        SettingsController.voiceProgramDoubaoSelected
-    readonly property bool chatterflySelected:
-        SettingsController.voiceProgramChatterflySelected
-    readonly property string voiceHotkeyModeLabel:
-        root.chatterflySelected ? qsTr("语音输入") :
-        !SettingsController.isRc003Device
-            && SettingsController.remoteRecordingModeIndex === 1
-            && (root.sogouSelected || root.wetypeSelected || root.doubaoSelected)
-        ? qsTr("开关型") : qsTr("按住型")
-    readonly property bool customProgramSelected:
-        SettingsController.voiceProgramCustomSelected
-    readonly property int voiceProgramMenuIndex:
-        SettingsController.voiceProgramMenuIndex
-    readonly property string voiceProgramDisplayText:
-        root.customProgramSelected ? qsTr("自定义程序（旧）")
-        : SettingsController.voiceProgramOptions[root.voiceProgramMenuIndex + 1]
-            || qsTr("请选择语音程序")
-    readonly property bool voiceProgramUnsupported:
-        SettingsController.activeRemoteKey.length > 0
-        && !SettingsController.isRc003Device
-        && root.voiceProgramManaged
-        && !root.wetypeSelected && !root.sogouSelected && !root.doubaoSelected
-        && !root.chatterflySelected
     readonly property bool voiceHotkeyBusy: SettingsController.voiceHotkeyBusy
-    readonly property bool voiceHotkeyRefreshVisible:
-        root.sogouSelected || root.wetypeSelected || root.doubaoSelected || root.chatterflySelected
+    readonly property bool configurationWriteBusy:
+        DiagnosticsController.driverActionRunning
+        || DiagnosticsController.vbCableTestRunning
+        || SettingsController.bridgeLaunchBusy
+        || SettingsController.endpointPreflightBusy
     readonly property bool voiceHotkeyRuntimeBusy:
         String(SettingsController.voiceRuntimeState) === "active"
         || String(SettingsController.voiceRuntimeState) === "mic_confirmed"
         || String(SettingsController.voiceRuntimeState) === "receiving_audio"
         || String(SettingsController.voiceRuntimeState) === "finishing"
-    readonly property bool voiceHotkeyRefreshEnabled:
-        root.voiceHotkeyRefreshVisible
-        && !root.voiceProgramUnsupported
-        && !root.voiceHotkeyBusy
-        && !SettingsController.settingsSaveBusy
-        && !root.configurationWriteBusy
-        && !root.voiceHotkeyRecording
-        && !SettingsController.inputCaptureInUse
-        && !root.voiceHotkeyRuntimeBusy
-    readonly property bool endpointPreflightBusy:
-        SettingsController.endpointPreflightBusy
-    readonly property bool configurationWriteBusy:
-        DiagnosticsController.driverActionRunning
-        || DiagnosticsController.vbCableTestRunning
-        || SettingsController.bridgeLaunchBusy
-        || root.endpointPreflightBusy
-    readonly property bool voiceProgramPrivilegeMismatch:
-        voiceProgramLaunchable
-        && SettingsController.voiceProgramStatusCode === "running"
-        && SettingsController.voiceProgramElevationStatus !== "unknown"
-        && SettingsController.voiceProgramLaunchElevated
-            !== (SettingsController.voiceProgramElevationStatus === "elevated")
-    readonly property color voiceProgramStateColor:
-        root.voiceProgramUnsupported ? tokens.disabledText
-        : SettingsController.voiceProgramSettingsDirty
-            ? tokens.voiceAccent
-            : SettingsController.voiceProgramStatusCode === "running"
-                ? (voiceProgramPrivilegeMismatch
-                    ? tokens.voiceAccent : tokens.successColor)
-                : SettingsController.voiceProgramStatusCode === "not_found"
-                    ? tokens.errorColor : tokens.disabledText
-
-    function voiceProgramStateText() {
-        if (SettingsController.voiceProgramSettingsDirty)
-            return qsTr("正在保存")
-        const code = String(SettingsController.voiceProgramStatusCode)
-        if (!root.voiceProgramManaged)
-            return qsTr("待配置")
-        if (root.voiceProgramUnsupported)
-            return qsTr("尚未接通")
-        if (code === "running") {
-            if (root.voiceProgramPrivilegeMismatch)
-                return qsTr("退出后点“重新检测”")
-            return qsTr("运行中")
-        }
-        if (code === "stopped")
-            return qsTr("已安装")
-        if (code === "not_found") {
-            if (root.customProgramSelected)
-                return qsTr("点击“选择”")
-            if (root.sogouSelected)
-                return qsTr("点击“去安装”")
-            return qsTr("点击“打开设置”")
-        }
-        return qsTr("正在检查")
-    }
 
     function checkResult(checkId) {
         const rows = DiagnosticsController.checkResults
@@ -187,19 +96,21 @@ Item {
             ? String(row.detail).trim().replace(/[。；;]+$/, "") : fallback
     }
 
-    function startVoiceHotkeyCapture() {
-        if (voiceHotkeyRecording) {
-            stopVoiceHotkeyCapture("capture_field_tapped")
+    function startVoiceHotkeyCapture(slot) {
+        const sameSlot = voiceHotkeyRecording && voiceRecordingSlot === slot
+        if (voiceHotkeyRecording
+                && !stopVoiceHotkeyCapture("capture_field_tapped"))
             return
-        }
+        if (sameSlot)
+            return
         voiceHotkeyCaptureError = ""
         pendingVoiceHotkey = ""
         if (!SettingsController.startHotkeyCapture()) {
             voiceHotkeyCaptureError = qsTr("无法开始录入，请结束其它按键操作后重试")
             return
         }
+        voiceRecordingSlot = slot
         voiceHotkeyRecording = true
-        voiceHotkeyField.forceActiveFocus()
     }
 
     function stopVoiceHotkeyCapture(reason) {
@@ -223,6 +134,15 @@ Item {
         }
     }
 
+    // One entry point for every saved-profile action so the status line and the
+    // error reporting stay identical across buttons and dialogs.
+    function runVoiceProfileAction(operation, identity, text) {
+        const result = SettingsController.mappingPresetAction(
+            operation, identity || "", text || "")
+        voiceProfileMessage = String(result.message || "")
+        return result
+    }
+
     function finishCapturedVoiceHotkey(chord) {
         pendingVoiceHotkey = chord
         if (!SettingsController.stopHotkeyCapture()) {
@@ -238,19 +158,44 @@ Item {
         if (pendingVoiceHotkey.length === 0)
             return
         const chord = pendingVoiceHotkey
+        const slot = voiceRecordingSlot
         pendingVoiceHotkey = ""
         voiceHotkeyRecording = false
-        SettingsController.holdVoiceHotkeyText = chord
+        SettingsController.setVoiceSlotHotkey(slot, chord)
     }
 
-    FileDialog {
-        id: voiceProgramFileDialog
-        title: qsTr("选择语音程序")
-        nameFilters: [
-            qsTr("程序或快捷方式 (*.exe *.lnk)"),
-            qsTr("所有文件 (*)")
-        ]
-        onAccepted: SettingsController.voiceProgramCustomPath = selectedFile
+    function focusRecordingSlot() {
+        for (var i = 0; i < voiceSlotRepeater.count; i++) {
+            const row = voiceSlotRepeater.itemAt(i)
+            if (row)
+                row.claimFocus()
+        }
+    }
+
+    function tapInsideRecordingField(eventPoint) {
+        for (var i = 0; i < voiceSlotRepeater.count; i++) {
+            const row = voiceSlotRepeater.itemAt(i)
+            if (!row)
+                continue
+            const field = row.recordingField()
+            if (!field)
+                continue
+            const local = field.mapFromItem(voiceScroll.contentItem,
+                eventPoint.position.x, eventPoint.position.y)
+            if (local.x >= 0 && local.y >= 0
+                    && local.x < field.width && local.y < field.height)
+                return true
+        }
+        return false
+    }
+
+    onVoiceHotkeyRecordingChanged: {
+        if (voiceHotkeyRecording)
+            Qt.callLater(root.focusRecordingSlot)
+    }
+    onVoiceRecordingSlotChanged: {
+        if (voiceHotkeyRecording)
+            Qt.callLater(root.focusRecordingSlot)
     }
 
     SettingsDialog {
@@ -289,6 +234,368 @@ Item {
         }
     }
 
+    // "保存 / 重命名 / 复制" all collect one name; the automatic mode tag is
+    // appended by the store, so the field never asks for it.
+    SettingsDialog {
+        id: voiceProfileNameDialog
+        objectName: "voiceProfileNameDialog"
+        tokens: root.tokens
+        preferredWidth: 420
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        property string operation: "save"
+        property string targetId: ""
+        property string suggestedName: ""
+        title: operation === "rename"
+            ? qsTr("重命名配置")
+            : operation === "copy"
+                ? qsTr("复制配置") : qsTr("保存为配置")
+        onAboutToShow: {
+            voiceProfileNameField.text = suggestedName
+            Qt.callLater(voiceProfileNameField.forceActiveFocus)
+        }
+        onAccepted: root.runVoiceProfileAction(
+            voiceProfileNameDialog.operation,
+            voiceProfileNameDialog.targetId,
+            voiceProfileNameField.text)
+
+        contentItem: ColumnLayout {
+            spacing: root.tokens.spacingSmall
+            UiLabel {
+                tokens: root.tokens
+                kind: noteKind
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("名字后面会自动加上模式标签：模式1，或模式2 + 麦克风名字。")
+            }
+            CompactTextField {
+                id: voiceProfileNameField
+                objectName: "voiceProfileNameField"
+                tokens: root.tokens
+                Layout.fillWidth: true
+                placeholderText: qsTr("配置名称")
+                Accessible.name: qsTr("配置名称")
+                onAccepted: voiceProfileNameDialog.accept()
+            }
+        }
+    }
+
+    SettingsDialog {
+        id: voiceProfileDeleteDialog
+        objectName: "voiceProfileDeleteDialog"
+        tokens: root.tokens
+        preferredWidth: 420
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        title: qsTr("删除配置？")
+        property string pendingProfileId: ""
+        property string pendingProfileLabel: ""
+        onAccepted: root.runVoiceProfileAction(
+            "delete", voiceProfileDeleteDialog.pendingProfileId, "")
+
+        contentItem: UiLabel {
+            tokens: root.tokens
+            kind: bodyKind
+            wrapMode: Text.WordWrap
+            text: qsTr("这会删除配置“%1”，删除后无法撤销。当前按键设置和其他配置不受影响。")
+                .arg(voiceProfileDeleteDialog.pendingProfileLabel)
+        }
+    }
+
+    FileDialog {
+        id: voiceProfileExportDialog
+        objectName: "voiceProfileExportFileDialog"
+        title: qsTr("导出配置")
+        fileMode: FileDialog.SaveFile
+        defaultSuffix: "json"
+        nameFilters: [qsTr("配置文件 (*.json)")]
+        property string pendingProfileId: ""
+        onAccepted: root.runVoiceProfileAction(
+            "export", voiceProfileExportDialog.pendingProfileId, selectedFile.toString())
+    }
+
+    FileDialog {
+        id: voiceProfileImportDialog
+        objectName: "voiceProfileImportFileDialog"
+        title: qsTr("导入配置")
+        fileMode: FileDialog.OpenFile
+        nameFilters: [qsTr("配置文件 (*.json)")]
+        onAccepted: root.runVoiceProfileAction("import", "", selectedFile.toString())
+    }
+
+    FileDialog {
+        id: voiceProfileExportAllDialog
+        objectName: "voiceProfileExportAllFileDialog"
+        title: qsTr("导出全部配置")
+        fileMode: FileDialog.SaveFile
+        defaultSuffix: "json"
+        nameFilters: [qsTr("配置档案 (*.json)")]
+        onAccepted: {
+            const result = SettingsController.exportAllMappingPresets(
+                selectedFile.toString())
+            root.voiceProfileMessage = String(result.message || "")
+        }
+    }
+
+    // One place to browse, apply and maintain every saved profile. Keeping the
+    // cards here (instead of inline on the voice page) gives the row actions
+    // enough width and keeps the settings page scannable.
+    SettingsDialog {
+        id: voiceProfileManagerDialog
+        objectName: "voiceProfileManagerDialog"
+        tokens: root.tokens
+        preferredWidth: 680
+        title: qsTr("配置档案")
+        titleNote: qsTr("切换配置会同时切换按键映射、语音模式和麦克风")
+        closeButtonObjectName: "voiceProfileManagerCloseButton"
+        dismissalEnabled: !root.configurationWriteBusy
+
+        contentItem: ColumnLayout {
+            spacing: root.tokens.spacingMedium
+
+            ScrollView {
+                id: voiceProfileScroll
+                objectName: "voiceProfileListScroll"
+                Layout.fillWidth: true
+                Layout.preferredHeight: Math.min(360,
+                    Math.max(76, voiceProfileList.implicitHeight))
+                clip: true
+                contentWidth: availableWidth
+                ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+                ScrollBar.vertical.policy: ScrollBar.AsNeeded
+
+                ColumnLayout {
+                    id: voiceProfileList
+                    objectName: "voiceProfileList"
+                    width: voiceProfileScroll.availableWidth
+                    spacing: 0
+
+                    Repeater {
+                        objectName: "voiceProfileRepeater"
+                        model: SettingsController.voiceProfiles
+
+                        Rectangle {
+                            id: profileRow
+                            required property var modelData
+                            readonly property bool automatic:
+                                Boolean(modelData.automatic)
+                            readonly property bool applied:
+                                Boolean(modelData.applied)
+                            readonly property string profileId: String(modelData.id)
+                            readonly property string conflictText:
+                                String(modelData.voice_conflict_text || "")
+                            objectName: "voiceProfileRow_"
+                                + (automatic ? "global" : String(index))
+                            Layout.fillWidth: true
+                            implicitHeight: profileColumn.implicitHeight + 12
+                            radius: root.tokens.cornerRadiusControl
+                            color: applied ? root.tokens.accentSoft : "transparent"
+
+                            ColumnLayout {
+                                id: profileColumn
+                                anchors.fill: parent
+                                anchors.leftMargin: 10
+                                anchors.rightMargin: 10
+                                anchors.topMargin: 6
+                                anchors.bottomMargin: 6
+                                spacing: root.tokens.spacingTiny
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: root.tokens.spacingSmall
+
+                                    UiLabel {
+                                        id: profileLabel
+                                        objectName: "voiceProfileLabel"
+                                        tokens: root.tokens
+                                        kind: bodyKind
+                                        Layout.fillWidth: true
+                                        Layout.minimumWidth: 0
+                                        text: String(profileRow.modelData.label || "")
+                                        font.weight: Font.Medium
+                                        elide: Text.ElideRight
+                                        HoverHandler { id: profileLabelHover }
+                                        CompactToolTip {
+                                            tokens: root.tokens
+                                            active: profileLabelHover.hovered
+                                                && profileLabel.truncated
+                                            text: String(profileRow.modelData.label || "")
+                                        }
+                                    }
+                                    UiLabel {
+                                        tokens: root.tokens
+                                        kind: noteKind
+                                        visible: profileRow.applied
+                                        text: qsTr("当前使用")
+                                        color: root.tokens.successColor
+                                        font.weight: Font.Medium
+                                    }
+                                }
+
+                                UiLabel {
+                                    objectName: "voiceProfileConflictLabel"
+                                    tokens: root.tokens
+                                    kind: noteKind
+                                    Layout.fillWidth: true
+                                    Layout.minimumWidth: 0
+                                    visible: profileRow.conflictText.length > 0
+                                    text: profileRow.conflictText
+                                    color: root.tokens.errorColor
+                                    wrapMode: Text.WordWrap
+                                }
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: root.tokens.spacingSmall
+
+                                    CompactButton {
+                                        objectName: "applyVoiceProfileButton"
+                                        tokens: root.tokens
+                                        compactMinimumWidth: tokens.buttonWidth4Chars
+                                        text: qsTr("应用此配置")
+                                        enabled: !root.configurationWriteBusy
+                                        onClicked: root.runVoiceProfileAction(
+                                            "apply", profileRow.profileId, "")
+                                    }
+                                    CompactButton {
+                                        objectName: "updateVoiceProfileButton"
+                                        tokens: root.tokens
+                                        compactMinimumWidth: tokens.buttonWidth4Chars
+                                        visible: !profileRow.automatic
+                                        text: qsTr("更新")
+                                        enabled: !root.configurationWriteBusy
+                                        onClicked: root.runVoiceProfileAction(
+                                            "update", profileRow.profileId, "")
+                                    }
+                                    Item { Layout.fillWidth: true }
+                                    CompactButton {
+                                        objectName: "renameVoiceProfileButton"
+                                        tokens: root.tokens
+                                        compactMinimumWidth: tokens.buttonWidth4Chars
+                                        visible: !profileRow.automatic
+                                        text: qsTr("重命名")
+                                        enabled: !root.configurationWriteBusy
+                                        onClicked: {
+                                            voiceProfileNameDialog.operation = "rename"
+                                            voiceProfileNameDialog.targetId =
+                                                profileRow.profileId
+                                            voiceProfileNameDialog.suggestedName =
+                                                String(profileRow.modelData.name || "")
+                                            voiceProfileNameDialog.open()
+                                        }
+                                    }
+                                    CompactButton {
+                                        objectName: "copyVoiceProfileButton"
+                                        tokens: root.tokens
+                                        compactMinimumWidth: tokens.buttonWidth4Chars
+                                        text: qsTr("复制")
+                                        enabled: !root.configurationWriteBusy
+                                        onClicked: {
+                                            voiceProfileNameDialog.operation = "copy"
+                                            voiceProfileNameDialog.targetId =
+                                                profileRow.profileId
+                                            voiceProfileNameDialog.suggestedName =
+                                                profileRow.automatic
+                                                    ? qsTr("全局配置副本")
+                                                    : String(profileRow.modelData.name || "")
+                                                        + qsTr(" 副本")
+                                            voiceProfileNameDialog.open()
+                                        }
+                                    }
+                                    CompactButton {
+                                        objectName: "exportVoiceProfileButton"
+                                        tokens: root.tokens
+                                        compactMinimumWidth: tokens.buttonWidth4Chars
+                                        text: qsTr("导出")
+                                        enabled: !root.configurationWriteBusy
+                                        onClicked: {
+                                            voiceProfileExportDialog.pendingProfileId =
+                                                profileRow.profileId
+                                            voiceProfileExportDialog.open()
+                                        }
+                                    }
+                                    CompactButton {
+                                        objectName: "deleteVoiceProfileButton"
+                                        tokens: root.tokens
+                                        compactMinimumWidth: tokens.buttonWidth4Chars
+                                        visible: !profileRow.automatic
+                                        text: qsTr("删除")
+                                        enabled: !root.configurationWriteBusy
+                                        onClicked: {
+                                            voiceProfileDeleteDialog.pendingProfileId =
+                                                profileRow.profileId
+                                            voiceProfileDeleteDialog.pendingProfileLabel =
+                                                String(profileRow.modelData.label || "")
+                                            voiceProfileDeleteDialog.open()
+                                        }
+                                    }
+                                }
+                            }
+
+                            SettingsRowDivider {
+                                tokens: root.tokens
+                            }
+                        }
+                    }
+                }
+            }
+
+            UiLabel {
+                objectName: "voiceProfileDialogMessage"
+                tokens: root.tokens
+                kind: noteKind
+                Layout.fillWidth: true
+                visible: text.length > 0
+                text: root.voiceProfileMessage
+                textFormat: Text.PlainText
+                wrapMode: Text.WrapAnywhere
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: root.tokens.spacingSmall
+
+                CompactButton {
+                    objectName: "saveVoiceProfileButton"
+                    tokens: root.tokens
+                    compactMinimumWidth: tokens.buttonWidth4Chars
+                    text: qsTr("保存当前为配置")
+                    enabled: !root.configurationWriteBusy
+                    onClicked: {
+                        voiceProfileNameDialog.operation = "save"
+                        voiceProfileNameDialog.targetId = ""
+                        voiceProfileNameDialog.suggestedName = ""
+                        voiceProfileNameDialog.open()
+                    }
+                }
+                CompactButton {
+                    objectName: "exportAllVoiceProfilesButton"
+                    tokens: root.tokens
+                    compactMinimumWidth: tokens.buttonWidth4Chars
+                    text: qsTr("导出全部")
+                    enabled: !root.configurationWriteBusy
+                    onClicked: voiceProfileExportAllDialog.open()
+                }
+                CompactButton {
+                    objectName: "importVoiceProfileButton"
+                    tokens: root.tokens
+                    compactMinimumWidth: tokens.buttonWidth4Chars
+                    text: qsTr("导入配置")
+                    enabled: !root.configurationWriteBusy
+                    onClicked: voiceProfileImportDialog.open()
+                }
+                Item { Layout.fillWidth: true }
+                CompactButton {
+                    objectName: "closeVoiceProfileManagerButton"
+                    tokens: root.tokens
+                    compactMinimumWidth: tokens.buttonWidth4Chars
+                    text: qsTr("关闭")
+                    onClicked: voiceProfileManagerDialog.reject()
+                }
+            }
+        }
+    }
+
     Connections {
         target: SettingsController
         function onHotkeyCaptured(chord) {
@@ -314,13 +621,8 @@ Item {
     }
 
     onVisibleChanged: {
-        if (visible) {
-            SettingsController.refreshVoiceProgramStatus()
-            SettingsController.refreshVoiceProgramOptions()
-            SettingsController.loadVoiceHotkeyFromProvider()
-        } else {
+        if (!visible)
             stopVoiceHotkeyCapture("page_hidden")
-        }
     }
 
     ScrollView {
@@ -468,7 +770,7 @@ Item {
             }
 
             SectionFrame {
-                objectName: "voiceProgramSection"
+                objectName: "voiceKeySection"
                 tokens: root.tokens
                 Layout.fillWidth: true
                 horizontalPadding: 0
@@ -476,366 +778,270 @@ Item {
                 contentSpacing: 0
 
                 SettingsSectionTitle {
-                    objectName: "voiceProgramSectionTitle"
+                    objectName: "voiceKeySectionTitle"
                     tokens: root.tokens
-                    text: qsTr("语音程序")
-                }
-
-                UiLabel {
-                    objectName: "legacyVoiceProgramNotice"
-                    visible: root.customProgramSelected
-                    tokens: root.tokens
-                    kind: noteKind
-                    Layout.fillWidth: true
-                    Layout.leftMargin: root.tokens.spacingLarge
-                    Layout.rightMargin: root.tokens.spacingLarge
-                    wrapMode: Text.WordWrap
-                    text: root.voiceProgramUnsupported
-                        ? qsTr("此旧配置不能用于谷歌语音，请改选已适配程序")
-                        : qsTr("旧自定义配置已保留，请改选已适配程序")
+                    text: qsTr("语音键")
                 }
 
                 InlineSettingsRow {
-                    objectName: "voiceProgramSelectionRow"
+                    objectName: "voiceKeyHintRow"
                     tokens: root.tokens
-                    // Do not let a long note shrink the editor below its children.
-                    // Keep this provider-specific sizing out of the shared row.
-                    editorColumnWidth: root.voiceEditorGroupWidth
-                        + (root.voiceProgramLaunchable
-                            ? root.settingsActionColumnWidth + tokens.spacingSmall : 0)
-                    stateColumnWidth: root.settingsStateColumnWidth
-                    actionColumnWidth: root.settingsActionColumnWidth
-                    titleText: qsTr("选择程序")
-                    descriptionText: !root.voiceProgramManaged
-                            ? qsTr("请选择语音程序，普通按键不受影响") : ""
-                    stateText: root.voiceProgramStateText()
-                    stateColor: root.voiceProgramStateColor
+                    titleText: qsTr("触发方式")
+                    descriptionText: qsTr("短按一直开麦，再按一次停止；长按持续开麦，松开停止")
+                    showDivider: true
+                }
+
+                InlineSettingsRow {
+                    objectName: "voiceInputSourceRow"
+                    tokens: root.tokens
+                    editorColumnWidth: 240
+                    titleText: qsTr("语音模式")
+                    descriptionText: String(SettingsController.voiceInputSource) === "remote"
+                        ? qsTr("模式1：遥控器麦克风；按下即触发，长按持续说话")
+                        : qsTr("模式2：本机麦克风；按键可自定义，长短按都支持")
+                    showDivider: true
 
                     editorData: [
                         SelectionComboBox {
-                            id: voiceProgramCombo
-                            objectName: "voiceProgramCombo"
-                            tokens: root.tokens
-                            Layout.preferredWidth: root.voiceEditorGroupWidth
-                            Layout.minimumWidth: root.voiceEditorGroupWidth
-                            Layout.maximumWidth: root.voiceEditorGroupWidth
-                            // Controller indices stay stable for legacy provider settings.
-                            // Hide the reserved none entry; -1 is a prompt, not an option.
-                            model: SettingsController.voiceProgramOptions.slice(1)
-                            currentIndex: root.voiceProgramMenuIndex
-                            // Qt selects row zero when an asynchronously refreshed
-                            // model arrives; restore the explicit persisted choice.
-                            function restoreSelectedProgram() {
-                                currentIndex = Qt.binding(function() {
-                                    return root.voiceProgramMenuIndex
-                                })
-                            }
-                            onModelChanged: Qt.callLater(restoreSelectedProgram)
-                            Component.onCompleted: Qt.callLater(restoreSelectedProgram)
-                            displayText: root.voiceProgramDisplayText
-                            enabled: !root.voiceHotkeyBusy
-                                && !root.configurationWriteBusy
-                            onActivated: SettingsController.selectVoiceProgramMenuOption(index)
-                            Accessible.name: qsTr("语音程序")
-                        },
-                        CheckBox {
-                            id: voiceProgramElevatedCheckBox
-                            objectName: "voiceProgramElevatedCheckBox"
-                            visible: root.voiceProgramLaunchable
-                            implicitHeight: tokens.controlHeight
-                            Layout.preferredWidth: root.settingsActionColumnWidth
-                            Layout.minimumWidth: root.settingsActionColumnWidth
-                            Layout.maximumWidth: root.settingsActionColumnWidth
-                            leftPadding: 0
-                            rightPadding: 0
-                            spacing: tokens.spacingSmall
-                            indicator.width: 16
-                            indicator.height: 16
-                            enabled: root.voiceProgramManaged
-                                && !root.voiceHotkeyBusy
-                                && !root.configurationWriteBusy
-                            text: qsTr("管理员启动")
-                            font.family: tokens.fontFamily
-                            font.pixelSize: tokens.fontSizeSmall
-                            checked: SettingsController.voiceProgramLaunchElevated
-                            onClicked: SettingsController.voiceProgramLaunchElevated = checked
-                        }
-                    ]
-                    CompactButton {
-                        objectName: "openVoiceProgramSettingsButton"
-                        visible: root.wetypeSelected
-                            || root.doubaoSelected
-                            || root.chatterflySelected
-                            || (root.sogouSelected
-                                && SettingsController.voiceProgramStatusCode === "not_found")
-                        tokens: root.tokens
-                        Layout.fillWidth: true
-                        text: root.sogouSelected
-                            && SettingsController.voiceProgramStatusCode === "not_found"
-                            ? qsTr("去安装") : qsTr("打开设置")
-                        enabled: !root.voiceHotkeyBusy
-                        onClicked: SettingsController.openVoiceProgramSettings()
-                    }
-                }
-
-                InlineSettingsRow {
-                    objectName: "rc003RemoteRecordingModeRow"
-                    visible: SettingsController.isRc003Device
-                    tokens: root.tokens
-                    titleText: qsTr("按键模式")
-                    descriptionText: qsTr("仅支持按住型")
-                    showDivider: root.voiceProgramManaged
-                }
-
-                InlineSettingsRow {
-                    objectName: "remoteRecordingModeRow"
-                    visible: !SettingsController.isRc003Device
-                    tokens: root.tokens
-                    titleText: qsTr("按键模式")
-                    showDivider: root.voiceProgramManaged
-                    descriptionText: SettingsController.remoteRecordingModeIndex === 0
-                        ? qsTr("按住说话，松开结束")
-                        : root.doubaoSelected
-                            ? qsTr("按一下开始，再按结束；到时或操作键盘也会结束")
-                        : root.wetypeSelected || root.sogouSelected
-                            ? qsTr("按一下开始，再按结束；到时停止遥控音频")
-                            : qsTr("按下开始，再按结束。注意期间按键处于按下状态")
-                    editorColumnWidth: root.remoteRecordingModeComboWidth
-                        + (SettingsController.remoteRecordingModeIndex === 1
-                            ? root.remoteRecordingLimitComboWidth : 0)
-                        + (SettingsController.remoteRecordingModeIndex === 1 ? root.tokens.spacingSmall : 0)
-                    editorData: [SelectionComboBox {
-                        objectName: "remoteRecordingModeCombo"
-                        tokens: root.tokens
-                        Layout.preferredWidth: root.remoteRecordingModeComboWidth
-                        Layout.minimumWidth: root.remoteRecordingModeComboWidth
-                        Layout.maximumWidth: root.remoteRecordingModeComboWidth
-                        model: [
-                            qsTr("按住型"),
-                            qsTr("开关型")
-                        ]
-                        currentIndex: SettingsController.remoteRecordingModeIndex
-                        enabled: !SettingsController.settingsSaveBusy && !root.configurationWriteBusy
-                            && !SettingsController.remoteSelectionBusy && !SettingsController.inputCaptureInUse
-                            && !root.voiceHotkeyRuntimeBusy && !root.voiceHotkeyBusy
-                        onActivated: function(index) {
-                            SettingsController.setRemoteRecordingPreferences(
-                                index, SettingsController.remoteRecordingLimitIndex)
-                            currentIndex = Qt.binding(function() {
-                                return SettingsController.remoteRecordingModeIndex
-                            })
-                        }
-                        Accessible.name: qsTr("按键模式")
-                    }, SelectionComboBox {
-                        objectName: "remoteRecordingLimitCombo"
-                        visible: SettingsController.remoteRecordingModeIndex === 1
-                        tokens: root.tokens
-                        Layout.preferredWidth: root.remoteRecordingLimitComboWidth
-                        Layout.minimumWidth: root.remoteRecordingLimitComboWidth
-                        Layout.maximumWidth: root.remoteRecordingLimitComboWidth
-                        model: SettingsController.remoteRecordingLimitOptions
-                        currentIndex: SettingsController.remoteRecordingLimitIndex
-                        enabled: !SettingsController.settingsSaveBusy && !root.configurationWriteBusy
-                            && !SettingsController.remoteSelectionBusy && !SettingsController.inputCaptureInUse
-                            && !root.voiceHotkeyRuntimeBusy && !root.voiceHotkeyBusy
-                        onActivated: function(index) {
-                            SettingsController.setRemoteRecordingPreferences(
-                                SettingsController.remoteRecordingModeIndex, index)
-                            currentIndex = Qt.binding(function() {
-                                return SettingsController.remoteRecordingLimitIndex
-                            })
-                        }
-                        Accessible.name: qsTr("最长录音时间")
-                    }]
-                }
-
-                InlineSettingsRow {
-                    objectName: "voiceProgramCustomPathRow"
-                    visible: root.customProgramSelected
-                    tokens: root.tokens
-                    stateColumnWidth: root.settingsStateColumnWidth
-                    actionColumnWidth: root.settingsActionColumnWidth
-                    titleText: qsTr("程序路径")
-                    descriptionText: ""
-
-                    editorData: [
-                        CompactTextField {
-                            objectName: "voiceProgramCustomPathField"
+                            objectName: "voiceInputSourceCombo"
                             tokens: root.tokens
                             Layout.fillWidth: true
                             Layout.minimumWidth: 180
-                            enabled: !root.voiceHotkeyBusy && !root.configurationWriteBusy
-                            text: SettingsController.voiceProgramCustomPath
-                            placeholderText: qsTr("选择或粘贴 .exe / .lnk 路径")
-                            onEditingFinished: {
-                                SettingsController.voiceProgramCustomPath = text
-                                text = Qt.binding(function() { return SettingsController.voiceProgramCustomPath })
-                            }
-                            Accessible.name: qsTr("自定义语音程序路径")
+                            model: SettingsController.voiceInputSourceOptions
+                            currentIndex: SettingsController.voiceInputSourceIndex
+                            onActivated: SettingsController.setVoiceInputSourceIndex(index)
+                            enabled: !root.configurationWriteBusy
+                                && !root.voiceHotkeyBusy
+                            Accessible.name: qsTr("语音模式")
                         }
                     ]
-                        CompactButton {
-                            objectName: "browseVoiceProgramButton"
-                            tokens: root.tokens
-                            Layout.fillWidth: true
-                            text: qsTr("选择")
-                            enabled: !root.voiceHotkeyBusy
-                                && !root.configurationWriteBusy
-                            onClicked: voiceProgramFileDialog.open()
-                        }
                 }
 
                 InlineSettingsRow {
-                    objectName: "voiceHotkeyRow"
-                    visible: root.voiceProgramManaged
+                    objectName: "voiceShortPressDismissRow"
                     tokens: root.tokens
-                    showDivider: root.customProgramSelected
-                    editorColumnWidth: root.voiceHotkeyEditorWidth
-                    stateColumnWidth: root.settingsStateColumnWidth
                     actionColumnWidth: root.settingsActionColumnWidth
-                    titleText: qsTr("语音按键")
-                    descriptionText: root.voiceHotkeyCaptureError.length > 0
-                        ? root.voiceHotkeyCaptureError
-                        : root.wetypeSelected
-                        ? qsTr("刷新时会打开微信设置")
-                        : root.doubaoSelected
-                        ? SettingsController.remoteRecordingModeIndex === 1
-                            ? qsTr("自动读取开关型快捷键")
-                            : qsTr("自动读取按住型快捷键")
-                        : root.sogouSelected
-                        ? qsTr("自动读取%1快捷键").arg(root.voiceHotkeyModeLabel)
-                        : root.chatterflySelected
-                        ? qsTr("自动读取 Chatterfly 语音输入快捷键")
-                        : qsTr("请录入按住型快捷键")
-                    stateText: root.voiceHotkeyRecording
-                        ? SettingsController.hotkeyCaptureReady
-                            ? qsTr("录入中") : qsTr("准备中")
-                        : root.voiceHotkeyBusy ? qsTr("正在处理")
-                            : root.chatterflySelected
-                                && SettingsController.holdVoiceHotkeyText.length === 0
-                                ? qsTr("待录入")
-                            : root.voiceHotkeyCaptureError.length > 0
-                                || SettingsController.voiceHotkeySaveState === "retry"
-                                ? qsTr("点击手动录入")
-                                : SettingsController.voiceHotkeySource === "manual"
-                                    ? qsTr("手动录入")
-                                    : SettingsController.voiceHotkeySource === "auto"
-                                        ? qsTr("自动识别") : qsTr("已保存")
-                    stateColor: root.voiceHotkeyRecording || root.voiceHotkeyBusy
-                        ? tokens.voiceAccent
-                        : root.voiceHotkeyCaptureError.length > 0
-                            || SettingsController.voiceHotkeySaveState === "retry"
-                            ? tokens.errorColor : tokens.successColor
+                    visible: String(SettingsController.voiceInputSource) === "remote"
+                    titleText: qsTr("短按补偿")
+                    descriptionText: qsTr("短按弹出后立刻再按一次，快速关闭输入框；长按不受影响。部分输入法不需要")
+                    showDivider: true
+
+                    CompactSwitch {
+                        id: voiceShortPressDismissSwitch
+                        objectName: "voiceShortPressDismissSwitch"
+                        tokens: root.tokens
+                        checked: SettingsController.voiceShortPressDismiss
+                        enabled: !root.configurationWriteBusy
+                            && !root.voiceHotkeyBusy
+                        Accessible.name: qsTr("短按自动双击关闭输入框")
+                        onToggled: {
+                            if (checked !== SettingsController.voiceShortPressDismiss)
+                                SettingsController.setVoiceShortPressDismiss(checked)
+                        }
+                    }
+                }
+
+                InlineSettingsRow {
+                    objectName: "localMicrophoneRow"
+                    tokens: root.tokens
+                    editorColumnWidth: 300
+                    visible: String(SettingsController.voiceInputSource) === "local"
+                    titleText: qsTr("本机麦克风")
+                    descriptionText: SettingsController.localMicrophoneOptions.length > 0
+                        ? qsTr("模式2 使用的录音设备")
+                        : qsTr("未找到录音设备，插好后点“刷新”")
+                    showDivider: true
 
                     editorData: [
-                        Item {
+                        SelectionComboBox {
+                            objectName: "localMicrophoneCombo"
+                            tokens: root.tokens
                             Layout.fillWidth: true
-                            Layout.minimumWidth: 130
-                            implicitHeight: tokens.controlHeight
-
-                            CompactTextField {
-                                id: voiceHotkeyField
-                                objectName: "holdVoiceHotkeyField"
-                                anchors.fill: parent
-                                tokens: root.tokens
-                                rightPadding: root.voiceHotkeyRefreshVisible ? 34 : 7
-                                readOnly: true
-                                background.visible: root.voiceHotkeyRecording
-                                    || SettingsController.voiceHotkeySource === "manual"
-                                    || SettingsController.voiceHotkeySaveState === "processing"
-                                rightInset: root.voiceHotkeyRefreshVisible
-                                    ? refreshVoiceHotkeyButton.width + tokens.spacingTiny : 0
-                                activeFocusOnPress: root.voiceHotkeyRecording
-                                activeFocusOnTab: root.voiceHotkeyRecording
-                                selectByMouse: false
-                                enabled: !root.voiceHotkeyBusy
-                                    && !root.configurationWriteBusy
-                                    && !root.voiceProgramUnsupported
-                                text: root.voiceHotkeyRecording
-                                    ? SettingsController.hotkeyCaptureReady
-                                        ? qsTr("请按快捷键") : qsTr("正在准备…")
-                                    : SettingsController.formatHotkeyText(SettingsController.holdVoiceHotkeyText)
-                                color: root.voiceHotkeyRecording
-                                    ? tokens.accent : tokens.textPrimary
-                                placeholderText: qsTr("尚未录入")
-                                Accessible.name: qsTr("语音按键，录入%1快捷键").arg(root.voiceHotkeyModeLabel)
-                                Keys.onEscapePressed: root.stopVoiceHotkeyCapture(
-                                    "escape_pressed")
-                                onActiveFocusChanged: {
-                                    if (!activeFocus && root.voiceHotkeyRecording)
-                                        root.stopVoiceHotkeyCapture("focus_lost")
-                                }
-                            }
-                            CompactButton {
-                                id: refreshVoiceHotkeyButton
-                                objectName: "refreshVoiceHotkeyButton"
-                                visible: root.voiceHotkeyRefreshVisible
-                                anchors.right: parent.right
-                                anchors.verticalCenter: parent.verticalCenter
-                                width: 28
-                                height: parent.height
-                                tokens: root.tokens
-                                flat: true
-                                enabled: root.voiceHotkeyRefreshEnabled
-                                Accessible.name: qsTr("重新读取语音按键")
-                                onClicked: SettingsController.refreshVoiceHotkeyFromProvider()
-                                contentItem: IconGlyph {
-                                    tokens: root.tokens
-                                    glyph: "\uE72C"
-                                    glyphSize: 14
-                                    color: !refreshVoiceHotkeyButton.enabled
-                                        ? tokens.disabledText
-                                        : refreshVoiceHotkeyButton.hovered
-                                            ? tokens.accent : tokens.textSecondary
-                                }
-                                HoverHandler { id: refreshVoiceHotkeyHover }
-                                CompactToolTip {
-                                    tokens: root.tokens
-                                    active: refreshVoiceHotkeyHover.hovered
-                                    text: root.wetypeSelected
-                                        ? SettingsController.remoteRecordingModeIndex === 1
-                                            ? qsTr("打开微信设置并读取启动语音输入快捷键；失败保留原值")
-                                            : qsTr("打开微信设置并读取按住说话快捷键；失败保留原值")
-                                        : qsTr("重新读取输入法当前的%1快捷键").arg(root.voiceHotkeyModeLabel)
-                                }
-                            }
+                            Layout.minimumWidth: 180
+                            model: SettingsController.localMicrophoneOptions
+                            currentIndex: SettingsController.localMicrophoneIndex
+                            onActivated: SettingsController.setLocalMicrophoneIndex(index)
+                            enabled: !root.configurationWriteBusy
+                                && !root.voiceHotkeyBusy
+                                && SettingsController.localMicrophoneOptions.length > 0
+                            Accessible.name: qsTr("本机麦克风")
+                        },
+                        CompactButton {
+                            objectName: "refreshLocalMicrophoneButton"
+                            tokens: root.tokens
+                            compactMinimumWidth: tokens.buttonWidth4Chars
+                            text: qsTr("刷新")
+                            onClicked: SettingsController.refreshLocalMicrophones()
                         }
                     ]
-                    CompactButton {
-                        id: recordVoiceHotkeyButton
-                        objectName: "recordVoiceHotkeyButton"
-                        tokens: root.tokens
-                        Layout.fillWidth: true
-                        compactMinimumWidth: tokens.buttonWidth4Chars
-                        text: root.voiceHotkeyRecording
-                            ? qsTr("停止") : qsTr("手动录入")
-                        enabled: !root.voiceHotkeyBusy
-                            && !root.configurationWriteBusy
-                            && !root.voiceProgramUnsupported
-                        onClicked: root.startVoiceHotkeyCapture()
-                    }
                 }
 
-                SettingsListRow {
-                    objectName: "voiceProgramAutoStartRow"
-                    visible: root.customProgramSelected
-                    tokens: root.tokens
-                    showDivider: false
-                    titleText: qsTr("随遥控器服务启动")
-                    descriptionText: qsTr("关闭后请自行启动语音程序")
-                    CompactSwitch {
-                        objectName: "voiceProgramAutoStartSwitch"
+                Repeater {
+                    id: voiceSlotRepeater
+                    objectName: "voiceSlotHotkeyRepeater"
+                    model: root.voiceSlots
+
+                    InlineSettingsRow {
+                        id: slotRow
+                        required property int modelData
+                        readonly property int slot: modelData
+                        function recordingField() {
+                            return root.voiceHotkeyRecording
+                                    && root.voiceRecordingSlot === slot
+                                ? slotHotkeyField : null
+                        }
+                        function claimFocus() {
+                            if (root.voiceHotkeyRecording
+                                    && root.voiceRecordingSlot === slot)
+                                slotHotkeyField.forceActiveFocus()
+                        }
+
+                        objectName: "voiceHotkeyRow"
                         tokens: root.tokens
-                        checked: SettingsController.voiceProgramLaunchOnBridgeStart
-                        enabled: !root.voiceHotkeyBusy && !root.configurationWriteBusy
-                        Accessible.name: qsTr("随遥控器服务启动语音程序")
-                        onToggled: {
-                            if (checked !== SettingsController.voiceProgramLaunchOnBridgeStart)
-                                SettingsController.voiceProgramLaunchOnBridgeStart = checked
+                        stateColumnWidth: root.settingsStateColumnWidth
+                        actionColumnWidth: root.settingsActionColumnWidth
+                        showDivider: true
+                        // Track the QVariantMap property (not the voiceSlotHotkeyText()
+                        // method, which QML cannot observe) so the row refreshes whenever
+                        // the slot shortcut changes.
+                        readonly property string slotHotkey: {
+                            var entries = SettingsController.voiceSlotHotkeys
+                            var value = entries[slot]
+                            return value === undefined ? "" : String(value)
+                        }
+                        titleText: SettingsController.voiceSlotLabel(slot)
+                        descriptionText: !SettingsController.voiceSlotEditable(slot)
+                            ? qsTr("模式1 只用语音1（遥控器话筒键）；要把它绑到别的按键请切到模式2")
+                            : root.voiceHotkeyCaptureError.length > 0
+                                    && root.voiceRecordingSlot === slot
+                                ? root.voiceHotkeyCaptureError
+                                : qsTr("为该语音键单独录入键盘快捷键")
+                        stateText: root.voiceHotkeyRecording
+                                && root.voiceRecordingSlot === slot
+                            ? SettingsController.hotkeyCaptureReady
+                                ? qsTr("录入中") : qsTr("准备中")
+                            : root.voiceHotkeyBusy
+                                ? qsTr("正在处理")
+                                : slotRow.slotHotkey.length === 0
+                                    ? qsTr("待录入") : qsTr("已保存")
+                        stateColor: root.voiceHotkeyRecording
+                                && root.voiceRecordingSlot === slot
+                            ? tokens.voiceAccent
+                            : slotRow.slotHotkey.length === 0
+                                ? tokens.errorColor : tokens.successColor
+
+                        editorData: [
+                            Item {
+                                Layout.fillWidth: true
+                                Layout.minimumWidth: 130
+                                implicitHeight: tokens.controlHeight
+
+                                CompactTextField {
+                                    id: slotHotkeyField
+                                    objectName: "voiceSlotHotkeyField"
+                                    anchors.fill: parent
+                                    tokens: root.tokens
+                                    readOnly: true
+                                    background.visible: root.voiceHotkeyRecording
+                                        && root.voiceRecordingSlot === slot
+                                    activeFocusOnPress: root.voiceHotkeyRecording
+                                        && root.voiceRecordingSlot === slot
+                                    activeFocusOnTab: root.voiceHotkeyRecording
+                                        && root.voiceRecordingSlot === slot
+                                    selectByMouse: false
+                                    enabled: !root.voiceHotkeyBusy
+                                        && !root.configurationWriteBusy
+                                    text: root.voiceHotkeyRecording
+                                            && root.voiceRecordingSlot === slot
+                                        ? SettingsController.hotkeyCaptureReady
+                                            ? qsTr("请按快捷键") : qsTr("正在准备…")
+                                        : SettingsController.formatHotkeyText(
+                                            slotRow.slotHotkey)
+                                    color: root.voiceHotkeyRecording
+                                            && root.voiceRecordingSlot === slot
+                                        ? tokens.accent : tokens.textPrimary
+                                    placeholderText: qsTr("尚未录入")
+                                    Accessible.name: qsTr("录入语音快捷键")
+                                    Keys.onEscapePressed: root.stopVoiceHotkeyCapture(
+                                        "escape_pressed")
+                                    onActiveFocusChanged: {
+                                        if (!activeFocus && root.voiceHotkeyRecording
+                                                && root.voiceRecordingSlot === slot)
+                                            root.stopVoiceHotkeyCapture("focus_lost")
+                                    }
+                                }
+                            }
+                        ]
+                        CompactButton {
+                            objectName: "recordVoiceHotkeyButton"
+                            tokens: root.tokens
+                            Layout.fillWidth: true
+                            compactMinimumWidth: tokens.buttonWidth4Chars
+                            text: root.voiceHotkeyRecording
+                                    && root.voiceRecordingSlot === slot
+                                ? qsTr("停止") : qsTr("手动录入")
+                            enabled: !root.voiceHotkeyBusy
+                                && !root.configurationWriteBusy
+                                && !root.voiceHotkeyRuntimeBusy
+                                && SettingsController.voiceSlotEditable(slot)
+                            onClicked: root.startVoiceHotkeyCapture(slot)
                         }
                     }
                 }
+            }
 
+            // Saved profiles: each one bundles a button layout, the voice mode
+            // and (for 模式2) the microphone. The page stays compact - the full
+            // list lives in the manager dialog so its many actions never wrap.
+            SectionFrame {
+                objectName: "voiceProfileSection"
+                tokens: root.tokens
+                Layout.fillWidth: true
+                horizontalPadding: 0
+                verticalPadding: 4
+                contentSpacing: 0
+
+                SettingsSectionTitle {
+                    objectName: "voiceProfileSectionTitle"
+                    tokens: root.tokens
+                    text: qsTr("配置档案")
+                }
+
+                InlineSettingsRow {
+                    objectName: "voiceProfileHintRow"
+                    tokens: root.tokens
+                    stateColumnWidth: 0
+                    actionColumnWidth: root.settingsActionColumnWidth
+                    titleText: qsTr("已保存配置")
+                    descriptionText: root.activeVoiceProfileName.length > 0
+                        ? qsTr("当前使用「%1」；可切换按键映射、语音模式与麦克风")
+                            .arg(root.activeVoiceProfileName)
+                        : qsTr("切换按键映射、语音模式与麦克风")
+                    showDivider: false
+
+                    CompactButton {
+                        objectName: "manageVoiceProfilesButton"
+                        tokens: root.tokens
+                        compactMinimumWidth: root.settingsActionColumnWidth
+                        text: qsTr("管理配置…")
+                        enabled: !root.configurationWriteBusy
+                        onClicked: voiceProfileManagerDialog.open()
+                    }
+                }
+
+                UiLabel {
+                    objectName: "voiceProfileMessage"
+                    tokens: root.tokens
+                    kind: noteKind
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 10
+                    Layout.rightMargin: 10
+                    Layout.bottomMargin: 6
+                    visible: text.length > 0 && !voiceProfileManagerDialog.visible
+                    text: root.voiceProfileMessage
+                    textFormat: Text.PlainText
+                    wrapMode: Text.WrapAnywhere
+                }
             }
 
             SectionFrame {
@@ -914,12 +1120,12 @@ Item {
             }
 
             UiLabel {
-                objectName: "holdRecordingNote"
+                objectName: "voiceGestureNote"
                 tokens: root.tokens
                 kind: noteKind
                 Layout.fillWidth: true
                 wrapMode: Text.Wrap
-                text: qsTr("按住型录音期间，语音快捷键会保持按下。请避免同时操作其他按键/鼠标操作。设置快捷键时，请留意与常用操作的冲突。")
+                text: qsTr("语音键按下后，遥控器麦克风会按触发方式开启。开启期间请避免同时操作其他按键或鼠标；录入快捷键时请留意与常用操作的冲突。")
             }
 
             Item { Layout.preferredHeight: tokens.pageVerticalPadding }
@@ -932,16 +1138,7 @@ Item {
         enabled: root.voiceHotkeyRecording
         acceptedButtons: Qt.AllButtons
         onTapped: function(eventPoint, button) {
-            const fieldPoint = voiceHotkeyField.mapFromItem(
-                voiceScroll.contentItem,
-                eventPoint.position.x,
-                eventPoint.position.y
-            )
-            const insideField = fieldPoint.x >= 0
-                && fieldPoint.y >= 0
-                && fieldPoint.x < voiceHotkeyField.width
-                && fieldPoint.y < voiceHotkeyField.height
-            if (!insideField)
+            if (!root.tapInsideRecordingField(eventPoint))
                 root.stopVoiceHotkeyCapture()
         }
     }

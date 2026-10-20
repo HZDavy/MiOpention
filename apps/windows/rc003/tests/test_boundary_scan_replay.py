@@ -33,7 +33,7 @@ _EXCLUDED_DIR_NAMES = {
     "pyinstaller-work",
     "third_party",
 }
-_EXCLUDED_ROOT_FILE_PATTERNS = ("无线麦便携测试包-*.zip",)
+_EXCLUDED_ROOT_FILE_PATTERNS = ("MiOpention便携测试包-*.zip",)
 
 
 def _is_excluded_generated_path(path: Path, root: Path) -> bool:
@@ -110,10 +110,13 @@ _AUTOSTART_MARKERS = ("CurrentVersion\\Run", "userstartup")
 # test_vb_cable_bundle_py_is_exempt_only_for_its_documented_elevation_reason
 # below, which proves this exemption is not a blank check).
 _REVIEWED_ELEVATION_MARKERS = {
-    Path("src/ovb_rc003/chromecast_pipe_windows.py"): {"runas", "ShellExecute"},
+    Path("src/ovb_rc003/pipe_windows.py"): {"runas", "ShellExecute"},
     Path("src/ovb_rc003/hid_source_injector.py"): {"runas", "ShellExecute"},
-    Path("scripts/sogou_normal_submit_test.py"): {"IsUserAnAdmin"},
-    Path("scripts/sogou_stop_probe.py"): {"IsUserAnAdmin"},
+    # Launches the bundled, SHA-256-pinned THIRD-PARTY Interception installer
+    # with Windows' own "runas"/UAC verb, only from an explicit user click -
+    # see test_interception_driver_install_py_is_exempt_only_for_the_vendor_
+    # installer_launch below, which proves this is not a blank check.
+    Path("src/ovb_rc003/interception_driver_install.py"): {"runas", "ShellExecute"},
 }
 _BRANDING_CHECK_EXEMPT_RELATIVE_PATHS = {
     Path("tests/test_privacy_contract.py"),
@@ -125,7 +128,6 @@ _BRANDING_CHECK_EXEMPT_RELATIVE_PATHS = {
     Path("src/ovb_rc003/hid_elevation_windows.py"),
     Path("installer/RemoteMicRC003Setup.iss"),
     Path("src/ovb_rc003/vb_cable_bundle.py"),
-    Path("src/ovb_rc003/voice_program_manager.py"),
     # ATTRIBUTION.md documents the vendor's "runas"/UAC launch. The concise
     # README no longer has this marker and must pass the normal scan.
     Path("ATTRIBUTION.md"),
@@ -136,7 +138,6 @@ _AUTOSTART_CHECK_EXEMPT_RELATIVE_PATHS = {
     Path("tests/test_build_artifacts.py"),
     Path("tests/test_boundary_scan_replay.py"),
     Path("build/check-public-boundary.ps1"),
-    Path("src/ovb_rc003/voice_program_manager.py"),
     Path("src/ovb_rc003/startup_windows.py"),
     Path("installer/RemoteMicRC003Setup.iss"),
 }
@@ -285,14 +286,21 @@ class BoundaryScanReplayTests(unittest.TestCase):
         self.assertFalse(any(pattern.search(text) for pattern in _FORBIDDEN_BRANDING_PATTERNS))
         self.assertFalse(any(marker in text for marker in _AUTOSTART_MARKERS))
 
-    def test_voice_program_manager_is_exempt_only_for_third_party_elevation(self):
-        path = _RC003_ROOT / "src" / "ovb_rc003" / "voice_program_manager.py"
+    def test_interception_driver_install_py_is_exempt_only_for_the_vendor_installer_launch(self):
+        # Proves the exemption is scoped, not a blank check: the file must
+        # reference the elevation verb (or the exemption is dead weight), must
+        # never contain a forbidden BRANDING or AUTOSTART term, and must launch
+        # only the SHA-256-pinned bundled installer - never this app's own
+        # executable or an arbitrary caller-supplied command.
+        path = _RC003_ROOT / "src" / "ovb_rc003" / "interception_driver_install.py"
         text = path.read_text(encoding="utf-8")
         self.assertTrue(any(marker in text for marker in _ELEVATION_MARKERS))
         self.assertFalse(any(pattern.search(text) for pattern in _FORBIDDEN_BRANDING_PATTERNS))
-        self.assertNotIn("sys.executable", text)
-        self.assertIn("winreg.QueryValueEx", text)
-        self.assertNotIn("winreg.SetValueEx", text)
+        self.assertFalse(any(marker in text for marker in _AUTOSTART_MARKERS))
+        self.assertIn("INSTALLER_SHA256", text)
+        self.assertIn('"runas"', text)
+        self.assertIn("ShellExecuteExW", text)
+        self.assertNotIn("RequireAdministrator", text)
 
     def test_hid_elevation_module_has_only_the_fixed_on_demand_task_boundary(self):
         path = _RC003_ROOT / "src" / "ovb_rc003" / "hid_elevation_windows.py"
@@ -392,7 +400,7 @@ class BoundaryScanReplayTests(unittest.TestCase):
                 root / "build" / "smoke-dist-c23" / "RemoteMicRC003.exe",
                 root / "build" / "smoke-work-c23" / "analysis.pyd",
                 root / "build" / "ui-audit-c23" / "settings.png.exe",
-                root / "无线麦便携测试包-022.zip",
+                root / "MiOpention便携测试包-022.zip",
             ]
             for generated_path in generated_paths:
                 generated_path.parent.mkdir(parents=True, exist_ok=True)

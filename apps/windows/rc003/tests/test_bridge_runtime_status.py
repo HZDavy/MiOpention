@@ -441,14 +441,6 @@ class BridgeRuntimeStatusTests(unittest.TestCase):
                 voice_key_physicalizer_state="recovering",
             )
         )
-        self.assertTrue(
-            bridge_runtime_status.button_receiver_usable(
-                "chromecast-remote",
-                raw_input_state="chromecast_ready",
-                hid_tap_state="failed",
-                voice_key_physicalizer_state="failed",
-            )
-        )
 
     def test_invalid_or_partial_file_is_treated_as_unknown(self):
         path = bridge_runtime_status.status_path(self.root)

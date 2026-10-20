@@ -35,6 +35,22 @@ from enum import Enum
 from typing import Dict, Optional, Tuple
 
 
+# Per-button injection backend. These strings are the single source of truth;
+# :mod:`injection_backend` imports them rather than redefining them. They live
+# here because ``ButtonAction`` persists the value, and a module-level import
+# of ``injection_backend`` from here would be circular.
+DEFAULT_INJECT_MODE = "sendinput"
+INJECT_MODE_INTERCEPTION = "interception"
+INJECT_MODES = (DEFAULT_INJECT_MODE, INJECT_MODE_INTERCEPTION)
+
+
+def normalize_stored_inject_mode(value: object) -> str:
+    """Coerce a persisted injection mode, defaulting to SendInput."""
+
+    mode = str(value or "").strip().lower()
+    return mode if mode in INJECT_MODES else DEFAULT_INJECT_MODE
+
+
 class ActionKind(str, Enum):
     DISABLED = "disabled"
     KEY_COMBO = "key_combo"
@@ -71,7 +87,13 @@ class ActionKind(str, Enum):
     # selectable or executable product actions anymore.
     VOICE = "voice"
     VOICE_TOGGLE = "voice_toggle"
+    # Hold-to-talk slots. Slot 1 keeps the original persisted value so every
+    # schema-1/2 file that already maps the physical microphone to
+    # ``voice_hold`` keeps working unchanged; slots 2 and 3 let the user
+    # promote additional physical buttons to their own voice lifecycle.
     VOICE_HOLD = "voice_hold"
+    VOICE_HOLD_2 = "voice_hold_2"
+    VOICE_HOLD_3 = "voice_hold_3"
     OPEN_REMOTE_MIC = "open_remote_mic"
     OPEN_CODEX = "open_codex"
     OPEN_CLAUDE = "open_claude"
@@ -102,20 +124,41 @@ class ButtonTrigger(str, Enum):
     LONG_PRESS = "long_press"
 
 
-class VoiceTriggerMode(str, Enum):
-    TOGGLE = "toggle"
-    HOLD = "hold"
-
-
 VOICE_ACTION_KINDS = frozenset(
     {
         ActionKind.VOICE,
         ActionKind.VOICE_TOGGLE,
         ActionKind.VOICE_HOLD,
+        ActionKind.VOICE_HOLD_2,
+        ActionKind.VOICE_HOLD_3,
     }
 )
 
-SUPPORTED_VOICE_ACTION_KINDS = frozenset({ActionKind.VOICE_HOLD})
+# A voice slot is one independent hold-to-talk lifecycle. Slot 1 is the
+# historical single voice key (the physical microphone); slot 2 lets the user
+# promote one more button to its own host shortcut. Slot 3 is retired but stays
+# readable in this mapping so older key_bindings.json files still load.
+MAX_VOICE_SLOTS = 2
+
+VOICE_SLOT_ACTION_KINDS = frozenset(
+    {
+        ActionKind.VOICE_HOLD,
+        ActionKind.VOICE_HOLD_2,
+        ActionKind.VOICE_HOLD_3,
+    }
+)
+
+VOICE_SLOT_BY_ACTION_KIND = {
+    ActionKind.VOICE_HOLD: 1,
+    ActionKind.VOICE_HOLD_2: 2,
+    ActionKind.VOICE_HOLD_3: 3,
+}
+
+VOICE_ACTION_KIND_BY_SLOT = {
+    slot: kind for kind, slot in VOICE_SLOT_BY_ACTION_KIND.items()
+}
+
+SUPPORTED_VOICE_ACTION_KINDS = VOICE_SLOT_ACTION_KINDS
 
 
 def is_voice_action(action: "ButtonAction") -> bool:
@@ -130,46 +173,29 @@ def is_supported_voice_action(action: "ButtonAction") -> bool:
     return action.kind in SUPPORTED_VOICE_ACTION_KINDS
 
 
-def voice_action_for_trigger_mode(trigger_mode: VoiceTriggerMode) -> "ButtonAction":
-    """Build the explicit primary mapping for one voice lifecycle."""
+def voice_slot_for_action(action: "ButtonAction") -> Optional[int]:
+    """Return the 1-based voice slot for ``action``, or ``None``."""
 
-    kind = (
-        ActionKind.VOICE_TOGGLE
-        if trigger_mode == VoiceTriggerMode.TOGGLE
-        else ActionKind.VOICE_HOLD
-    )
+    return VOICE_SLOT_BY_ACTION_KIND.get(action.kind)
+
+
+def voice_action_for_slot(slot: int) -> Optional["ButtonAction"]:
+    """Build the hold-to-talk action for ``slot`` (1..MAX_VOICE_SLOTS)."""
+
+    kind = VOICE_ACTION_KIND_BY_SLOT.get(slot)
+    if kind is None:
+        return None
     return ButtonAction(kind)
 
 
-def voice_trigger_mode_for_action(
-    action: "ButtonAction",
-    *,
-    legacy_mode: Optional[VoiceTriggerMode] = None,
-) -> Optional[VoiceTriggerMode]:
-    """Resolve an explicit voice action, preserving legacy ``VOICE`` files."""
-
-    if action.kind == ActionKind.VOICE_TOGGLE:
-        return VoiceTriggerMode.TOGGLE
-    if action.kind == ActionKind.VOICE_HOLD:
-        return VoiceTriggerMode.HOLD
-    if action.kind == ActionKind.VOICE:
-        return legacy_mode
-    return None
-
-
-# Right Alt remains the conservative default for hold-to-talk. A proposed
-# Ctrl+Alt+F8 default was rejected after UU remote-control testing showed that
-# the forwarded key-up edge does not preserve a stable physical hold duration.
-DEFAULT_HOLD_VOICE_HOTKEY = "ralt"
+# These two tokens were shipped by earlier Windows builds as an implicit
+# hold-to-talk shortcut. They are kept only so schema-1 data can still be
+# recognised and failed closed during migration.
 LEGACY_HOLD_VOICE_HOTKEY = "ralt"
 LEGACY_TOGGLE_VOICE_HOTKEY = "ralt+space"
 
-# HOLD is the only selectable product mode. TOGGLE remains in this lookup only
-# so schema-1 data can still be identified and failed closed during migration.
-VOICE_HOTKEY_PRESETS = {
-    VoiceTriggerMode.TOGGLE: LEGACY_TOGGLE_VOICE_HOTKEY,
-    VoiceTriggerMode.HOLD: DEFAULT_HOLD_VOICE_HOTKEY,
-}
+# A fresh installation no longer fabricates a wake shortcut: the product only
+# replays the shortcut the user records for slot 1/2.
 
 # These values were shipped by earlier Windows builds. They remain recognizable
 # so old configuration can keep its prior compatibility behavior without being
@@ -219,19 +245,6 @@ APPLICATION_ACTIONS = frozenset(
         ActionKind.OPEN_ZED,
     }
 )
-
-REPEATABLE_ACTIONS = frozenset(
-    {
-        ActionKind.ARROW_UP,
-        ActionKind.ARROW_DOWN,
-        ActionKind.ARROW_LEFT,
-        ActionKind.ARROW_RIGHT,
-        ActionKind.DELETE_BACKWARD,
-        ActionKind.SYSTEM_VOLUME_UP,
-        ActionKind.SYSTEM_VOLUME_DOWN,
-    }
-)
-
 
 QUICKER_URI_PREFIX = "quicker:runaction:"
 MAX_QUICKER_URI_LENGTH = 2048
@@ -288,37 +301,26 @@ def semantic_action_for_keys(keys: Tuple[str, ...]) -> Optional["ButtonAction"]:
     return ButtonAction(action_kind)
 
 
-def action_allows_repeat(action: "ButtonAction") -> bool:
-    """Allow hold-repeat only for actions with clear repeat semantics.
-
-    Custom key combinations remain one tap per physical press. Replaying a
-    modifier chord such as Shift+3 on a timer is both surprising and more
-    likely to expose an incomplete host key release. Navigation, backspace,
-    and volume changes keep the expected remote-control repeat behavior.
-    """
-
-    return action.kind in REPEATABLE_ACTIONS
-
-
-def voice_hotkey_for_trigger_mode(trigger_mode: VoiceTriggerMode) -> str:
-    """Return the host shortcut paired with a voice trigger mode."""
-
-    return VOICE_HOTKEY_PRESETS[trigger_mode]
-
-
 @dataclass(frozen=True)
 class ButtonAction:
     kind: ActionKind
     keys: Tuple[str, ...] = field(default_factory=tuple)
     uri: str = ""
+    inject_mode: str = "sendinput"
 
     def to_dict(self) -> dict:
         if self.kind in (ActionKind.MOUSE_WHEEL_UP, ActionKind.MOUSE_WHEEL_DOWN):
             page_key = "pageup" if self.kind == ActionKind.MOUSE_WHEEL_UP else "pagedown"
-            return {"kind": ActionKind.KEY_COMBO.value, "keys": [page_key]}
-        data = {"kind": self.kind.value, "keys": list(self.keys)}
-        if self.kind == ActionKind.QUICKER_URI:
-            data["uri"] = normalize_quicker_uri(self.uri)
+            data = {"kind": ActionKind.KEY_COMBO.value, "keys": [page_key]}
+        else:
+            data = {"kind": self.kind.value, "keys": list(self.keys)}
+            if self.kind == ActionKind.QUICKER_URI:
+                data["uri"] = normalize_quicker_uri(self.uri)
+        # Only written when the button opted out of the default backend, so
+        # every file written before per-button injection modes existed keeps
+        # its exact previous bytes.
+        if self.inject_mode != DEFAULT_INJECT_MODE:
+            data["inject_mode"] = self.inject_mode
         return data
 
     @classmethod
@@ -326,6 +328,7 @@ class ButtonAction:
         if not isinstance(data, dict):
             raise TypeError("button action must be a mapping")
         kind = ActionKind(data["kind"])
+        inject_mode = normalize_stored_inject_mode(data.get("inject_mode"))
         raw_keys = data.get("keys", ())
         if not isinstance(raw_keys, (list, tuple)) or not all(
             isinstance(key, str) and key.strip() for key in raw_keys
@@ -346,8 +349,10 @@ class ButtonAction:
             raise ValueError("non-URI action must not contain a URI")
         if kind in (ActionKind.MOUSE_WHEEL_UP, ActionKind.MOUSE_WHEEL_DOWN):
             page_key = "pageup" if kind == ActionKind.MOUSE_WHEEL_UP else "pagedown"
-            return cls(kind=ActionKind.KEY_COMBO, keys=(page_key,))
-        return cls(kind=kind, keys=keys, uri=uri)
+            return cls(
+                kind=ActionKind.KEY_COMBO, keys=(page_key,), inject_mode=inject_mode
+            )
+        return cls(kind=kind, keys=keys, uri=uri, inject_mode=inject_mode)
 
 
 def button_action_for(
@@ -458,7 +463,7 @@ DEFAULT_BUTTON_IDS = frozenset(
 
 def default_button_actions() -> Dict[str, ButtonAction]:
     return {
-        "mic": voice_action_for_trigger_mode(VoiceTriggerMode.HOLD),
+        "mic": ButtonAction(ActionKind.VOICE_HOLD),
         "power": ButtonAction(ActionKind.ESCAPE),
         "up": ButtonAction(ActionKind.ARROW_UP),
         "down": ButtonAction(ActionKind.ARROW_DOWN),

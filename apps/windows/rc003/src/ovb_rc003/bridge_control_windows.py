@@ -161,7 +161,7 @@ def request_bridge_exit(
         return BridgeExitResult(False, False, "无法确认遥控器服务是否正在运行。")
 
     if dev_session.is_isolated():
-        return BridgeExitResult(False, False, "隔离测试不控制其它无线麦实例，请手动退出旧版。")
+        return BridgeExitResult(False, False, "隔离测试不控制其它MiOpention实例，请手动退出旧版。")
     try:
         hwnd = int(find_window())
     except Exception:

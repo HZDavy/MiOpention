@@ -7,13 +7,112 @@ import sys
 import tempfile
 import unittest
 
-from tests.test_voice_program_qml import _PROBE as _VOICE_PAGE_PROBE
+_BASE_SETUP = r'''
+import json
+import os
+import time
+
+import shiboken6
+
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtTest import QTest
+from ovb_rc003 import qt_settings_app as m
 
 
-# Reuse the existing offscreen application setup and its hardware/host stubs.
-# Run only setup, before that probe begins its voice-program interactions.
-_SETUP = _VOICE_PAGE_PROBE.split('tab_bar = find(window, "tabBar")', 1)[0]
-_SETUP = _SETUP.replace(
+def find(root, name):
+    children = list(root.children())
+    child_items = getattr(root, "childItems", None)
+    if callable(child_items):
+        children.extend(child for child in child_items() if child not in children)
+    for child in children:
+        if child.objectName() == name:
+            return child
+        found = find(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def render(window, app, count=10):
+    image = None
+    for _ in range(count):
+        image = window.grabWindow()
+        app.processEvents()
+    return image
+
+
+def wait_for_voice_hotkey_idle(controller, app, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while controller.voiceHotkeyBusy and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    assert not controller.voiceHotkeyBusy
+
+
+classes = m._load_qt_classes()
+QGuiApplication = classes["QGuiApplication"]
+QQmlApplicationEngine = classes["QQmlApplicationEngine"]
+QQuickStyle = classes["QQuickStyle"]
+QUrl = classes["QUrl"]
+qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
+ButtonMappingModel = classes["ButtonMappingModel"]
+SettingsController = classes["SettingsController"]
+DiagnosticsController = classes["DiagnosticsController"]
+
+
+class FakeHotkeyCapture:
+    def __init__(self, on_captured, *, accept_injected=False, isolated=False, on_error=None):
+        self.on_captured = on_captured
+        self.accept_injected = accept_injected
+        self.is_running = False
+
+    def start(self):
+        self.is_running = True
+
+    def stop(self):
+        self.is_running = False
+
+
+m.hotkey_capture_windows.HotkeyCapture = FakeHotkeyCapture
+
+QQuickStyle.setStyle("Basic")
+app = QGuiApplication.instance() or QGuiApplication([])
+m.single_instance.bridge_instance_running = lambda: False
+model = ButtonMappingModel()
+controller = SettingsController(model)
+diagnostics = DiagnosticsController(controller, m.config.config_root())
+qmlRegisterSingletonInstance(
+    SettingsController, "OvbRc003Settings", 1, 0, "SettingsController", controller
+)
+qmlRegisterSingletonInstance(
+    ButtonMappingModel, "OvbRc003Settings", 1, 0, "ButtonMappingModel", model
+)
+qmlRegisterSingletonInstance(
+    DiagnosticsController,
+    "OvbRc003Settings",
+    1,
+    0,
+    "DiagnosticsController",
+    diagnostics,
+)
+
+engine = QQmlApplicationEngine()
+qml_dir = m._qml_directory()
+engine.addImportPath(str(qml_dir))
+warnings = []
+engine.warnings.connect(lambda values: warnings.extend(values))
+engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
+assert len(engine.rootObjects()) == 1
+window = engine.rootObjects()[0]
+window.show()
+render(window, app)
+
+'''
+
+
+# Reuse the offscreen application setup and its hardware/host stubs.
+# Run only setup, before the probe begins its voice-program interactions.
+_SETUP = _BASE_SETUP.replace(
     "engine = QQmlApplicationEngine()",
     "m.windows_diagnostics.run_diagnostics = lambda **_kwargs: None\n"
     "from pathlib import Path\n"
@@ -144,21 +243,6 @@ input_state(frida_compat.HidTapState.ATTACHED_WAITING_IO.value)
 assert device_page.buttonReceiverStateText() == "正常"
 input_state(frida_compat.HidTapState.READY.value)
 assert device_page.buttonReceiverStateText() == "正常"
-
-# Chromecast does not consume the Xiaomi component or its stale failure state.
-controller._config["remote_selection"]["devices"][0]["profile"] = "chromecast-remote"
-controller.remoteSelectionChanged.emit()
-assert not controller.isRc003Device
-bridge_runtime_status.publish_status(
-    root_path, bridge_runtime_status.BridgeConnectionState.CONNECTED,
-    pid=os.getpid(), raw_input_state="chromecast_ready",
-    hid_tap_state=frida_compat.HidTapState.UNAVAILABLE.value,
-)
-controller._set_bridge_input_states(bridge_runtime_status.read_status(root_path))
-assert device_page.buttonReceiverStateText() == "正常"
-assert not device_page.bridgeNeedsRestartAction()
-controller._config["remote_selection"]["devices"][0]["profile"] = "xiaomi-rc003"
-controller.remoteSelectionChanged.emit()
 
 input_state(frida_compat.HidTapState.RESTART_REQUIRED.value)
 render(window, app)

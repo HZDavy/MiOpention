@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Tuple
 
-from . import key_mapping, win32_keys
+from . import win32_keys
 
 _MODIFIER_ORDER = (
     "ctrl", "shift", "alt", "win",
@@ -139,11 +139,3 @@ def format_hotkey_text(text: str) -> str:
     except HotkeyParseError:
         return text
     return " + ".join(win32_keys.key_label(token) for token in tokens)
-
-
-# The established right-Alt hold trigger remains the fresh-install default.
-# Existing config files keep their saved value because config.load_config()
-# normalizes persisted voice fields before merging defaults.
-DEFAULT_VOICE_HOTKEY = HotkeySpec.parse(
-    key_mapping.voice_hotkey_for_trigger_mode(key_mapping.VoiceTriggerMode.HOLD)
-)

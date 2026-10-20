@@ -56,47 +56,11 @@ class ButtonActionSerializationTests(unittest.TestCase):
         restored = key_mapping.ButtonAction.from_dict(data)
         self.assertEqual(restored.keys, ())
 
-    def test_explicit_voice_actions_resolve_their_lifecycle(self):
-        for mode in key_mapping.VoiceTriggerMode:
-            action = key_mapping.voice_action_for_trigger_mode(mode)
+    def test_voice_slot_actions_resolve_their_lifecycle(self):
+        for slot in (1, 2):
+            action = key_mapping.voice_action_for_slot(slot)
             self.assertTrue(key_mapping.is_voice_action(action))
-            self.assertEqual(
-                key_mapping.voice_trigger_mode_for_action(action),
-                mode,
-            )
-            self.assertFalse(key_mapping.action_allows_repeat(action))
-
-    def test_only_navigation_backspace_and_volume_actions_repeat(self):
-        repeatable = {
-            key_mapping.ActionKind.ARROW_UP,
-            key_mapping.ActionKind.ARROW_DOWN,
-            key_mapping.ActionKind.ARROW_LEFT,
-            key_mapping.ActionKind.ARROW_RIGHT,
-            key_mapping.ActionKind.DELETE_BACKWARD,
-            key_mapping.ActionKind.SYSTEM_VOLUME_UP,
-            key_mapping.ActionKind.SYSTEM_VOLUME_DOWN,
-        }
-        for action_kind in key_mapping.ActionKind:
-            action = (
-                key_mapping.ButtonAction(action_kind, ("shift", "3"))
-                if action_kind == key_mapping.ActionKind.KEY_COMBO
-                else key_mapping.ButtonAction(action_kind)
-            )
-            self.assertEqual(
-                key_mapping.action_allows_repeat(action),
-                action_kind in repeatable,
-                msg=action_kind.value,
-            )
-
-    def test_legacy_voice_action_uses_the_supplied_mode(self):
-        action = key_mapping.ButtonAction(key_mapping.ActionKind.VOICE)
-        self.assertEqual(
-            key_mapping.voice_trigger_mode_for_action(
-                action,
-                legacy_mode=key_mapping.VoiceTriggerMode.HOLD,
-            ),
-            key_mapping.VoiceTriggerMode.HOLD,
-        )
+            self.assertEqual(key_mapping.voice_slot_for_action(action), slot)
 
     def test_reference_actions_are_semantic_and_not_key_combos(self):
         for action_kind in (

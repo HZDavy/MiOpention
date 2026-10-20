@@ -30,16 +30,19 @@
 ;     before PyInstaller ran, the frozen DistDir may contain it as optional
 ;     application data; runtime verifies it again before use.
 
-#define AppName "无线麦"
-#define AppPublisher "无线麦项目"
+#define AppName "MiOpention"
+#define AppPublisher "MiOpention项目"
 #define VersionFileHandle FileOpen(AddBackslash(SourcePath) + "..\src\ovb_rc003\VERSION")
 #if !VersionFileHandle
   #error "Cannot read src\ovb_rc003\VERSION"
 #endif
 #define AppVersion Trim(FileRead(VersionFileHandle))
 #expr FileClose(VersionFileHandle)
-#define AppExeName "RemoteMicRC003.exe"
+#define AppExeName AppName + " " + AppVersion + ".exe"
+; 运行时目录名必须与 product_identity.WINDOWS_RUNTIME_DIRECTORY_NAME 一致。
+#define RuntimeDirName "app"
 #define HidHelperExeName "RemoteMicRC003HidHelper.exe"
+; 配置/日志根目录仍沿用 RemoteMic\RC003（全英文），与旧版本保持兼容。
 #define AppFolder "RC003"
 #define DistDir "..\dist\RemoteMicRC003"
 
@@ -48,8 +51,8 @@ AppId={{B6E8B6F0-7B9B-4B7C-9E7E-3B7B2C6B0F5C}}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
-DefaultDirName={localappdata}\RemoteMic\{#AppFolder}
-DefaultGroupName=无线麦
+DefaultDirName={localappdata}\MiOpention
+DefaultGroupName=MiOpention
 UsePreviousGroup=no
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
@@ -61,7 +64,7 @@ SolidCompression=yes
 WizardStyle=modern
 SetupLogging=yes
 SetupIconFile=..\src\ovb_rc003\assets\icons\remote-mic.ico
-OutputBaseFilename=RemoteMicRC003Setup-{#AppVersion}-unsigned
+OutputBaseFilename=MiOpentionSetup-{#AppVersion}-unsigned
 OutputDir=..\dist\installer
 UninstallDisplayName={#AppName}
 UninstallDisplayIcon={app}\{#AppExeName}
@@ -73,7 +76,7 @@ RestartApplications=no
 ; immediately. The old complete runtime remains quarantined until that check
 ; has actually run the new executable successfully.
 Source: "{#DistDir}\*"; DestDir: "{app}"; Excludes: "{#AppExeName}"; Flags: recursesubdirs createallsubdirs ignoreversion
-Source: "readme-rc003.txt"; DestDir: "{app}"; Flags: isreadme ignoreversion
+Source: "readme-rc003.txt"; DestDir: "{app}"; DestName: "README.txt"; Flags: isreadme ignoreversion
 Source: "..\..\..\..\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; DestName: "THIRD_PARTY_NOTICES.md"; Flags: ignoreversion
 Source: "..\..\..\..\THIRD_PARTY_SOURCE.md"; DestDir: "{app}"; DestName: "THIRD_PARTY_SOURCE.md"; Flags: ignoreversion
 Source: "..\..\..\..\ASSET_LICENSES.md"; DestDir: "{app}"; DestName: "ASSET_LICENSES.md"; Flags: ignoreversion
@@ -271,7 +274,7 @@ begin
   begin
     ReleaseLegacyRuntimeBarriers;
     ErrorMessage :=
-      '无法锁定旧版启动入口。请完全退出无线麦后重试；本次没有覆盖程序文件。';
+      '无法锁定旧版启动入口。请完全退出MiOpention后重试；本次没有覆盖程序文件。';
     Result := False;
     exit;
   end;
@@ -287,7 +290,7 @@ begin
   UpgradeStatePath := ExpandConstant('{app}\.installing-previous.state');
   UpgradeHeldApplicationPath :=
     AddBackslash(UpgradeRuntimeHoldPath) + '{#AppExeName}';
-  UpgradeHeldInternalPath := AddBackslash(UpgradeRuntimeHoldPath) + '_internal';
+  UpgradeHeldInternalPath := AddBackslash(UpgradeRuntimeHoldPath) + '{#RuntimeDirName}';
   UpgradeHeldLegacyHelperPath :=
     AddBackslash(UpgradeRuntimeHoldPath) + '{#HidHelperExeName}';
 end;
@@ -565,13 +568,13 @@ begin
   HelperPath := AddBackslash(UpgradeInternalPath) + '{#HidHelperExeName}';
   if not FileExists(UpgradeApplicationPath) then
   begin
-    ErrorMessage := '无线麦主程序未能写入。';
+    ErrorMessage := 'MiOpention主程序未能写入。';
     Result := False;
     exit;
   end;
   if not DirExists(UpgradeInternalPath) then
   begin
-    ErrorMessage := '无线麦运行文件未能完整写入。';
+    ErrorMessage := 'MiOpention运行文件未能完整写入。';
     Result := False;
     exit;
   end;
@@ -591,7 +594,7 @@ begin
   );
   if (not Started) or (ResultCode <> 0) then
   begin
-    ErrorMessage := '无线麦新版本未通过启动检查。';
+    ErrorMessage := 'MiOpention新版本未通过启动检查。';
     Result := False;
     exit;
   end;
@@ -672,7 +675,7 @@ begin
     Result := RestoreHeldRuntime(True);
     if not Result then
       ErrorMessage :=
-        '无法继续上次未完成的旧版恢复。请不要启动无线麦，保留安装目录并联系维护人员处理。';
+        '无法继续上次未完成的旧版恢复。请不要启动MiOpention，保留安装目录并联系维护人员处理。';
     exit;
   end;
 
@@ -681,7 +684,7 @@ begin
     Result := RestoreHeldRuntime(True);
     if not Result then
       ErrorMessage :=
-        '无法开始上次未完成的旧版恢复。请不要启动无线麦，保留安装目录并联系维护人员处理。';
+        '无法开始上次未完成的旧版恢复。请不要启动MiOpention，保留安装目录并联系维护人员处理。';
     exit;
   end;
 
@@ -691,7 +694,7 @@ begin
     Result := RestoreHeldRuntime(False);
     if not Result then
       ErrorMessage :=
-        '无法恢复上次安装保留的旧版。请不要启动无线麦，保留安装目录并联系维护人员处理。';
+        '无法恢复上次安装保留的旧版。请不要启动MiOpention，保留安装目录并联系维护人员处理。';
     exit;
   end;
   if UpgradeRuntimeQuarantined and
@@ -700,7 +703,7 @@ begin
     Result := RestoreHeldRuntime(True);
     if not Result then
       ErrorMessage :=
-        '无法恢复上次安装保留的旧版。请不要启动无线麦，保留安装目录并联系维护人员处理。';
+        '无法恢复上次安装保留的旧版。请不要启动MiOpention，保留安装目录并联系维护人员处理。';
     exit;
   end;
   if UpgradeRuntimeQuarantined then
@@ -734,11 +737,11 @@ begin
       Result := RestoreHeldRuntime(True);
       if not Result then
         ErrorMessage :=
-          '无法恢复上次安装保留的旧版。请不要启动无线麦，保留安装目录并联系维护人员处理。';
+          '无法恢复上次安装保留的旧版。请不要启动MiOpention，保留安装目录并联系维护人员处理。';
       exit;
     end;
     ErrorMessage :=
-      '上次安装留下的程序和备份都不完整。为避免继续误删，本次未改动文件；请不要启动无线麦，保留安装目录并联系维护人员处理。';
+      '上次安装留下的程序和备份都不完整。为避免继续误删，本次未改动文件；请不要启动MiOpention，保留安装目录并联系维护人员处理。';
     Result := False;
     exit;
   end;
@@ -809,7 +812,7 @@ begin
       '无法确认旧版安全备份。安装已停止，正在恢复旧版。';
     if not RestoreHeldRuntime(False) then
       ErrorMessage := ErrorMessage +
-        ' 自动恢复失败，请不要启动无线麦，保留安装目录并联系维护人员处理。';
+        ' 自动恢复失败，请不要启动MiOpention，保留安装目录并联系维护人员处理。';
     Result := False;
     exit;
   end;
@@ -947,7 +950,7 @@ begin
   if InstallerMaintenanceMutexHandle = 0 then
   begin
     MsgBox(
-      '无法锁定无线麦程序文件。请关闭其它安装或卸载窗口后重试。',
+      '无法锁定MiOpention程序文件。请关闭其它安装或卸载窗口后重试。',
       mbError,
       MB_OK
     );
@@ -959,7 +962,7 @@ begin
   begin
     ReleaseInstallerMaintenanceMutex;
     MsgBox(
-      '无线麦正在安装或卸载。请完成前一个操作后重试。',
+      'MiOpention正在安装或卸载。请完成前一个操作后重试。',
       mbError,
       MB_OK
     );
@@ -974,7 +977,7 @@ begin
   if ShellIsUserAnAdmin() then
   begin
     MsgBox(
-      '请关闭安装程序，然后普通双击安装包。无线麦不需要以管理员身份安装或长期运行。',
+      '请关闭安装程序，然后普通双击安装包。MiOpention不需要以管理员身份安装或长期运行。',
       mbError,
       MB_OK
     );
@@ -993,7 +996,7 @@ begin
     else if not RecoverUpgradeRuntimeQuarantine() then
     begin
       MsgBox(
-        '安装没有完成，且旧版运行文件未能自动恢复。为避免继续误删，请不要启动无线麦，保留安装目录并联系维护人员处理。',
+        '安装没有完成，且旧版运行文件未能自动恢复。为避免继续误删，请不要启动MiOpention，保留安装目录并联系维护人员处理。',
         mbError,
         MB_OK
       );
@@ -1077,19 +1080,19 @@ begin
       '检测到旧便携版仍在运行。请完全退出旧版后重试；安装尚未修改文件。'
   else if ResultCode = StopOtherSessionRunningExitCode then
     ErrorMessage :=
-      '另一个 Windows 会话正在运行无线麦。请到那个会话完全退出后重试；安装尚未修改文件。'
+      '另一个 Windows 会话正在运行MiOpention。请到那个会话完全退出后重试；安装尚未修改文件。'
   else if ResultCode = StopUserActionRequiredExitCode then
     ErrorMessage :=
       '旧版仍需您确认退出。请保存或放弃修改，完全退出旧版后重试；安装尚未修改文件。'
   else if ResultCode = StopUnsafeToContinueExitCode then
     ErrorMessage :=
-      '无线麦没有完全退出。请处理旧版窗口并完全退出后重试；安装尚未修改文件。'
+      'MiOpention没有完全退出。请处理旧版窗口并完全退出后重试；安装尚未修改文件。'
   else if ResultCode = StopProbeFailedExitCode then
     ErrorMessage :=
-      '无法确认旧版状态。请完全退出无线麦或重启 Windows 后重试；安装尚未修改文件。'
+      '无法确认旧版状态。请完全退出MiOpention或重启 Windows 后重试；安装尚未修改文件。'
   else
     ErrorMessage :=
-      '无线麦没有完全退出。请完全退出后重试；安装尚未修改文件。';
+      'MiOpention没有完全退出。请完全退出后重试；安装尚未修改文件。';
   Result := False;
 end;
 
@@ -1107,13 +1110,13 @@ begin
 
   if ResultCode = StopNeedsElevationExitCode then
     MsgBox(
-      '无线麦正以管理员身份运行。请先在旧版通知区域选择“完全退出”，再重新卸载。',
+      'MiOpention正以管理员身份运行。请先在旧版通知区域选择“完全退出”，再重新卸载。',
       mbError,
       MB_OK
     )
   else if ResultCode = StopOtherSessionRunningExitCode then
     MsgBox(
-      '另一个 Windows 会话正在运行无线麦。请到那个会话完全退出后重新卸载。',
+      '另一个 Windows 会话正在运行MiOpention。请到那个会话完全退出后重新卸载。',
       mbError,
       MB_OK
     )
@@ -1125,7 +1128,7 @@ begin
     )
   else
     MsgBox(
-      '无线麦没有完全退出。请完全退出后重新卸载。',
+      'MiOpention没有完全退出。请完全退出后重新卸载。',
       mbError,
       MB_OK
     );
@@ -1250,7 +1253,7 @@ begin
         )
       else
         MsgBox(
-          '管理员按键组件未启用。打开无线麦，在“按键接收”中点击“修复权限”即可重试。',
+          '管理员按键组件未启用。打开MiOpention，在“按键接收”中点击“修复权限”即可重试。',
           mbError,
           MB_OK
         );
@@ -1288,7 +1291,7 @@ begin
   end;
   if not HidHelperInstallSucceeded then
     WizardForm.FinishedLabel.Caption :=
-      '无线麦已安装；自定义按键映射可稍后在程序内启用。';
+      'MiOpention已安装；自定义按键映射可稍后在程序内启用。';
 end;
 
 function ShouldLaunchInstalledApplication(): Boolean;
@@ -1314,7 +1317,7 @@ begin
   if ShellIsUserAnAdmin() then
   begin
     MsgBox(
-      '请关闭卸载程序，然后普通方式重新打开。无线麦按当前 Windows 账号卸载，不能以管理员身份运行卸载程序。',
+      '请关闭卸载程序，然后普通方式重新打开。MiOpention按当前 Windows 账号卸载，不能以管理员身份运行卸载程序。',
       mbError,
       MB_OK
     );
@@ -1330,7 +1333,7 @@ begin
   if not FileExists(StopScript) then
   begin
     MsgBox(
-      '无法找到无线麦进程清理程序。卸载尚未开始，请修复或重新安装当前版本后重试。',
+      '无法找到MiOpention进程清理程序。卸载尚未开始，请修复或重新安装当前版本后重试。',
       mbError,
       MB_OK
     );

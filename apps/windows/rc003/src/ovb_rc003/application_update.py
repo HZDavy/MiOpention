@@ -28,13 +28,15 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 
-REPOSITORY_OWNER = "ZSTDJan"
-REPOSITORY_NAME = "windows-remote-mic-app"
+REPOSITORY_OWNER = "HZDavy"
+REPOSITORY_NAME = "MiOpention"
 REPOSITORY_SLUG = f"{REPOSITORY_OWNER}/{REPOSITORY_NAME}"
 RELEASES_PAGE_URL = f"https://github.com/{REPOSITORY_SLUG}/releases"
 RELEASES_API_URL = (
     f"https://api.github.com/repos/{REPOSITORY_SLUG}/releases?per_page=30"
 )
+WEBSITE_URL = "https://hzdavy.github.io/MiOpention/"
+WEBSITE_GUIDE_URL = f"{WEBSITE_URL}#guide"
 
 NETWORK_TIMEOUT_SECONDS = 10.0
 MAX_RELEASES_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -68,13 +70,14 @@ _VERSION_PATTERN = re.compile(
     r"(?:-candidate(?:\.(?P<candidate>0|[1-9][0-9]*))?)?$"
 )
 _INSTALLER_PATTERN = re.compile(
-    rf"^RemoteMicRC003Setup-(?P<version>{_VERSION_TEXT_PATTERN})-unsigned\.exe$"
+    rf"^(?:MiOpentionSetup|RemoteMicRC003Setup)-"
+    rf"(?P<version>{_VERSION_TEXT_PATTERN})-unsigned\.exe$"
 )
 _PORTABLE_PATTERN = re.compile(
     rf"^RemoteMicRC003-(?P<version>{_VERSION_TEXT_PATTERN})-portable-unsigned\.zip$"
 )
 _CHINESE_PORTABLE_PATTERN = re.compile(
-    rf"^无线麦-Windows-(?P<version>{_VERSION_TEXT_PATTERN})-免安装\.zip$"
+    rf"^MiOpention(?:\+-Windows)?-(?P<version>{_VERSION_TEXT_PATTERN})-免安装\.zip$"
 )
 _SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 _MANIFEST_LINE_PATTERN = re.compile(
@@ -154,14 +157,18 @@ class ApplicationRelease:
     release_url: str
     notes: str
     installer: Optional[ReleaseAsset]
-    portable: ReleaseAsset
+    portable: Optional[ReleaseAsset]
     manifest: ReleaseAsset
 
     def package_for(self, kind: PackageKind) -> ReleaseAsset:
-        return (
-            self.installer
-            if kind is PackageKind.INSTALLER and self.installer is not None
-            else self.portable
+        if kind is PackageKind.INSTALLER and self.installer is not None:
+            return self.installer
+        if self.portable is not None:
+            return self.portable
+        if self.installer is not None:
+            return self.installer
+        raise ApplicationUpdateError(
+            "invalid_release", "GitHub 更新包信息不完整。"
         )
 
 
@@ -319,17 +326,23 @@ def _path_is_link_like(path: Path) -> bool:
 
 
 def _owned_download_names(version: ApplicationVersion) -> frozenset[str]:
-    installer = f"RemoteMicRC003Setup-{version.text}-unsigned.exe"
+    installer = f"MiOpentionSetup-{version.text}-unsigned.exe"
+    legacy_installer = f"RemoteMicRC003Setup-{version.text}-unsigned.exe"
     portable = f"RemoteMicRC003-{version.text}-portable-unsigned.zip"
-    chinese_portable = f"无线麦-Windows-{version.text}-免安装.zip"
+    chinese_portable = f"MiOpention-{version.text}-免安装.zip"
+    legacy_chinese_portable = f"MiOpention+-Windows-{version.text}-免安装.zip"
     return frozenset(
         {
             installer,
-            portable,
             f"{installer}.part",
+            legacy_installer,
+            f"{legacy_installer}.part",
+            portable,
             f"{portable}.part",
             chinese_portable,
             f"{chinese_portable}.part",
+            legacy_chinese_portable,
+            f"{legacy_chinese_portable}.part",
         }
     )
 
@@ -454,7 +467,7 @@ def _request(url: str, accept: str) -> urllib.request.Request:
         url,
         headers={
             "Accept": accept,
-            "User-Agent": "RemoteMic-RC003-Updater",
+            "User-Agent": "MiOpention-Updater",
             "X-GitHub-Api-Version": "2022-11-28",
         },
         method="GET",
@@ -685,15 +698,21 @@ def _parse_release(
         for _asset_item, match in (*installer_matches, *portable_matches)
     ]
     version_hint = max(version_hints) if version_hints else None
-    if len(installer_matches) > 1 or len(portable_matches) != 1 or len(manifest_matches) != 1:
+    if (
+        len(installer_matches) > 1
+        or len(portable_matches) > 1
+        or len(manifest_matches) != 1
+    ):
         return None, True, version_hint
 
-    portable_item, portable_match = portable_matches[0]
-    portable_version_text = portable_match.group("version")
-    if installer_matches and installer_matches[0][1].group("version") != portable_version_text:
+    package_versions = {
+        match.group("version")
+        for _asset_item, match in (*installer_matches, *portable_matches)
+    }
+    if len(package_versions) != 1:
         return None, True, version_hint
     try:
-        version = parse_application_version(portable_version_text)
+        version = parse_application_version(package_versions.pop())
     except ValueError:
         return None, True, version_hint
     if prerelease != version.is_prerelease:
@@ -704,18 +723,23 @@ def _parse_release(
         return None, True, version
     try:
         _validate_release_page_url(release_url)
+        # Both layouts stay supported: a release may ship the installer, the
+        # portable ZIP, or both. At most one of each is accepted above.
         installer = (
             _parse_asset(
                 installer_matches[0][0],
-                f"RemoteMicRC003Setup-{version.text}-unsigned.exe",
+                installer_matches[0][0]["name"],
                 MAX_PACKAGE_BYTES,
             )
             if installer_matches else None
         )
-        portable = _parse_asset(
-            portable_item,
-            portable_item["name"],
-            MAX_PACKAGE_BYTES,
+        portable = (
+            _parse_asset(
+                portable_matches[0][0],
+                portable_matches[0][0]["name"],
+                MAX_PACKAGE_BYTES,
+            )
+            if portable_matches else None
         )
         manifest = _parse_asset(
             manifest_matches[0], "SHA256SUMS.txt", MAX_MANIFEST_BYTES
@@ -913,9 +937,13 @@ def _parse_manifest(data: bytes, release: ApplicationRelease) -> dict[str, str]:
             "invalid_manifest", "SHA256SUMS.txt 不是有效的 UTF-8 清单。"
         ) from exc
     lines = text.splitlines()
-    expected_names = {release.portable.name}
-    if release.installer is not None:
-        expected_names.add(release.installer.name)
+    expected_names = {
+        asset.name
+        for asset in (release.installer, release.portable)
+        if asset is not None
+    }
+    if not expected_names:
+        _raise("invalid_manifest", "发布中没有可用的更新包。")
     if len(lines) != len(expected_names):
         _raise("invalid_manifest", "SHA256SUMS.txt 的文件数量不符合发布规则。")
     entries: dict[str, str] = {}
@@ -1071,8 +1099,11 @@ def download_update_package(
     if cancel_event is not None and cancel_event.is_set():
         raise ApplicationUpdateCancelled()
     asset = release.package_for(kind)
-    if release.installer is None:
-        kind = PackageKind.PORTABLE
+    kind = (
+        PackageKind.INSTALLER
+        if asset is release.installer
+        else PackageKind.PORTABLE
+    )
     manifest_data = _fetch_bytes(
         release.manifest.download_url,
         accept="application/octet-stream",

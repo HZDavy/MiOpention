@@ -3,7 +3,7 @@
 ## 仓库历史
 
 本仓库的历史来源为 [`HD838A/remote-mic-app`](https://github.com/HD838A/remote-mic-app)。
-当前无线麦 Windows 版由本项目独立维护；macOS/Swift 工程不属于本仓库维护范围。
+当前MiOpention+ Windows 版由本项目独立维护；macOS/Swift 工程不属于本仓库维护范围。
 此处记录代码和仓库沿革，具体第三方代码与许可见下文及仓库根目录的
 [`THIRD_PARTY_NOTICES.md`](../../../THIRD_PARTY_NOTICES.md)。
 
@@ -16,9 +16,9 @@
 上游项目已经提供了 RC003 的 Windows 参考实现，包括 WinRT BLE、ATVV 语音协议、
 Windows Raw Input、SendInput、PortAudio 音频输出、Qt/QML 设置页、诊断、测试和
 PyInstaller/Inno Setup 构建流程。本仓库在 GPL-3.0-only 条件下保留并适配这些能力，
-并做了以下面向无线麦的改动：
+并做了以下面向MiOpention+的改动：
 
-- 用户可见名称统一为“无线麦”；配置目录、互斥锁、EXE、安装器文件名和发布产物
+- 用户可见名称统一为“MiOpention+”；配置目录、互斥锁、EXE、安装器文件名和发布产物
   继续保留 `RemoteMic` / `RC003` 内部兼容标识；
 - 适配本仓库现有的 `LICENSE.md`、`COPYRIGHT.md` 和第三方声明文件；
 - 补充中文安装、配对、VB-CABLE 配置、按键映射和故障排查说明；
@@ -52,6 +52,12 @@ VB-CABLE 是 VB-Audio 的独立第三方软件，不属于本项目的 GPL 代�
 应用只会在用户明确确认后调用 Windows 的 `runas`/UAC 流程启动厂商安装器，
 自身进程不会提权。
 
+Interception 同样是独立第三方软件（oblitum/Interception）。构建脚本固定哈希地
+获取官方发布包，并随包附带官方命令行安装程序 `install-interception.exe`（未修改）。
+按键映射里的“安装驱动/卸载驱动”按钮只在用户显式点击后，经 Windows 自身的 UAC
+提权流程启动该安装程序（`/install` 或 `/uninstall`），MiOpention+自身进程不会提权，
+也绝不会静默安装驱动；未安装驱动时保持 SendInput 后端。
+
 搜狗及用户选择的其它语音输入程序同样是独立第三方软件，不属于本项目，也不会
-随无线麦打包。可选的语音程序管理只负责发现或启动本机已有程序；管理员
-启动必须由用户明确选择并通过 Windows UAC，无线麦自身进程不会因此提权。
+随MiOpention+打包。可选的语音程序管理只负责发现或启动本机已有程序；管理员
+启动必须由用户明确选择并通过 Windows UAC，MiOpention+自身进程不会因此提权。

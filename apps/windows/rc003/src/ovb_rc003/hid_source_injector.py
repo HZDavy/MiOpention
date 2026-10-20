@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 
-from . import chromecast_pipe_windows as transport
+from . import pipe_windows as transport
 from . import dev_session, hid_injection_diagnostics as diagnostics
 
 FLAG = "--rc003-source-injector"

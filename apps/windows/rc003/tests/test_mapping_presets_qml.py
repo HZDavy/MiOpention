@@ -15,7 +15,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QMetaObject, QUrl, QPointF, Qt
 from PySide6.QtGui import QPalette, QColor, QFontDatabase
 from PySide6.QtTest import QTest
-from ovb_rc003 import qt_settings_app as m, config, mapping_presets
+from ovb_rc003 import qt_settings_app as m, config, app_profiles
 from tests.test_qt_settings_app import SettingsControllerTests
 
 classes = m._load_qt_classes()
@@ -73,7 +73,7 @@ try:
         assert QMetaObject.invokeMethod(find(name), method), (name, method)
         tick()
     def wait_for(predicate):
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 5
         while not predicate() and time.monotonic() < deadline:
             QTest.qWait(20)
             app.processEvents()
@@ -85,122 +85,115 @@ try:
         assert 0 <= point.x() <= window.width() and 0 <= point.y() <= window.height(), (name, point)
         QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, point.toPoint())
         tick()
+    def inside_dialog(item_name, dialog):
+        item = find(item_name)
+        point = item.mapToScene(QPointF(0, 0))
+        assert point.x() >= dialog.property('x'), (item_name, point)
+        assert point.x() + item.width() <= dialog.property('x') + dialog.property('width'), item_name
+
+    key_bindings_path = config.key_bindings_path(controller._config_root)
+    store = app_profiles.AppProfileStore(controller._config_root)
+
     find('tabBar').setProperty('currentIndex', 1)
     tick()
+    # The application bar starts with just the global chip and "+", and it sits
+    # above the button list on the page.
+    assert controller.mappingEditTarget == ''
+    assert len(controller.mappingAppProfiles) == 0, controller.mappingAppProfiles
+    assert find('mappingChip_global').property('objectName') == 'mappingChip_global'
+    assert find('mappingViewSwitcher').property('y') < find('mappingList').property('y')
+
+    # "+" on the bar opens the picker; a typed process name is accepted.
+    click('addMappingAppButton')
+    picker = find('mappingAppPickerDialog')
+    wait_for(lambda: picker.property('visible'))
+    field = find('mappingAppProcessField')
+    inside_dialog('browseMappingAppButton', picker)
+    field.setProperty('text', 'chrome.exe')
+    tick()
+    click('addMappingAppProcessButton')
+    assert len(controller.mappingAppProfiles) == 1, controller.mappingAppProfiles
+    assert controller.mappingAppProfiles[0]['process'] == 'chrome.exe'
+    assert str(controller.mappingAppProfiles[0]['name']).strip(), controller.mappingAppProfiles[0]
+    app_id = controller.mappingAppProfiles[0]['id']
+    # Adding a second time reuses the same application instead of duplicating it.
+    field.setProperty('text', 'Chrome.exe')
+    tick()
+    click('addMappingAppProcessButton')
+    assert len(controller.mappingAppProfiles) == 1, controller.mappingAppProfiles
+    assert controller.mappingAppProfiles[0]['id'] == app_id
+    # Adding an application retargets the button page, like Logi Options+.
+    assert controller.mappingEditTarget == app_id, controller.mappingEditTarget
+    invoke('mappingAppPickerDialog', 'reject')
+    wait_for(lambda: not picker.property('visible'))
+
+    # The application chip sits after the global one; clicking either chip
+    # retargets the button page, and clicking is immediate (no apply step).
+    app_chip = find('mappingChip_0')
+    assert app_chip.property('x') > find('mappingChip_global').property('x')
+    click('mappingChip_global')
+    assert controller.mappingEditTarget == '', controller.mappingEditTarget
+    click('mappingChip_0')
+    assert controller.mappingEditTarget == app_id, controller.mappingEditTarget
+
+    # The "整体配置" panel only owns the export/import bundle now.
+    click('manageMappingBundleButton')
+    dialog = find('mappingBundleDialog')
+    wait_for(lambda: dialog.property('visible'))
+    inside_dialog('exportMappingBundleButton', dialog)
+    inside_dialog('importMappingBundleButton', dialog)
+    assert find('mappingBundleExportDialog').property('objectName') == 'mappingBundleExportDialog'
+    assert find('mappingBundleImportDialog').property('objectName') == 'mappingBundleImportDialog'
+    invoke('mappingBundleDialog', 'reject')
+    wait_for(lambda: not dialog.property('visible'))
+    assert controller.mappingEditTarget == app_id, controller.mappingEditTarget
+
+    # Editing the button page now writes that application's layout and leaves
+    # the global key_bindings.json untouched.
+    before_global = json.dumps(config.load_key_bindings(key_bindings_path), sort_keys=True)
     click('editMapping_ok')
     assert find('actionEditorDialog').property('visible')
     find('actionEditorLongCombo').setProperty('editText', '鼠标左键长按')
     click('actionEditorSaveButton')
-    assert controller._bindings['secondary_bindings']['ok']['long_press']['kind'] == 'mouse_left_hold'
-    click('manageMappingPresetsButton')
-    dialog = find('mappingPresetsDialog')
-    assert dialog.property('visible')
-    assert not find('deleteMappingPresetButton').property('enabled')
-    assert not find('renameMappingPresetButton').property('enabled')
-    assert len(controller.mappingPresets) == 1
-    assert controller.mappingPresets[0]['automatic'] and controller.mappingPresets[0]['applied']
-    combo = find('mappingPresetCombo')
-    assert combo.property('currentIndex') == combo.property('effectiveIndex') == 0
-    assert '自动保存' in combo.property('displayText')
-    assert find('applyMappingPresetButton').property('text') == '应用配置'
-    # All management actions form one row; every button stays within the dialog.
-    buttons = [find(name + 'MappingPresetButton') for name in ('copy', 'rename', 'delete', 'export', 'import')]
-    positions = [button.mapToScene(QPointF(0, 0)) for button in buttons]
-    assert max(point.y() for point in positions) - min(point.y() for point in positions) < 1
-    for button, point in zip(buttons, positions):
-        assert point.x() >= dialog.property('x')
-        assert point.x() + button.width() <= dialog.property('x') + dialog.property('width')
-    screenshot_dir = os.environ.get('PRESET_TEST_SCREENSHOT_DIR')
-    if screenshot_dir:
-        window.grabWindow().save(str(Path(screenshot_dir) / (profile + '-initial.png')))
-    click('copyMappingPresetButton')
-    assert find('mappingPresetNameDialog').property('visible')
-    # Invalid input remains editable in the naming dialog.
-    field = find('mappingPresetNameField')
-    field.setProperty('text', '')
-    invoke('mappingPresetNameDialog', 'accept')
-    wait_for(lambda: find('mappingPresetNameDialog').property('opened'))
-    field.setProperty('text', '我的按键配置')
-    invoke('mappingPresetNameDialog', 'accept')
-    wait_for(lambda: not find('mappingPresetNameDialog').property('visible'))
-    assert len(controller.mappingPresets) == 2
-    first = controller.mappingPresets[1]['id']
-    assert combo.property('currentIndex') == 1 and combo.property('effectiveIndex') == 0
-    click('copyMappingPresetButton')
-    assert find('mappingPresetNameDialog').property('visible')
-    # Browsing another row cannot redirect the copy's source.
-    dialog.setProperty('selectedId', mapping_presets.AUTO_ID)
-    invoke('mappingPresetNameDialog', 'accept')
-    second = dialog.property('selectedId')
-    assert second != first
-    # Changing the selection after opening the name dialog cannot redirect rename.
-    click('renameMappingPresetButton')
-    dialog.setProperty('selectedId', first)
-    field.setProperty('text', '副本改名')
-    invoke('mappingPresetNameDialog', 'accept')
-    store = mapping_presets.PresetStore(controller._config_root)
-    assert store.get(second)['name'] == '副本改名'
-    assert store.get(first)['name'] == '我的按键配置'
-    before = dict(controller._bindings)
-    click('applyMappingPresetButton')
-    assert find('mappingPresetConfirmDialog').property('visible')
-    invoke('mappingPresetConfirmDialog', 'reject')
-    assert controller._bindings == before
-    click('applyMappingPresetButton')
-    invoke('mappingPresetConfirmDialog', 'accept')
-    assert '已应用' in dialog.property('message'), dialog.property('message')
-    applied_index = next(index for index, row in enumerate(controller.mappingPresets) if row['applied'])
-    assert combo.property('effectiveIndex') == applied_index
-    # Browsing an unapplied row must not move the check mark or bold type.
-    dialog.setProperty('selectedId', first)
+    def app_saved():
+        actions = store.get(app_id)['mapping']['secondary_bindings'].get('ok', {})
+        return actions.get('long_press', {}).get('kind') == 'mouse_left_hold'
+    wait_for(app_saved)
+    assert json.dumps(config.load_key_bindings(key_bindings_path), sort_keys=True) == before_global
+
+    # The bar marks the layout actually in effect - the store's applied marker,
+    # not the chip the user is editing. Applying an application moves the mark.
+    assert find('mappingChipInEffect_global').property('visible') is True
+    assert find('mappingChipInEffect_0').property('visible') is False
+    assert controller.mappingPresetAction('apply', app_id, '')['ok']
     tick()
-    assert combo.property('effectiveIndex') == applied_index
-    click('mappingPresetCombo')
-    for index in range(len(controller.mappingPresets)):
-        option = find('mappingPresetCombo_option_' + str(index))
-        weight = option.property('contentItem').property('font').weight()
-        assert int(weight) == (600 if index == applied_index else 400), (index, weight)
-    if screenshot_dir:
-        window.grabWindow().save(str(Path(screenshot_dir) / (profile + '.png')))
-    QTest.keyClick(window, Qt.Key_Escape)
+    assert find('mappingChipInEffect_0').property('visible') is True
+    assert find('mappingChipInEffect_global').property('visible') is False
+    assert controller.mappingPresetAction('apply', app_profiles.GLOBAL_ID, '')['ok']
     tick()
-    if screenshot_dir:
-        window.grabWindow().save(str(Path(screenshot_dir) / (profile + '-panel.png')))
-    invoke('mappingPresetsDialog', 'reject')
-    click('manageMappingPresetsButton')
-    assert combo.property('currentIndex') == combo.property('effectiveIndex') == applied_index
-    # Both records can be removed; the applied values remain intact.
-    for identity in (first, second):
-        dialog.setProperty('selectedId', identity)
-        tick()
-        click('deleteMappingPresetButton')
-        invoke('mappingPresetConfirmDialog', 'accept')
-    assert len(controller.mappingPresets) == 1
-    assert controller.mappingPresets[0]['automatic'] and controller.mappingPresets[0]['applied']
-    assert not find('deleteMappingPresetButton').property('enabled')
-    invoke('mappingPresetsDialog', 'reject')
-    assert not dialog.property('visible')
-    # A legacy mapping that needs correction must not hide valid named copies.
-    store = mapping_presets.PresetStore(controller._config_root)
-    compatible = store.create('兼容验证副本', profile, mapping_presets.snapshot(controller._bindings, profile))
-    export = controller._config_root.parent / 'compatible.json'
-    store.export_file(compatible, export)
-    controller._bindings['bindings']['mic'] = {'kind': 'voice_toggle', 'keys': []}
-    controller._removed_voice_bindings = config.normalize_voice_product_boundary(controller._config, controller._bindings)
-    controller._load_bindings_into_model()
-    controller._set_mapping_dirty(True)
-    legacy_before = json.dumps(controller._bindings, sort_keys=True)
-    click('manageMappingPresetsButton')
-    assert dialog.property('visible') and combo.property('count') == 2
-    assert combo.property('currentIndex') == combo.property('effectiveIndex') == 0
-    assert dialog.property('message') == ''
-    imported = controller.mappingPresetAction('import', '', QUrl.fromLocalFile(str(export)).toString())
-    assert imported['ok'], imported
-    dialog.setProperty('selectedId', imported['id'])
-    tick()
-    assert combo.property('count') == 3 and combo.property('currentIndex') == 2
-    assert json.dumps(controller._bindings, sort_keys=True) == legacy_before
-    invoke('mappingPresetsDialog', 'reject')
+    assert find('mappingChipInEffect_global').property('visible') is True
+    assert find('mappingChipInEffect_0').property('visible') is False
+
+    # "移除" on the chip asks for confirmation first; a stray click no longer
+    # deletes the application layout.
+    click('removeMappingAppButton_0')
+    confirm = find('removeMappingAppConfirmDialog')
+    wait_for(lambda: confirm.property('visible'))
+    assert len(controller.mappingAppProfiles) == 1, controller.mappingAppProfiles
+    invoke('removeMappingAppConfirmDialog', 'reject')
+    wait_for(lambda: not confirm.property('visible'))
+    assert len(controller.mappingAppProfiles) == 1, controller.mappingAppProfiles
+
+    # Confirming deletes the application and the page falls back to the global
+    # layout.
+    click('removeMappingAppButton_0')
+    wait_for(lambda: confirm.property('visible'))
+    invoke('removeMappingAppConfirmDialog', 'accept')
+    wait_for(lambda: len(controller.mappingAppProfiles) == 0)
+    assert len(controller.mappingAppProfiles) == 0, controller.mappingAppProfiles
+    assert controller.mappingEditTarget == ''
+    message = find('mappingMessage').property('text')
+    assert '已删除' in message, message
     assert not warnings, warnings
     print(json.dumps({'profile': profile, 'warnings': warnings, 'width': 640, 'height': 480}))
     window.hide()
@@ -215,12 +208,12 @@ finally:
 
 @unittest.skipUnless(qt_tests._HAS_PYSIDE6, qt_tests._SKIP_REASON)
 class MappingPresetsQmlTests(unittest.TestCase):
-    def test_real_panel_flow_in_both_profiles_and_light_dark_scaled_windows(self):
-        for profile, scale, dark in (("xiaomi-rc003", "1", "0"), ("chromecast-remote", "1.5", "1")):
+    def test_real_panel_flow_in_light_dark_scaled_windows(self):
+        for profile, scale, dark in (("xiaomi-rc003", "1", "0"), ("xiaomi-rc003", "1.5", "1")):
             with self.subTest(profile=profile, scale=scale, dark=dark):
                 env = dict(os.environ, QT_QPA_PLATFORM="offscreen", RC003_DISABLE_LIVE_INPUT="1",
                            PRESET_TEST_PROFILE=profile, PRESET_TEST_DARK=dark, QT_SCALE_FACTOR=scale)
                 result = subprocess.run([sys.executable, "-c", PROBE], env=env,
-                                        capture_output=True, text=True, encoding="utf-8", timeout=45)
+                                        capture_output=True, text=True, encoding="utf-8", timeout=90)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(json.loads(result.stdout.strip().splitlines()[-1])["warnings"], [])

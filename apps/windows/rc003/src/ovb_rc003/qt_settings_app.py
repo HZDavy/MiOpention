@@ -95,7 +95,7 @@ functions (see that function's docstring for the full story).
 from __future__ import annotations
 
 import atexit
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import gc
 import os
 import sys
@@ -108,6 +108,7 @@ from . import (
     __version__,
     action_executor,
     remote_selection,
+    app_icons,
     application_update,
     audio_playback,
     audio_output,
@@ -125,7 +126,8 @@ from . import (
     hotkey_capture_windows,
     key_detection_bridge,
     key_mapping,
-    mapping_presets,
+    local_microphone_windows,
+    app_profiles,
     log_export,
     logging_setup,
     product_identity,
@@ -133,76 +135,21 @@ from . import (
     remote_layout,
     raw_input_windows,
     resources,
+    running_apps_windows,
     settings_ui,
     shell_targets,
     single_instance,
     startup_windows,
     vb_cable_bundle,
-    voice_hotkey_sync_windows,
-    voice_program_manager,
-    wetype_control_windows,
     win32_keys,
     window_chrome_windows,
     windows_diagnostics,
 )
 
-_VOICE_HOTKEY_TASK_TIMEOUT_MS = 2500
+# 特别版（0.1.0）停用联网更新检查：应用不再访问 GitHub 查询新版本，
+# 启动时也不做静默检查。发布页入口、更新弹窗与已下载内容仍可正常查看。
+APPLICATION_UPDATE_CHECK_ENABLED = False
 
-
-@dataclass
-class _VoiceHotkeyTransaction:
-    """Own one side-effecting provider transaction across all of its steps."""
-
-    owner_key: str
-    provider_id: str
-    trigger: str
-    settings_revision: int
-    cancel_event: threading.Event
-    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
-    _worker_token: int = 0
-    _worker_active: bool = False
-    _terminal_payload: object = None
-    _reconciled: bool = False
-
-    def begin_worker(self, token: int) -> None:
-        with self._lock:
-            self._worker_token = token
-            self._worker_active = True
-            self._terminal_payload = None
-
-    def record_terminal(self, token: int, payload: object) -> None:
-        with self._lock:
-            if token != self._worker_token:
-                return
-            self._worker_active = False
-            self._terminal_payload = payload
-
-    def consume_terminal(self, token: int) -> bool:
-        with self._lock:
-            if token != self._worker_token or self._terminal_payload is None:
-                return False
-            self._terminal_payload = None
-            return True
-
-    def mark_reconciled(self) -> None:
-        with self._lock:
-            self._reconciled = True
-            self._terminal_payload = None
-
-    def is_unsettled(self) -> bool:
-        with self._lock:
-            return self._worker_active or (
-                self._terminal_payload is not None and not self._reconciled
-            )
-
-    def matches(self, config_value: dict, provider_id: str, trigger: str,
-                settings_revision: int) -> bool:
-        return (
-            provider_id == self.provider_id
-            and trigger == self.trigger
-            and settings_revision == self.settings_revision
-            and remote_selection.active_key(config_value) == self.owner_key
-        )
 
 # Only the physical microphone button can own RC003 audio. Other buttons use
 # ordinary actions; secondary gestures are ordinary actions for every button.
@@ -801,6 +748,7 @@ def _load_qt_classes() -> dict:
         SingleNoteRole = _UserRole + 14
         DoubleNoteRole = _UserRole + 15
         LongNoteRole = _UserRole + 16
+        InjectModeRole = _UserRole + 17
 
         # Emitted whenever a QML combo box edits a row's action text
         # (button_id, new display text) - SettingsController does not need
@@ -844,6 +792,9 @@ def _load_qt_classes() -> dict:
                 }
                 for bid in self._button_ids
             }
+            self._inject_modes: Dict[str, str] = {
+                bid: key_mapping.DEFAULT_INJECT_MODE for bid in self._button_ids
+            }
             self._selected_button_id: str = "ok"
 
         def rowCount(self, parent=QModelIndex()) -> int:  # noqa: B008 - QML model convention
@@ -869,6 +820,7 @@ def _load_qt_classes() -> dict:
                 self.SingleNoteRole: QByteArray(b"singleNote"),
                 self.DoubleNoteRole: QByteArray(b"doubleNote"),
                 self.LongNoteRole: QByteArray(b"longNote"),
+                self.InjectModeRole: QByteArray(b"injectMode"),
             }
 
         def data(self, index, role: int = _DisplayRole):
@@ -881,9 +833,6 @@ def _load_qt_classes() -> dict:
             if role == self.DisplayNameRole:
                 return remote_layout.display_names(self._profile)[button_id]
             if role == self.HidUsageRole:
-                if self._profile == device_catalog.CHROMECAST_ID:
-                    code = remote_layout.CHROMECAST_REPORT_CODES.get(button_id)
-                    return f"普通报告 0x{code:02X}" if code is not None else "ATVV 语音控制（非普通报告）"
                 return remote_layout.hid_usage_display(button_id)
             if role == self.ActionTextRole:
                 return settings_ui.format_action_text(self._action_text[button_id])
@@ -921,6 +870,8 @@ def _load_qt_classes() -> dict:
                 return self._display_notes[button_id][
                     key_mapping.ButtonTrigger.LONG_PRESS.value
                 ]
+            if role == self.InjectModeRole:
+                return self._inject_modes[button_id]
             return None
 
         def load_display_map(
@@ -1026,6 +977,51 @@ def _load_qt_classes() -> dict:
                 if any(note.strip() for note in trigger_map.values())
             }
 
+        def load_inject_modes(
+            self, inject_modes: Optional[Dict[str, str]]
+        ) -> None:
+            """Apply persisted per-button injection backends to the rows.
+
+            Like load_display_map() this only refreshes the roles whose value
+            changed, so the QML delegates stay alive across a save/reload.
+            """
+
+            entries = inject_modes if isinstance(inject_modes, dict) else {}
+            for row, button_id in enumerate(self._button_ids):
+                mode = key_mapping.normalize_stored_inject_mode(
+                    entries.get(button_id)
+                )
+                if mode == self._inject_modes[button_id]:
+                    continue
+                self._inject_modes[button_id] = mode
+                model_index = self.index(row, 0)
+                self.dataChanged.emit(
+                    model_index, model_index, [self.InjectModeRole]
+                )
+
+        def to_inject_mode_map(self) -> Dict[str, str]:
+            """Inverse of load_inject_modes() for build_save_model()."""
+
+            return dict(self._inject_modes)
+
+        def inject_mode_for(self, button_id: str) -> str:
+            return self._inject_modes.get(
+                str(button_id), key_mapping.DEFAULT_INJECT_MODE
+            )
+
+        @Slot(int, str)
+        def setInjectModeAt(self, row: int, mode: str) -> None:
+            if not (0 <= row < len(self._button_ids)):
+                return
+            button_id = self._button_ids[row]
+            normalized = key_mapping.normalize_stored_inject_mode(mode)
+            if normalized == self._inject_modes[button_id]:
+                return
+            self._inject_modes[button_id] = normalized
+            model_index = self.index(row, 0)
+            self.dataChanged.emit(model_index, model_index, [self.InjectModeRole])
+            self.mappingEdited.emit()
+
         def index_of(self, button_id: str) -> int:
             try:
                 return self._button_ids.index(button_id)
@@ -1123,8 +1119,17 @@ def _load_qt_classes() -> dict:
         """
 
         mappingPresetsChanged = Signal()
+        mappingEditTargetChanged = Signal()
+        mappingAppProfilesChanged = Signal()
+        runningApplicationsChanged = Signal()
         hotkeyTextChanged = Signal()
         holdVoiceHotkeyTextChanged = Signal()
+        voiceSlotHotkeysChanged = Signal()
+        voiceInputSourceChanged = Signal()
+        voiceShortPressDismissChanged = Signal()
+        localMicrophoneOptionsChanged = Signal()
+        localMicrophoneDeviceChanged = Signal()
+        injectModesChanged = Signal()
         endpointOptionsChanged = Signal()
         recommendedEndpointIndexChanged = Signal()
         selectedEndpointIndexChanged = Signal()
@@ -1163,16 +1168,6 @@ def _load_qt_classes() -> dict:
         remoteSelectionChanged = Signal()
         _remoteDevicesReady = Signal(object)
         _remoteSwitchReady = Signal(object)
-        _chromecastSetupReady = Signal(object)
-        selectedVoiceProgramIndexChanged = Signal()
-        voiceProgramOptionsChanged = Signal()
-        voiceProgramCustomPathChanged = Signal()
-        voiceProgramLaunchOnBridgeStartChanged = Signal()
-        voiceProgramLaunchElevatedChanged = Signal()
-        voiceProgramSettingsDirtyChanged = Signal()
-        voiceProgramStatusTextChanged = Signal()
-        voiceProgramStatusCodeChanged = Signal()
-        voiceProgramElevationStatusChanged = Signal()
         voiceHotkeyBusyChanged = Signal()
         voiceHotkeySaveStateChanged = Signal()
         voiceHotkeySourceChanged = Signal()
@@ -1199,10 +1194,6 @@ def _load_qt_classes() -> dict:
         _hotkeyCaptureResult = Signal(object)
         _hotkeyCaptureFailed = Signal(object)
         _endpointOptionsRefreshReady = Signal(object)
-        _voiceProgramStatusRefreshReady = Signal(object)
-        _voiceProgramOptionsRefreshReady = Signal(object)
-        _voiceHotkeyTaskReady = Signal(object)
-        _voiceProgramLaunchReady = Signal(object)
         _endpointPreflightReady = Signal(object)
         _hidHelperRepairReady = Signal(object)
         _hidHelperRemovalReady = Signal(object)
@@ -1213,8 +1204,7 @@ def _load_qt_classes() -> dict:
         _applicationUpdateDownloadReady = Signal(object)
         _applicationUpdateProgressReady = Signal(object)
 
-        _TRIGGER_MODE_ORDER = (key_mapping.VoiceTriggerMode.HOLD,)
-        _DEVICE_ORDER = (device_catalog.RC003_ID, device_catalog.CHROMECAST_ID)
+        _DEVICE_ORDER = (device_catalog.RC003_ID,)
         _DEVICE_PAGE_INDEX = 0
         _BUTTONS_PAGE_INDEX = 1
         _VOICE_PAGE_INDEX = 2
@@ -1242,7 +1232,6 @@ def _load_qt_classes() -> dict:
             self._available_mapping_app_labels: Optional[set[str]] = None
             self._background_task_runner = background_task_runner
             self._background_shutdown_event = threading.Event()
-            self._wetype_hotkey_refresh_cancel = None
             self._background_threads: set[threading.Thread] = set()
             # Tests inject a same-thread runner, so emitting a result may
             # synchronously submit the next serialized hotkey step while this
@@ -1306,7 +1295,31 @@ def _load_qt_classes() -> dict:
             self._hidHelperRemovalReady.connect(
                 self._on_hid_helper_removal_ready
             )
-            self._config = config.load_config(config.config_path(self._config_root))
+            self._config, self._bindings, self._configuration_issues = (
+                config.load_window_settings(self._config_root)
+            )
+            self._configuration_error = ""
+            if self._configuration_issues:
+                details = "；".join(
+                    f"{issue.filename}：{issue.message}" for issue in self._configuration_issues
+                )
+                self._configuration_error = (
+                    f"{details} 原文件已保留，当前仅供查看；未读出的内容使用临时显示值。"
+                    "保存和遥控器服务已暂停，可在设备页导出日志；修复配置后请重新打开。"
+                )
+                try:
+                    logger = logging_setup.get_logger(self._config_root)
+                    for issue in self._configuration_issues:
+                        logger.error(
+                            "settings load failed: file=%s error_type=%s reason=%s",
+                            issue.filename, issue.error_type, issue.message,
+                        )
+                    if not logging_setup.flush_application_logs(logging_setup.log_dir(self._config_root)):
+                        self._configuration_error += " 本次原因未能完整写入日志。"
+                except Exception:
+                    # A read-only/unavailable data directory must not also
+                    # prevent the user from seeing the recovery explanation.
+                    self._configuration_error += " 本次原因未能写入日志。"
             self._remote_devices = []
             self._remote_scan_busy = False
             self._remote_scan_valid = False
@@ -1314,17 +1327,14 @@ def _load_qt_classes() -> dict:
             self._remote_selection_message = ""
             self._remote_switch_pending = None
             self._remote_save_uncertain = False
-            self._chromecast_setup_client = None
-            self._chromecast_setup_error = ""
             self._remoteDevicesReady.connect(self._on_remote_devices_ready)
             self._remoteSwitchReady.connect(self._on_remote_switch_ready)
-            self._chromecastSetupReady.connect(self._on_chromecast_setup_ready)
             self.remoteSelectionChanged.connect(self.trayStateChanged.emit)
             self._hid_helper_setup_prompted_offer_id = str(
                 self._config.get("hid_helper_setup_prompted_offer_id", "")
             )
             self._hid_helper_setup_attempted_this_session = False
-            self._start_hidden = bool(start_hidden)
+            self._start_hidden = bool(start_hidden) and not self.configurationReadOnly
             self._start_bridge_requested = bool(start_bridge)
             self._launch_bridge_on_app_start = bool(
                 self._config.get("launch_bridge_on_app_start", False)
@@ -1337,7 +1347,8 @@ def _load_qt_classes() -> dict:
                     "close_behavior", config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
                 )
             )
-            startup_windows.rebind_owned_frozen_startup()
+            if not self.configurationReadOnly:
+                startup_windows.rebind_owned_frozen_startup()
             startup_state = startup_windows.read_startup_state()
             self._launch_at_login = startup_state.enabled
             self._application_exit_requested = False
@@ -1362,70 +1373,15 @@ def _load_qt_classes() -> dict:
                 self._on_bridge_restart_stop_ready
             )
             self._window_hide_requested = False
-            self._bindings = config.load_key_bindings(
-                config.key_bindings_path(self._config_root)
-            )
             self._removed_voice_bindings = config.normalize_voice_product_boundary(
                 self._config,
                 self._bindings,
             )
-            self._trigger_mode_index = 0
             saved_voice_hotkeys = self._config.get("voice_hotkeys", {})
-            self._voice_hotkeys = {
-                mode: str(
-                    saved_voice_hotkeys.get(
-                        mode.value,
-                        key_mapping.voice_hotkey_for_trigger_mode(mode),
-                    )
-                )
-                for mode in self._TRIGGER_MODE_ORDER
-            }
-            if config.voice_hotkey_trigger_for_settings(self._config) == "toggle":
-                self._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD] = config.voice_hotkey_for_provider(
-                    self._config, self._config.get("voice_program", {}).get("provider"), trigger="toggle")
-            self._voice_program_settings = (
-                voice_program_manager.normalize_voice_program_settings(
-                    self._config.get("voice_program")
-                )
-            )
-            self._voice_program_settings_dirty = False
-            self._voice_program_status_text = ""
-            self._voice_program_status_code = "unknown"
-            self._voice_program_elevation_status = "unknown"
-            self._voice_program_options = voice_program_manager.provider_options()
-            self._voice_program_status_refresh_running = False
-            self._voice_program_status_refresh_pending = False
-            self._voiceProgramStatusRefreshReady.connect(
-                self._on_voice_program_status_refresh_ready
-            )
-            self._voice_program_options_refresh_running = False
-            self._voice_program_options_refresh_pending = False
-            self._voiceProgramOptionsRefreshReady.connect(
-                self._on_voice_program_options_refresh_ready
-            )
+            self._voice_hotkey = str(saved_voice_hotkeys.get("hold", ""))
+            self._voice_slot_hotkeys = self._slots_from_config(self._config)
             self._voice_hotkey_busy = False
-            self._voice_hotkey_load_pending = None
-            self._voice_hotkey_load_timer = QTimer(self)
-            self._voice_hotkey_load_timer.setSingleShot(True)
-            self._voice_hotkey_load_timer.timeout.connect(
-                self._retry_pending_voice_hotkey_load
-            )
             self._voice_hotkey_save_state = "saved"
-            self._voice_hotkey_task_token = 0
-            self._voice_hotkey_task_completion = None
-            self._voice_hotkey_task_cancel_event = None
-            self._voice_hotkey_task_timed_out = False
-            self._voice_hotkey_task_retain_on_timeout = False
-            self._voice_hotkey_transaction = None
-            self._voice_hotkey_task_timeout_timer = QTimer(self)
-            self._voice_hotkey_task_timeout_timer.setSingleShot(True)
-            self._voice_hotkey_task_timeout_timer.timeout.connect(
-                self._on_voice_hotkey_task_timeout
-            )
-            self._voiceHotkeyTaskReady.connect(
-                self._on_voice_hotkey_task_ready
-            )
-            self._voiceProgramLaunchReady.connect(self._on_voice_program_launch_ready)
             self._endpoint_preflight_busy = False
             self._endpoint_preflight_token = 0
             self._endpoint_preflight_completion = None
@@ -1492,11 +1448,6 @@ def _load_qt_classes() -> dict:
                 runtime_status.voice_runtime_state
                 if runtime_status is not None
                 else bridge_runtime_status.VOICE_RUNTIME_NOT_TESTED
-            )
-            self._voice_runtime_provider = (
-                runtime_status.voice_runtime_provider
-                if runtime_status is not None
-                else ""
             )
             self._bridge_connected = bool(
                 runtime_status is not None
@@ -1573,12 +1524,16 @@ def _load_qt_classes() -> dict:
             self._application_update_package_size = 0
             self._application_update_download_received = 0
             self._application_update_download_path = ""
-            self._settings_dirty = bool(self._removed_voice_bindings)
-            self._mapping_dirty = bool(self._removed_voice_bindings)
+            self._settings_dirty = bool(self._removed_voice_bindings) and not self.configurationReadOnly
+            self._mapping_dirty = bool(self._removed_voice_bindings) and not self.configurationReadOnly
             self._settings_revision = 0
             self._settings_save_busy = False
             self._mapping_preset_rows: List[dict] = []
-            self._mapping_applied_overrides: Dict[str, str] = {}
+            self._mapping_edit_target = ""
+            self._mapping_app_rows: List[dict] = []
+            self._running_applications: List[dict] = []
+            self._app_executable_cache: Dict[str, str] = {}
+            self._app_icon_cache: Dict[str, str] = {}
             self._mapping_auto_save_scheduled = False
             self._mapping_auto_save_running = False
             self._mapping_auto_save_retry_available = False
@@ -1645,7 +1600,6 @@ def _load_qt_classes() -> dict:
             self._model.mappingEdited.connect(self._on_mapping_edited)
             self._model.set_selected_button(self._selected_button_id)
             self._request_endpoint_options_refresh()
-            self._request_voice_program_status_refresh()
             if removed_windows_dictation:
                 self._status_message = (
                     "Windows 语音输入入口已取消，请在语音页重新选择实际使用的语音程序。"
@@ -1730,17 +1684,6 @@ def _load_qt_classes() -> dict:
                 self._background_shutdown_event.set()
                 threads = list(self._background_threads)
             self._endpoint_options_refresh_pending = False
-            self._voice_program_status_refresh_pending = False
-            self._voice_program_options_refresh_pending = False
-            self._clear_pending_voice_hotkey_load()
-            self._voice_hotkey_task_token += 1
-            self._voice_hotkey_task_completion = None
-            voice_hotkey_cancel = self._voice_hotkey_task_cancel_event
-            if voice_hotkey_cancel is not None:
-                voice_hotkey_cancel.set()
-            transaction = self._voice_hotkey_transaction
-            if transaction is not None:
-                transaction.cancel_event.set()
             self._endpoint_preflight_token += 1
             self._endpoint_preflight_completion = None
             cancel_event = self._application_update_download_cancel_event
@@ -1756,26 +1699,7 @@ def _load_qt_classes() -> dict:
                 if remaining <= 0:
                     break
                 thread.join(timeout=remaining)
-            provider_settled = transaction is None or not transaction.is_unsettled()
-            if provider_settled:
-                self._voice_hotkey_task_cancel_event = None
-                self._voice_hotkey_task_timed_out = False
-                self._voice_hotkey_task_retain_on_timeout = False
-                if transaction is not None:
-                    transaction.mark_reconciled()
-                    self._voice_hotkey_transaction = None
-                self._voice_hotkey_busy = False
-                self._voice_hotkey_save_state = "saved"
-            setup_client = self._chromecast_setup_client
-            setup_settled = setup_client is None
-            if setup_client is not None and not any(thread.is_alive() for thread in threads):
-                try:
-                    setup_client.stop()
-                    self._chromecast_setup_client = None
-                    setup_settled = True
-                except RuntimeError:
-                    pass
-            return provider_settled and setup_settled
+            return True
 
         def shutdownForProcessExit(self) -> bool:
             """Synchronously release input hooks before Qt objects disappear."""
@@ -1999,15 +1923,21 @@ def _load_qt_classes() -> dict:
             if self._selected_button_id not in remote_layout.button_order(profile):
                 self._selected_button_id = "ok"
                 self.selectedButtonIdChanged.emit()
-            bindings = self._bindings.get("bindings", {})
+            identity, document = self._resolved_edit_target()
+            if identity != self._mapping_edit_target:
+                self._mapping_edit_target = identity
+                self.mappingEditTargetChanged.emit()
+            editing_app = bool(identity)
+            bindings = document.get("bindings", {})
             display_map: Dict[str, str] = {}
             secondary_display_map: Dict[str, Dict[str, str]] = {}
-            raw_display_notes = self._bindings.get("display_notes", {})
+            inject_mode_map: Dict[str, str] = {}
+            raw_display_notes = document.get("display_notes", {})
             display_note_map = (
                 raw_display_notes if isinstance(raw_display_notes, dict) else {}
             )
             for button_id in remote_layout.button_order(profile):
-                if button_id in self._removed_voice_bindings:
+                if not editing_app and button_id in self._removed_voice_bindings:
                     display_map[button_id] = settings_ui._REMOVED_VOICE_DISPLAY
                     secondary_display_map[button_id] = {}
                     continue
@@ -2016,12 +1946,13 @@ def _load_qt_classes() -> dict:
                     try:
                         action = key_mapping.ButtonAction.from_dict(action_dict)
                         display_map[button_id] = settings_ui._action_to_display(action)
+                        inject_mode_map[button_id] = action.inject_mode
                     except (KeyError, TypeError, ValueError):
                         display_map[button_id] = ""
                 else:
                     display_map[button_id] = ""
                 secondary_display_map[button_id] = {}
-                raw_secondary = self._bindings.get("secondary_bindings", {}).get(
+                raw_secondary = document.get("secondary_bindings", {}).get(
                     button_id, {}
                 )
                 if isinstance(raw_secondary, dict):
@@ -2044,7 +1975,10 @@ def _load_qt_classes() -> dict:
                 secondary_display_map,
                 display_note_map,
             )
+            self._model.load_inject_modes(inject_mode_map)
             self._model.set_selected_button(self._selected_button_id)
+            self.voiceSlotHotkeysChanged.emit()
+            self.injectModesChanged.emit()
 
         def _selected_device_id(self) -> str:
             from . import remote_selection
@@ -2093,72 +2027,54 @@ def _load_qt_classes() -> dict:
             ) else "selected_missing"
 
         @Property(str, notify=remoteSelectionChanged)
-        def chromecastSetupError(self) -> str:
-            return self._chromecast_setup_error
-
-        @Property(str, notify=remoteSelectionChanged)
         def currentRemoteModelName(self) -> str:
             return device_catalog.profile_for(self._selected_device_id()).display_name
 
         @Property(int, notify=remoteSelectionChanged)
-        def remoteRecordingModeIndex(self) -> int:
-            return 1 if self._config.get("remote_recording_mode", "hold") == "toggle" else 0
-
-        @Property(str, notify=remoteSelectionChanged)
-        def remoteRecordingModeText(self) -> str:
-            return "开关型" if self.remoteRecordingModeIndex else "按住型"
-
-        @Property(int, notify=remoteSelectionChanged)
         def remoteRecordingLimitIndex(self) -> int:
-            from .chromecast_voice import LIMITS, DEFAULT_LIMIT
+            from .voice_preferences import LIMITS, DEFAULT_LIMIT
             return LIMITS.index(self._config.get("remote_recording_limit_seconds", DEFAULT_LIMIT))
 
         @Property("QStringList", notify=remoteSelectionChanged)
         def remoteRecordingLimitOptions(self) -> list:
-            from .chromecast_voice import LIMITS
+            from .voice_preferences import LIMITS
             return [f"{seconds // 60} 分钟" for seconds in LIMITS]
 
-        @Slot(int, int)
-        def setRemoteRecordingPreferences(self, mode_index: int, limit_index: int) -> None:
-            from .chromecast_voice import MODES, LIMITS
+        @Slot(int)
+        def setRemoteRecordingLimit(self, limit_index: int) -> None:
+            if self.configurationReadOnly:
+                return
+            from .voice_preferences import LIMITS
             logger = logging_setup.get_logger(self._config_root)
             if (self.isRc003Device or self._remote_selection_busy or self._settings_save_busy
                     or self.inputCaptureInUse or self._voice_hotkey_busy or self.voiceRuntimeState in (
                         "active", "mic_confirmed", "receiving_audio", "finishing")
-                    or mode_index not in range(len(MODES)) or limit_index not in range(len(LIMITS))):
+                    or limit_index not in range(len(LIMITS))):
                 self._set_status_message("")
                 self._set_error_message("当前无法更改录音设置，原设置已保留；请稍后重试。", 2)
                 self.remoteSelectionChanged.emit()
-                logger.info("recording preferences rejected: mode_index=%s limit_index=%s hotkey_busy=%s voice_state=%s",
-                            mode_index, limit_index, self._voice_hotkey_busy, self.voiceRuntimeState)
+                logger.info("recording limit rejected: limit_index=%s hotkey_busy=%s voice_state=%s",
+                            limit_index, self._voice_hotkey_busy, self.voiceRuntimeState)
                 return
             updated = dict(self._config)
-            mode_changed = updated.get("remote_recording_mode") != MODES[mode_index]
-            updated["remote_recording_mode"] = MODES[mode_index]
             updated["remote_recording_limit_seconds"] = LIMITS[limit_index]
             try:
                 saved = config.save_config_and_load(config.config_path(self._config_root), updated)
             except Exception:
                 self._set_status_message("")
-                self._set_error_message("录音模式保存失败，原设置已保留。", 2)
+                self._set_error_message("录音设置保存失败，原设置已保留。", 2)
                 self.remoteSelectionChanged.emit()
-                logger.warning("recording preferences save failed: mode=%s limit=%s",
-                               MODES[mode_index], LIMITS[limit_index])
+                logger.warning("recording limit save failed: limit=%s", LIMITS[limit_index])
                 return
             self._config = saved
-            logger.info("recording preferences saved: mode=%s limit=%s",
-                        saved["remote_recording_mode"], saved["remote_recording_limit_seconds"])
-            self._set_voice_hotkey_text(key_mapping.VoiceTriggerMode.HOLD,
-                                       self._display_voice_hotkey())
+            logger.info("recording limit saved: limit=%s",
+                        saved["remote_recording_limit_seconds"])
+            self._set_voice_hotkey_text(self._voice_hotkey)
             self.voiceHotkeySourceChanged.emit()
             self._bump_settings_revision()
             self.remoteSelectionChanged.emit()
             self._set_error_message("")
             self._set_status_message("录音设置已保存，下一次录音使用新设置。", 2)
-            if mode_changed:
-                # Silent providers read the newly selected mode. WeType stays
-                # explicit-only; manual shortcuts are preserved by the loader.
-                self.loadVoiceHotkeyFromProvider()
 
         @Property(bool, notify=remoteSelectionChanged)
         def remoteSelectionBusy(self) -> bool:
@@ -2237,6 +2153,8 @@ def _load_qt_classes() -> dict:
                 "没有找到已配对且支持的遥控器，请先在 Windows 蓝牙设置中配对。"))
 
         def _save_remote_selection(self, selection: dict, *, allow_legacy_binding=True) -> bool:
+            if self.configurationReadOnly:
+                return False
             from . import remote_selection
             try:
                 # Read the latest saved settings so device management cannot
@@ -2263,13 +2181,8 @@ def _load_qt_classes() -> dict:
                 self._bindings = saved_bindings
                 self._removed_voice_bindings = config.normalize_voice_product_boundary(saved, saved_bindings)
                 self._load_bindings_into_model()
-                self._voice_hotkeys = {mode: saved["voice_hotkeys"].get(mode.value, "")
-                                      for mode in self._TRIGGER_MODE_ORDER}
-                if config.voice_hotkey_trigger_for_settings(saved) == "toggle":
-                    self._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD] = config.voice_hotkey_for_provider(
-                        saved, saved.get("voice_program", {}).get("provider"), trigger="toggle")
-                self._replace_voice_program_settings(saved.get("voice_program"))
-                self._set_voice_program_settings_dirty(False)
+                self._voice_hotkey = str(saved["voice_hotkeys"].get("hold", ""))
+                self._voice_slot_hotkeys = self._slots_from_config(saved)
                 self._set_mapping_dirty(False)
                 self._selected_endpoint_index = next((index for index, item in enumerate(self._endpoint_values)
                     if (item.name, item.host_api) == (saved.get("output_endpoint_name", ""), saved.get("output_endpoint_host_api", ""))), -1)
@@ -2277,6 +2190,7 @@ def _load_qt_classes() -> dict:
                 self._request_endpoint_options_refresh()
                 self.hotkeyTextChanged.emit()
                 self.holdVoiceHotkeyTextChanged.emit()
+                self.voiceSlotHotkeysChanged.emit()
                 self.voiceHotkeySourceChanged.emit()
                 self.voiceMappingReadyChanged.emit()
                 self.selectedDeviceIndexChanged.emit()
@@ -2285,8 +2199,6 @@ def _load_qt_classes() -> dict:
             self._remote_save_uncertain = False
             self._bump_settings_revision()
             self.remoteSelectionChanged.emit()
-            if changed:
-                self.loadVoiceHotkeyFromProvider()
             return True
 
         @Slot(str)
@@ -2304,16 +2216,12 @@ def _load_qt_classes() -> dict:
                 self._remote_feedback(str(exc))
                 return
             if key == self.activeRemoteKey and not self._remote_save_uncertain:
-                if self.activeRemoteProfile == remote_selection.CHROMECAST_PROFILE:
-                    self._change_active_remote(updated, allow_legacy_binding=legacy_binding)
-                    return
                 self._remote_feedback("当前已在使用这台设备。")
                 return
             self._change_active_remote(updated, allow_legacy_binding=legacy_binding)
 
         def _change_active_remote(self, updated: dict, *, allow_legacy_binding=True) -> None:
-            if self._chromecast_setup_client is not None and updated["active"] != self.activeRemoteKey:
-                self._remote_feedback("上次谷歌启用进程尚未退出，请先重新使用当前设备完成清理。")
+            if self.configurationReadOnly:
                 return
             if (self._get_bridge_launch_busy() or self._bridge_recovery_running
                     or self._settings_save_busy or self._get_input_capture_in_use()
@@ -2365,11 +2273,7 @@ def _load_qt_classes() -> dict:
                 self._remote_feedback("设备切换已取消。")
                 return
             saved = self._save_remote_selection(updated, allow_legacy_binding=allow_legacy_binding)
-            if saved and self.activeRemoteProfile == "chromecast-remote":
-                self._prepare_chromecast_selection(was_running)
-                return
             if saved:
-                self._chromecast_setup_error = ""
                 self._remote_feedback(("已保存当前设备；其它页面已同步。" if self.activeRemoteReady
                                       else "已保存选择；当前型号尚未提供接收。")
                                       if updated["active"] else "当前设备已移除，请重新选择设备。")
@@ -2377,55 +2281,6 @@ def _load_qt_classes() -> dict:
                 self._remote_selection_busy = False
                 self.remoteSelectionChanged.emit()
             if was_running and self.activeRemoteKey and self.activeRemoteReady and not self._remote_save_uncertain:
-                self._set_bridge_launch_phase("starting")
-                QTimer.singleShot(0, self._start_bridge_process)
-
-        def _prepare_chromecast_selection(self, was_running: bool) -> None:
-            key = self.activeRemoteKey
-            self._chromecast_setup_error = ""
-            self._remote_feedback("正在准备谷歌遥控器…", busy=True)
-
-            def prepare():
-                success, detail = False, ""
-                try:
-                    if self._chromecast_setup_client is not None:
-                        self._chromecast_setup_client.stop()
-                        self._chromecast_setup_client = None
-                    if self._application_exit_intent.is_set() or self._background_shutdown_event.is_set():
-                        raise RuntimeError("设备准备已取消。")
-                    success = True
-                except Exception as exc:
-                    detail = str(exc) if isinstance(exc, RuntimeError) else "设备准备失败，请重新使用此设备。"
-                finally:
-                    client = self._chromecast_setup_client
-                    if client is not None:
-                        try:
-                            client.stop()
-                            self._chromecast_setup_client = None
-                        except RuntimeError:
-                            success = False
-                            detail = "谷歌启用进程尚未退出，请稍后重新使用此设备。"
-                    self._emit_background_result(self._chromecastSetupReady,
-                                                 (key, success, detail, was_running))
-            try:
-                self._start_background_task(prepare, "chromecast-setup")
-            except RuntimeError:
-                self._on_chromecast_setup_ready((key, False, "设备准备未能启动，请重试。", was_running))
-
-        def _on_chromecast_setup_ready(self, payload: object) -> None:
-            key, success, detail, was_running = payload
-            if key != self.activeRemoteKey or self._background_shutdown_event.is_set():
-                return
-            if self._application_exit_intent.is_set():
-                self._remote_feedback("设备准备已取消。")
-                return
-            self._chromecast_setup_error = "" if success else detail
-            self._remote_feedback("已使用谷歌遥控器。" if success else detail)
-            if not success:
-                self._set_error_message(detail, self._DEVICE_PAGE_INDEX)
-            else:
-                self._set_error_message("")
-            if success and was_running:
                 self._set_bridge_launch_phase("starting")
                 QTimer.singleShot(0, self._start_bridge_process)
 
@@ -2465,9 +2320,6 @@ def _load_qt_classes() -> dict:
             status: Optional[bridge_runtime_status.BridgeRuntimeStatus],
         ) -> None:
             raw_input_state = status.raw_input_state if status is not None else "unknown"
-            if raw_input_state == "chromecast_ready" and self._chromecast_setup_error:
-                self._chromecast_setup_error = ""
-                self.remoteSelectionChanged.emit()
             hid_tap_state = status.hid_tap_state if status is not None else "unknown"
             voice_key_physicalizer_state = (
                 getattr(status, "voice_key_physicalizer_state", "unknown")
@@ -2505,27 +2357,8 @@ def _load_qt_classes() -> dict:
                 if status is not None
                 else bridge_runtime_status.VOICE_RUNTIME_NOT_TESTED
             )
-            voice_runtime_provider = (
-                getattr(status, "voice_runtime_provider", "")
-                if status is not None
-                else ""
-            )
-            if (
-                voice_runtime_state != self._voice_runtime_state
-                or voice_runtime_provider != self._voice_runtime_provider
-            ):
+            if voice_runtime_state != self._voice_runtime_state:
                 self._voice_runtime_state = voice_runtime_state
-                self._voice_runtime_provider = voice_runtime_provider
-                if (
-                    self._wetype_hotkey_refresh_cancel is not None
-                    and voice_runtime_state in {
-                        bridge_runtime_status.VOICE_RUNTIME_ACTIVE,
-                        bridge_runtime_status.VOICE_RUNTIME_MIC_CONFIRMED,
-                        bridge_runtime_status.VOICE_RUNTIME_RECEIVING_AUDIO,
-                        bridge_runtime_status.VOICE_RUNTIME_FINISHING,
-                    }
-                ):
-                    self._wetype_hotkey_refresh_cancel.set()
                 self.voiceRuntimeStatusChanged.emit()
 
         @staticmethod
@@ -2605,18 +2438,6 @@ def _load_qt_classes() -> dict:
             status: bridge_runtime_status.BridgeRuntimeStatus,
         ) -> str:
             unconfirmed_text = "已收到声音，未确认微信开麦；若未输入文字，请松开后重试"
-            if remote_selection.active_profile(self._config) == remote_selection.CHROMECAST_PROFILE:
-                from .chromecast_client import message
-                state = ("普通按键接收正常" if status.raw_input_state == "chromecast_ready"
-                         else "正在核实按键来源" if status.raw_input_state == "starting"
-                         else message(status.raw_input_state.removeprefix("chromecast_")))
-                voice_state = {
-                    bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED: "语音启动失败，请查看运行日志",
-                    bridge_runtime_status.VOICE_RUNTIME_HOST_UNCONFIRMED: unconfirmed_text,
-                    bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED: "语音尚未正常结束，请先停止服务",
-                    bridge_runtime_status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED: "语音输出未打开，请检查声音通道",
-                }.get(status.voice_runtime_state, "语音请先用微信输入法验证")
-                return f"服务运行中；{self.currentRemoteModelName}；{state}；{voice_state}"
             connected = (
                 status.state
                 is bridge_runtime_status.BridgeConnectionState.CONNECTED
@@ -2744,8 +2565,6 @@ def _load_qt_classes() -> dict:
                 ):
                     recommended = True
             self._set_bridge_restart_recommended(recommended)
-            if remote_selection.active_profile(self._config) == remote_selection.CHROMECAST_PROFILE:
-                automatic = False
             if (
                 automatic
                 and schedule_recovery
@@ -2760,6 +2579,8 @@ def _load_qt_classes() -> dict:
                 QTimer.singleShot(0, self._start_automatic_bridge_recovery)
 
         def _persist_desktop_behavior(self, key: str, value: object) -> bool:
+            if self.configurationReadOnly:
+                return False
             next_config = dict(self._config)
             next_config[key] = value
             try:
@@ -3113,6 +2934,8 @@ def _load_qt_classes() -> dict:
             self._set_settings_dirty(True)
 
         def _queue_mapping_auto_save(self, delay_ms: int = 0) -> None:
+            if self.configurationReadOnly:
+                return
             self._set_mapping_auto_save_retry_available(False)
             if self._mapping_auto_save_scheduled or self._mapping_auto_save_running:
                 return
@@ -3120,6 +2943,9 @@ def _load_qt_classes() -> dict:
             self._mapping_auto_save_timer.start(max(0, int(delay_ms)))
 
         def _on_mapping_edited(self) -> None:
+            if self.configurationReadOnly:
+                self._load_bindings_into_model()
+                return
             self._mark_mapping_dirty()
             self._set_error_message("")
             self._set_status_message(
@@ -3146,22 +2972,9 @@ def _load_qt_classes() -> dict:
             return "；按键映射正在自动保存。"
 
         def _has_unsaved_non_mapping_settings(self) -> bool:
-            saved_hotkey = self._display_voice_hotkey()
-            if (
-                self._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD]
-                != saved_hotkey
-            ):
-                return True
-
-            saved_program = voice_program_manager.normalize_voice_program_settings(
-                self._config.get("voice_program")
-            )
-            if (
-                self._voice_program_settings_dirty
-                or self._voice_program_settings != saved_program
-            ):
-                return True
-
+            # RC003 records each voice slot's shortcut and writes it to disk the
+            # moment it is captured, so its legacy hold mirror is never a draft
+            # waiting to be committed.
             if 0 <= self._selected_endpoint_index < len(self._endpoint_values):
                 selected_endpoint = self._endpoint_values[
                     self._selected_endpoint_index
@@ -3217,27 +3030,6 @@ def _load_qt_classes() -> dict:
             accepted = self._save_mapping(completion=finish)
             if not accepted and not completion_called and not self._settings_save_busy:
                 finish(False)
-
-        def _set_voice_program_settings_dirty(self, value: bool) -> None:
-            value = bool(value)
-            if value == self._voice_program_settings_dirty:
-                return
-            self._voice_program_settings_dirty = value
-            self.voiceProgramSettingsDirtyChanged.emit()
-
-        def _set_voice_hotkey_busy(self, value: bool) -> None:
-            value = bool(value)
-            if value == self._voice_hotkey_busy:
-                return
-            self._voice_hotkey_busy = value
-            self.voiceHotkeyBusyChanged.emit()
-
-        def _set_voice_hotkey_save_state(self, value: str) -> None:
-            value = str(value)
-            if value == self._voice_hotkey_save_state:
-                return
-            self._voice_hotkey_save_state = value
-            self.voiceHotkeySaveStateChanged.emit()
 
         def _set_endpoint_preflight_busy(self, value: bool) -> None:
             value = bool(value)
@@ -3302,127 +3094,6 @@ def _load_qt_classes() -> dict:
             if completion is not None:
                 ok, message = payload
                 completion(bool(ok), str(message))
-            self._schedule_application_exit_poll()
-
-        def _submit_voice_hotkey_step(
-            self,
-            callback: Callable[[], object],
-            completion: Callable[[bool, object], None],
-            *,
-            timeout_ms: int = _VOICE_HOTKEY_TASK_TIMEOUT_MS,
-            cancel_event: Optional[threading.Event] = None,
-            retain_on_timeout: bool = False,
-            transaction: Optional[_VoiceHotkeyTransaction] = None,
-        ) -> None:
-            """Run one serialized provider step and return through a Qt signal."""
-
-            self._voice_hotkey_task_token += 1
-            token = self._voice_hotkey_task_token
-            self._voice_hotkey_task_completion = completion
-            self._voice_hotkey_task_cancel_event = cancel_event
-            self._voice_hotkey_task_timed_out = False
-            self._voice_hotkey_task_retain_on_timeout = retain_on_timeout
-            if transaction is not None:
-                transaction.begin_worker(token)
-            self._voice_hotkey_task_timeout_timer.start(
-                timeout_ms
-            )
-
-            def run() -> None:
-                try:
-                    payload = (True, callback())
-                except BaseException as exc:  # noqa: BLE001 - marshal to GUI thread
-                    payload = (False, exc)
-                if transaction is not None:
-                    transaction.record_terminal(token, payload)
-                self._emit_background_result(
-                    self._voiceHotkeyTaskReady,
-                    (token, payload),
-                )
-
-            try:
-                self._start_background_task(run, "voice-hotkey-provider")
-            except BaseException as exc:  # noqa: BLE001 - report start failure
-                self._voice_hotkey_task_timeout_timer.stop()
-                self._voice_hotkey_task_completion = None
-                self._voice_hotkey_task_cancel_event = None
-                self._voice_hotkey_task_retain_on_timeout = False
-                if transaction is not None:
-                    transaction.record_terminal(token, (False, exc))
-                completion(False, exc)
-
-        def _on_voice_hotkey_task_ready(self, result: object) -> None:
-            if self._background_shutdown_event.is_set():
-                return
-            token, payload = result
-            if token != self._voice_hotkey_task_token:
-                return
-            transaction = self._voice_hotkey_transaction
-            if transaction is not None:
-                if not transaction.consume_terminal(token):
-                    return
-                if not transaction.matches(
-                    self._config,
-                    str(self._voice_program_settings.get("provider", "")),
-                    self._voice_hotkey_trigger(),
-                    self._settings_revision,
-                ):
-                    self._set_voice_hotkey_save_state("retry")
-                    self._set_status_message("")
-                    self._set_error_message(
-                        "语音快捷键所属配置已变化，未应用后台结果；请重新读取后再试。",
-                        self._VOICE_PAGE_INDEX,
-                    )
-                    self._finish_voice_hotkey_operation()
-                    return
-            self._voice_hotkey_task_timeout_timer.stop()
-            completion = self._voice_hotkey_task_completion
-            self._voice_hotkey_task_completion = None
-            self._voice_hotkey_task_cancel_event = None
-            self._voice_hotkey_task_timed_out = False
-            self._voice_hotkey_task_retain_on_timeout = False
-            if completion is None:
-                return
-            ok, value = payload
-            completion(bool(ok), value)
-
-        def _on_voice_hotkey_task_timeout(self) -> None:
-            completion = self._voice_hotkey_task_completion
-            if completion is None:
-                return
-            if self._wetype_hotkey_refresh_cancel is not None:
-                self._wetype_hotkey_refresh_cancel.set()
-            cancel_event = self._voice_hotkey_task_cancel_event
-            if cancel_event is not None:
-                cancel_event.set()
-            if not self._voice_hotkey_task_retain_on_timeout:
-                self._voice_hotkey_task_token += 1
-                self._voice_hotkey_task_completion = None
-                self._voice_hotkey_task_cancel_event = None
-                self._voice_hotkey_task_timed_out = False
-                self._voice_hotkey_task_retain_on_timeout = False
-                completion(False, TimeoutError("语音快捷键操作超时"))
-                return
-            self._voice_hotkey_task_timed_out = True
-            self._set_status_message(
-                "语音快捷键操作耗时较长，正在等待安全结束…",
-                self._VOICE_PAGE_INDEX,
-            )
-
-        def _finish_voice_hotkey_operation(self) -> None:
-            if self._wetype_hotkey_refresh_cancel is not None:
-                self._wetype_hotkey_refresh_cancel.set()
-                self._wetype_hotkey_refresh_cancel = None
-            self._voice_hotkey_task_timeout_timer.stop()
-            self._voice_hotkey_task_completion = None
-            self._voice_hotkey_task_cancel_event = None
-            self._voice_hotkey_task_timed_out = False
-            self._voice_hotkey_task_retain_on_timeout = False
-            transaction = self._voice_hotkey_transaction
-            if transaction is not None:
-                transaction.mark_reconciled()
-                self._voice_hotkey_transaction = None
-            self._set_voice_hotkey_busy(False)
             self._schedule_application_exit_poll()
 
         def _set_key_detection_text(self, text: str) -> None:
@@ -3638,8 +3309,6 @@ def _load_qt_classes() -> dict:
             physical_bindings: dict,
         ) -> _InputStartResult:
             from . import remote_selection
-            if self._chromecast_setup_client is not None:
-                return _InputStartResult("key_detection", False, "谷歌启用进程尚未退出，请先重新使用当前设备完成清理。")
             selected_key = remote_selection.active_key(self._config)
             if not selected_key:
                 return _InputStartResult("key_detection", False, "请先在设备页选择要使用的遥控器。")
@@ -3667,21 +3336,6 @@ def _load_qt_classes() -> dict:
                 return _InputStartResult(
                     "key_detection", True, bridge_request=request
                 )
-
-            if self.activeRemoteProfile == remote_selection.CHROMECAST_PROFILE:
-                from .chromecast_client import Client
-                listener = Client(selected_key, mode="detect", on_edge=lambda edge:
-                    self._rawKeyDetected.emit(edge.button, "") if edge.action == "down" else None,
-                    on_voice=lambda event: self._rawKeyDetected.emit("mic", "")
-                    if event["event"] == "mic" else None)
-                try:
-                    listener.start(cancel_event=cancel_event)
-                    return _InputStartResult("key_detection", True, listener=listener)
-                except Exception as exc:
-                    stopped = self._stop_input_resources("key_detection", listener=listener)
-                    return _InputStartResult("key_detection", False,
-                                             str(exc) if stopped.listener is None else stopped.message,
-                                             listener=stopped.listener)
 
             listener = None
             tap = None
@@ -4080,170 +3734,9 @@ def _load_qt_classes() -> dict:
             )
             return False
 
-        def _voice_program_status_payload(
-            self, settings: dict
-        ) -> tuple[str, str, str]:
-            try:
-                status = voice_program_manager.inspect_voice_program(
-                    settings
-                )
-                text = voice_program_manager.status_text(status)
-                code = status.code
-                elevation_status = (
-                    "elevated"
-                    if status.running and status.elevated is True
-                    else "standard"
-                    if status.running and status.elevated is False
-                    else "unknown"
-                )
-            except Exception:
-                text = "无法读取语音程序状态"
-                code = "unknown"
-                elevation_status = "unknown"
-            return text, code, elevation_status
-
-        def _apply_voice_program_status_payload(
-            self, payload: tuple[str, str, str]
-        ) -> None:
-            text, code, elevation_status = payload
-            if elevation_status != self._voice_program_elevation_status:
-                self._voice_program_elevation_status = elevation_status
-                self.voiceProgramElevationStatusChanged.emit()
-            if text != self._voice_program_status_text:
-                self._voice_program_status_text = text
-                self.voiceProgramStatusTextChanged.emit()
-            if code != self._voice_program_status_code:
-                self._voice_program_status_code = code
-                self.voiceProgramStatusCodeChanged.emit()
-
-        def _refresh_voice_program_status(self) -> None:
-            self._apply_voice_program_status_payload(
-                self._voice_program_status_payload(
-                    dict(self._voice_program_settings)
-                )
-            )
-
-        def _request_voice_program_status_refresh(self) -> None:
-            if self._voice_program_status_refresh_running:
-                self._voice_program_status_refresh_pending = True
-                return
-
-            settings_snapshot = dict(self._voice_program_settings)
-            self._voice_program_status_refresh_running = True
-
-            def run() -> None:
-                payload = self._voice_program_status_payload(settings_snapshot)
-                self._emit_background_result(
-                    self._voiceProgramStatusRefreshReady,
-                    (settings_snapshot, payload),
-                )
-
-            try:
-                self._start_background_task(
-                    run,
-                    "voice-program-status-refresh",
-                )
-            except Exception:
-                self._voice_program_status_refresh_running = False
-                self._apply_voice_program_status_payload(
-                    ("无法读取语音程序状态", "unknown", "unknown")
-                )
-
-        def _on_voice_program_status_refresh_ready(self, result: object) -> None:
-            if self._background_shutdown_event.is_set():
-                return
-            self._voice_program_status_refresh_running = False
-            settings_snapshot, payload = result
-            stale = settings_snapshot != self._voice_program_settings
-            if not stale:
-                self._apply_voice_program_status_payload(payload)
-
-            refresh_again = self._voice_program_status_refresh_pending or stale
-            self._voice_program_status_refresh_pending = False
-            if refresh_again:
-                self._schedule_voice_program_status_refresh()
-
-        def _schedule_voice_program_status_refresh(self) -> None:
-            QTimer.singleShot(0, self._request_voice_program_status_refresh)
-
-        def _voice_program_options_payload(self, settings_snapshot: dict) -> List[str]:
-            options = voice_program_manager.provider_options()
-            for provider_id in (
-                voice_program_manager.VOICE_PROGRAM_SOGOU,
-                voice_program_manager.VOICE_PROGRAM_WETYPE,
-                voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
-                voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
-            ):
-                candidate = dict(settings_snapshot)
-                candidate["provider"] = provider_id
-                try:
-                    status = voice_program_manager.inspect_voice_program(candidate)
-                except Exception:  # noqa: BLE001 - leave the stable name intact
-                    continue
-                if status.code != "not_found":
-                    continue
-                index = voice_program_manager.VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER.index(provider_id)
-                options[index] += "（未安装）"
-            return options
-
-        def _request_voice_program_options_refresh(self) -> None:
-            if self._voice_program_options_refresh_running:
-                self._voice_program_options_refresh_pending = True
-                return
-            settings_snapshot = dict(self._voice_program_settings)
-            self._voice_program_options_refresh_running = True
-
-            def run() -> None:
-                payload = self._voice_program_options_payload(settings_snapshot)
-                self._emit_background_result(
-                    self._voiceProgramOptionsRefreshReady,
-                    payload,
-                )
-
-            try:
-                self._start_background_task(
-                    run,
-                    "voice-program-options-refresh",
-                )
-            except Exception:
-                self._voice_program_options_refresh_running = False
-
-        def _on_voice_program_options_refresh_ready(self, payload: object) -> None:
-            if self._background_shutdown_event.is_set():
-                return
-            self._voice_program_options_refresh_running = False
-            options = [str(item) for item in payload]
-            if options != self._voice_program_options:
-                self._voice_program_options = options
-                self.voiceProgramOptionsChanged.emit()
-            refresh_again = self._voice_program_options_refresh_pending
-            self._voice_program_options_refresh_pending = False
-            if refresh_again:
-                QTimer.singleShot(0, self._request_voice_program_options_refresh)
-
-        def _replace_voice_program_settings(self, raw: object) -> None:
-            previous = dict(self._voice_program_settings)
-            current = voice_program_manager.normalize_voice_program_settings(raw)
-            self._voice_program_settings = current
-            if current["provider"] != previous.get("provider"):
-                self.selectedVoiceProgramIndexChanged.emit()
-                self.voiceHotkeySourceChanged.emit()
-                # Do not display the previous provider's running/installed
-                # state while the newly-selected provider is checked.
-                self._apply_voice_program_status_payload(
-                    ("", "unknown", "unknown")
-                )
-            if current["custom_executable"] != previous.get("custom_executable"):
-                self.voiceProgramCustomPathChanged.emit()
-            if current["launch_on_bridge_start"] != previous.get(
-                "launch_on_bridge_start"
-            ):
-                self.voiceProgramLaunchOnBridgeStartChanged.emit()
-            if current["launch_elevated"] != previous.get("launch_elevated"):
-                self.voiceProgramLaunchElevatedChanged.emit()
-            self._request_voice_program_status_refresh()
-
         def _voice_settings_write_block_reason(self) -> str:
+            if self.configurationReadOnly:
+                return self._configuration_error
             if _vb_cable_test_active_event.is_set():
                 return "VB-CABLE 通道测试正在运行；测试结束后再修改语音设置。"
             if self._get_bridge_launch_busy():
@@ -4259,376 +3752,6 @@ def _load_qt_classes() -> dict:
                 or self._application_exit_confirmed
                 or self._application_exit_intent.is_set()
             )
-
-        def _persist_voice_settings(
-            self,
-            *,
-            hotkey_source: object = None,
-            allow_empty_hotkey: bool = False,
-        ) -> bool:
-            block_reason = self._voice_settings_write_block_reason()
-            if block_reason:
-                self._set_error_message(block_reason, self._VOICE_PAGE_INDEX)
-                return False
-
-            hotkey_text = self._voice_hotkeys[
-                key_mapping.VoiceTriggerMode.HOLD
-            ].strip()
-            provider_id = str(self._voice_program_settings.get("provider", ""))
-            validation = voice_hotkey_sync_windows.validate_provider_hotkey(
-                provider_id,
-                hotkey_text,
-            )
-            if not validation.ok:
-                if not (allow_empty_hotkey and not hotkey_text):
-                    self._set_error_message(
-                        validation.message,
-                        self._VOICE_PAGE_INDEX,
-                    )
-                    return False
-                hotkey_source = config.VOICE_HOTKEY_SOURCE_DEFAULT
-            else:
-                hotkey_text = validation.hotkey
-
-            new_config = dict(self._config)
-            new_config["voice_trigger_mode"] = (
-                key_mapping.VoiceTriggerMode.HOLD.value
-            )
-            new_config.pop("voice_release_finish_tap_enabled", None)
-            new_config["voice_program"] = dict(self._voice_program_settings)
-            config.set_voice_hotkey_for_provider(
-                new_config,
-                provider_id,
-                hotkey_text,
-                source=hotkey_source,
-                trigger=self._voice_hotkey_trigger(provider_id),
-            )
-            config_path = config.config_path(self._config_root)
-            try:
-                saved_config = config.save_config_and_load(config_path, new_config)
-            except Exception as exc:  # noqa: BLE001 - a Qt slot must not escape
-                self._set_error_message(
-                    f"语音设置保存失败：{exc}",
-                    self._VOICE_PAGE_INDEX,
-                )
-                return False
-
-            self._config = saved_config
-            self._bump_settings_revision()
-            self.voiceHotkeySourceChanged.emit()
-            saved_hotkey = self._display_voice_hotkey(provider_id)
-            self._set_voice_hotkey_text(
-                key_mapping.VoiceTriggerMode.HOLD, saved_hotkey
-            )
-            self._replace_voice_program_settings(saved_config.get("voice_program"))
-            self._set_voice_program_settings_dirty(False)
-            self._refresh_settings_dirty_state()
-            self._set_error_message("")
-            self._set_status_message(
-                "语音设置已自动保存。" + self._mapping_save_status_suffix(),
-                self._VOICE_PAGE_INDEX,
-            )
-            return True
-
-        def _update_and_persist_voice_hotkey(self, value: str) -> bool:
-            mode = key_mapping.VoiceTriggerMode.HOLD
-            previous = self._voice_hotkeys[mode]
-            if self._voice_hotkey_busy or self._voice_settings_write_start_blocked():
-                self._set_voice_hotkey_save_state("retry")
-                return False
-            try:
-                value = hotkey.HotkeySpec.from_user_text(value).serialize()
-            except hotkey.HotkeyParseError as exc:
-                self._set_voice_hotkey_save_state("retry")
-                self._set_error_message(str(exc), self._VOICE_PAGE_INDEX)
-                self.hotkeyCaptureError.emit(str(exc))
-                return False
-            provider_id = str(self._voice_program_settings.get("provider", ""))
-            self._set_voice_hotkey_busy(True)
-            self._set_voice_hotkey_save_state("processing")
-            self._set_status_message("正在同步语音快捷键…", self._VOICE_PAGE_INDEX)
-            self._set_error_message("")
-            trigger = self._voice_hotkey_trigger(provider_id)
-            cancel_event = (
-                threading.Event()
-                if provider_id == voice_program_manager.VOICE_PROGRAM_SOGOU
-                and trigger != "toggle"
-                else None
-            )
-            transaction = None
-            if cancel_event is not None:
-                transaction = _VoiceHotkeyTransaction(
-                    owner_key=remote_selection.active_key(self._config),
-                    provider_id=provider_id,
-                    trigger=trigger,
-                    settings_revision=self._settings_revision,
-                    cancel_event=cancel_event,
-                )
-                self._voice_hotkey_transaction = transaction
-            sync_kwargs = (
-                {"cancel_event": cancel_event}
-                if cancel_event is not None
-                else ({"trigger": "toggle"} if trigger == "toggle" else {})
-            )
-            self._submit_voice_hotkey_step(
-                lambda: voice_hotkey_sync_windows.sync_provider_hotkey(
-                    provider_id,
-                    value,
-                    **sync_kwargs,
-                ),
-                lambda ok, payload: self._on_voice_hotkey_sync_ready(
-                    provider_id,
-                    value,
-                    previous,
-                    ok,
-                    payload,
-                ),
-                cancel_event=cancel_event,
-                retain_on_timeout=transaction is not None,
-                transaction=transaction,
-            )
-            return True
-
-        def _on_voice_hotkey_sync_ready(
-            self,
-            provider_id: str,
-            value: str,
-            previous: str,
-            ok: bool,
-            payload: object,
-        ) -> None:
-            mode = key_mapping.VoiceTriggerMode.HOLD
-            if not ok:
-                self._set_voice_hotkey_save_state("retry")
-                self._set_status_message("")
-                self._set_error_message(
-                    f"同步语音快捷键失败：{payload}",
-                    self._VOICE_PAGE_INDEX,
-                )
-                self._finish_voice_hotkey_operation()
-                return
-
-            result = payload
-            if not result.ok:
-                self._set_voice_hotkey_save_state("retry")
-                self._set_status_message("")
-                if result.hotkey and result.hotkey != previous:
-                    self._set_voice_hotkey_text(mode, result.hotkey)
-                    if self._persist_voice_settings(
-                        hotkey_source=config.VOICE_HOTKEY_SOURCE_MANUAL
-                    ):
-                        self._set_status_message("")
-                        self._set_error_message(
-                            result.message
-                            + f" {product_identity.DISPLAY_NAME}已按语音程序当前值更新。",
-                            self._VOICE_PAGE_INDEX,
-                        )
-                    else:
-                        adoption_error = self._error_message
-                        self._set_voice_hotkey_text(mode, previous)
-                        self._set_status_message("")
-                        self._set_error_message(
-                            result.message
-                            + f"；{adoption_error}"
-                            + f" 语音程序当前值未能保存到{product_identity.DISPLAY_NAME}，"
-                            "两边仍不一致。",
-                            self._VOICE_PAGE_INDEX,
-                        )
-                else:
-                    self._set_error_message(result.message, self._VOICE_PAGE_INDEX)
-                self._finish_voice_hotkey_operation()
-                return
-
-            self._set_voice_hotkey_text(mode, result.hotkey or value)
-            if self._persist_voice_settings(
-                hotkey_source=config.VOICE_HOTKEY_SOURCE_MANUAL
-            ):
-                self._set_voice_hotkey_save_state("saved")
-                self._set_status_message(
-                    result.message
-                    + self._mapping_save_status_suffix(),
-                    self._VOICE_PAGE_INDEX,
-                )
-                self._finish_voice_hotkey_operation()
-                return
-
-            local_error = self._error_message
-            self._set_voice_hotkey_save_state("retry")
-            self._set_voice_hotkey_text(mode, previous)
-            if self._voice_hotkey_trigger(provider_id) == "toggle" or provider_id in {
-                voice_program_manager.VOICE_PROGRAM_NONE,
-                voice_program_manager.VOICE_PROGRAM_CUSTOM,
-                voice_program_manager.VOICE_PROGRAM_WETYPE,
-            }:
-                self._set_status_message("")
-                self._set_error_message(local_error, self._VOICE_PAGE_INDEX)
-                self._finish_voice_hotkey_operation()
-                return
-
-            cancel_event = threading.Event()
-            transaction = self._voice_hotkey_transaction
-            write_receipt = getattr(result, "write_receipt", None)
-            if transaction is None or write_receipt is None:
-                rollback = voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                    provider_id,
-                    False,
-                    "rollback_receipt_missing",
-                    message=(
-                        "未取得本次写入的内容凭据，为避免覆盖第三方的新修改，"
-                        "未直接恢复原值。"
-                    ),
-                )
-                self._on_voice_hotkey_rollback_ready(
-                    provider_id,
-                    previous,
-                    local_error,
-                    True,
-                    rollback,
-                )
-                return
-            self._submit_voice_hotkey_step(
-                lambda: voice_hotkey_sync_windows.restore_provider_write(
-                    provider_id,
-                    write_receipt,
-                    cancel_event=cancel_event,
-                ),
-                lambda rollback_ok, rollback_payload: (
-                    self._on_voice_hotkey_rollback_ready(
-                        provider_id,
-                        previous,
-                        local_error,
-                        rollback_ok,
-                        rollback_payload,
-                    )
-                ),
-                cancel_event=cancel_event,
-                retain_on_timeout=True,
-                transaction=transaction,
-            )
-
-        def _on_voice_hotkey_rollback_ready(
-            self,
-            provider_id: str,
-            previous: str,
-            local_error: str,
-            ok: bool,
-            payload: object,
-        ) -> None:
-            if ok:
-                rollback = payload
-            else:
-                rollback = voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                    provider_id,
-                    False,
-                    "rollback_failed",
-                    message=f"恢复第三方快捷键失败：{payload}",
-                )
-            if rollback.ok:
-                self._set_status_message("")
-                self._set_error_message(
-                    local_error + "；语音程序快捷键已恢复原值。",
-                    self._VOICE_PAGE_INDEX,
-                )
-                self._finish_voice_hotkey_operation()
-                return
-            if rollback.hotkey:
-                self._finish_failed_voice_hotkey_rollback(
-                    previous,
-                    local_error,
-                    rollback,
-                    rollback.hotkey,
-                )
-                return
-            self._submit_voice_hotkey_step(
-                lambda: voice_hotkey_sync_windows.read_provider_hotkey(provider_id),
-                lambda read_ok, read_payload: self._on_voice_hotkey_readback_ready(
-                    previous,
-                    local_error,
-                    rollback,
-                    read_ok,
-                    read_payload,
-                ),
-                retain_on_timeout=True,
-                transaction=self._voice_hotkey_transaction,
-            )
-
-        def _on_voice_hotkey_readback_ready(
-            self,
-            previous: str,
-            local_error: str,
-            rollback: object,
-            ok: bool,
-            payload: object,
-        ) -> None:
-            observed = payload.hotkey if ok and payload.ok else ""
-            self._finish_failed_voice_hotkey_rollback(
-                previous,
-                local_error,
-                rollback,
-                observed,
-            )
-
-        def _finish_failed_voice_hotkey_rollback(
-            self,
-            previous: str,
-            local_error: str,
-            rollback: object,
-            observed: str,
-        ) -> None:
-            mode = key_mapping.VoiceTriggerMode.HOLD
-            if observed:
-                self._set_voice_hotkey_text(mode, observed)
-                if self._persist_voice_settings():
-                    self._set_status_message("")
-                    self._set_error_message(
-                        local_error
-                        + f"；语音程序未能恢复原值，{product_identity.DISPLAY_NAME}"
-                        "已按其当前值更新。",
-                        self._VOICE_PAGE_INDEX,
-                    )
-                    self._finish_voice_hotkey_operation()
-                    return
-                reconciliation_error = self._error_message
-                self._set_voice_hotkey_text(mode, previous)
-                self._set_status_message("")
-                self._set_error_message(
-                    local_error
-                    + f"；第三方程序快捷键未能恢复：{rollback.message}"
-                    + f"；{reconciliation_error}"
-                    + f" 语音程序当前值未能保存到{product_identity.DISPLAY_NAME}，"
-                    "两边仍不一致。",
-                    self._VOICE_PAGE_INDEX,
-                )
-                self._finish_voice_hotkey_operation()
-                return
-            self._set_status_message("")
-            self._set_error_message(
-                local_error
-                + f"；第三方程序快捷键也未能恢复：{rollback.message}"
-                + "；无法确认语音程序当前值，两边可能不一致。",
-                self._VOICE_PAGE_INDEX,
-            )
-            self._finish_voice_hotkey_operation()
-
-        def _update_and_persist_voice_program(
-            self,
-            updated: dict,
-            *,
-            hotkey_source: object = None,
-            allow_empty_hotkey: bool = False,
-        ) -> bool:
-            previous = dict(self._voice_program_settings)
-            previous_dirty = self._voice_program_settings_dirty
-            self._replace_voice_program_settings(updated)
-            self._set_voice_program_settings_dirty(True)
-            if self._persist_voice_settings(
-                hotkey_source=hotkey_source,
-                allow_empty_hotkey=allow_empty_hotkey,
-            ):
-                return True
-            self._replace_voice_program_settings(previous)
-            self._set_voice_program_settings_dirty(previous_dirty)
-            return False
 
         def _on_raw_input_event(self, event: raw_input_windows.RawInputEvent) -> None:
             if not event.is_pressed:
@@ -4665,11 +3788,6 @@ def _load_qt_classes() -> dict:
                 or self._input_operation_phase != "active"
             ):
                 return
-            if self.activeRemoteProfile == remote_selection.CHROMECAST_PROFILE:
-                try:
-                    logging_setup.get_logger(self._config_root).info("Chromecast key detection: gui_accepted=1")
-                except Exception:
-                    pass
             stop_requested = self.stopKeyDetection()
             if button_id:
                 self.selectButton(button_id)
@@ -4827,10 +3945,13 @@ def _load_qt_classes() -> dict:
                     completion(bool(result))
                 return bool(result)
 
+            if self.configurationReadOnly:
+                return finish(False)
+
             saved_voice_hotkeys = self._config.get("voice_hotkeys", {})
             saved_hotkey = str(
                 saved_voice_hotkeys.get(
-                    key_mapping.VoiceTriggerMode.HOLD.value,
+                    "hold",
                     self._config.get("voice_hotkey", ""),
                 )
             )
@@ -4856,19 +3977,21 @@ def _load_qt_classes() -> dict:
                     secondary_display_map=self._model.to_secondary_display_map(),
                     display_note_map=self._model.to_display_note_map(),
                     hotkey_text=saved_hotkey,
-                    trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
                     endpoint_display_text=saved_endpoint_display,
                     base_config=self._config,
-                    base_bindings=self._bindings,
+                    base_bindings=self._active_edit_bindings(),
                     selected_device_profile=str(
                         self._config.get(
                             "selected_device_profile",
                             device_catalog.RC003_ID,
                         )
                     ),
-                    voice_hotkeys={
-                        key_mapping.VoiceTriggerMode.HOLD.value: saved_hotkey
+                    voice_hotkeys={"hold": saved_hotkey},
+                    voice_slot_hotkeys={
+                        str(slot): self._voice_slot_hotkeys.get(slot, "")
+                        for slot in sorted(settings_ui._VOICE_SLOT_DISPLAYS)
                     },
+                    button_inject_modes=self._model.to_inject_mode_map(),
                     validate_voice_hotkeys=False,
                 )
             except settings_ui.SettingsValidationError as exc:
@@ -4888,6 +4011,30 @@ def _load_qt_classes() -> dict:
 
             if replacement is not None:
                 new_bindings = replacement
+            if self._mapping_edit_target:
+                store = app_profiles.AppProfileStore(self._config_root)
+                try:
+                    store.update_mapping(self._mapping_edit_target,
+                                         app_profiles.snapshot(new_bindings, self._selected_device_id()))
+                    app_name = store.get(self._mapping_edit_target)["name"]
+                except Exception as exc:  # noqa: BLE001 - a Qt slot must not escape
+                    self._set_error_message(
+                        f"保存失败：{exc}",
+                        self._BUTTONS_PAGE_INDEX,
+                    )
+                    return finish(False)
+                self._set_mapping_dirty(False)
+                self._set_mapping_auto_save_retry_available(False)
+                self._refresh_settings_dirty_state()
+                try:
+                    self._refresh_mapping_presets()
+                except Exception:  # noqa: BLE001 - the save already committed
+                    pass
+                self._set_status_message(
+                    f"「{app_name}」的按键映射已自动保存；切换到该应用时生效。",
+                    self._BUTTONS_PAGE_INDEX,
+                )
+                return finish(True)
             config_path = config.config_path(self._config_root)
             bindings_path = config.key_bindings_path(self._config_root)
             try:
@@ -4951,6 +4098,9 @@ def _load_qt_classes() -> dict:
                         )
                 return bool(result)
 
+            if self.configurationReadOnly:
+                return finish(False)
+
             if self._settings_save_busy:
                 self._set_error_message(
                     "按键映射正在保存，请等待完成。",
@@ -4972,7 +4122,6 @@ def _load_qt_classes() -> dict:
                 )
                 return finish(False)
 
-            trigger_mode = key_mapping.VoiceTriggerMode.HOLD
             endpoint_display = (
                 self._endpoint_options[self._selected_endpoint_index]
                 if 0 <= self._selected_endpoint_index < len(self._endpoint_options)
@@ -4983,18 +4132,17 @@ def _load_qt_classes() -> dict:
                     button_display_map=self._model.to_display_map(),
                     secondary_display_map=self._model.to_secondary_display_map(),
                     display_note_map=self._model.to_display_note_map(),
-                    hotkey_text=(config.voice_hotkey_for_provider(self._config, self._voice_program_settings.get("provider"))
-                                 if self._voice_hotkey_trigger() == "toggle" else self._voice_hotkeys[trigger_mode]),
-                    trigger_mode=trigger_mode,
+                    hotkey_text=self._voice_hotkey,
                     endpoint_display_text=endpoint_display,
                     base_config=self._config,
                     base_bindings=self._bindings,
                     selected_device_profile=self._selected_device_id(),
-                    voice_hotkeys={
-                        mode.value: (config.voice_hotkey_for_provider(self._config, self._voice_program_settings.get("provider"))
-                                     if self._voice_hotkey_trigger() == "toggle" else self._voice_hotkeys[mode])
-                        for mode in self._TRIGGER_MODE_ORDER
+                    voice_hotkeys={"hold": self._voice_hotkey},
+                    voice_slot_hotkeys={
+                        str(slot): self._voice_slot_hotkeys.get(slot, "")
+                        for slot in sorted(settings_ui._VOICE_SLOT_DISPLAYS)
                     },
+                    button_inject_modes=self._model.to_inject_mode_map(),
                 )
             except settings_ui.SettingsValidationError as exc:
                 button_name = (
@@ -5011,13 +4159,16 @@ def _load_qt_classes() -> dict:
                 )
                 return finish(False)
 
-            new_config["voice_program"] = dict(self._voice_program_settings)
-            config.set_voice_hotkey_for_provider(
-                new_config,
-                self._voice_program_settings.get("provider"),
-                self._voice_hotkeys[trigger_mode],
-                trigger=self._voice_hotkey_trigger(),
-            )
+            if self._mapping_edit_target:
+                # The button page is editing one application's layout. Saving
+                # the settings page must never write that layout into the
+                # global key_bindings.json, so fall back to the global file.
+                try:
+                    new_bindings = config.load_key_bindings(
+                        config.key_bindings_path(self._config_root)
+                    )
+                except Exception:  # noqa: BLE001 - keep the built model on failure
+                    pass
 
             endpoint_name = new_config.get("output_endpoint_name", "")
             endpoint_host_api = new_config.get("output_endpoint_host_api", "")
@@ -5078,10 +4229,6 @@ def _load_qt_classes() -> dict:
                 self._config = saved_config
                 self._bindings = saved_bindings
                 self._bump_settings_revision()
-                self._replace_voice_program_settings(
-                    saved_config.get("voice_program")
-                )
-                self._set_voice_program_settings_dirty(False)
                 self._removed_voice_bindings = (
                     config.normalize_voice_product_boundary(
                         self._config,
@@ -5090,9 +4237,7 @@ def _load_qt_classes() -> dict:
                 )
                 if previous_voice_mapping_ready != self._get_voice_mapping_ready():
                     self.voiceMappingReadyChanged.emit()
-                for mode in self._TRIGGER_MODE_ORDER:
-                    saved_text = self._display_voice_hotkey()
-                    self._set_voice_hotkey_text(mode, saved_text)
+                self._set_voice_hotkey_text(self._voice_hotkey)
                 self._load_bindings_into_model()
                 self._set_settings_dirty(False)
                 self._set_mapping_dirty(False)
@@ -5155,46 +4300,85 @@ def _load_qt_classes() -> dict:
 
         # -- properties ---------------------------------------------------
 
-        def _voice_hotkey_trigger(self, provider_id=None):
-            provider = provider_id or self._voice_program_settings.get("provider")
-            return config.voice_hotkey_trigger_for_settings(self._config, provider)
+        def _slots_from_config(self, config_data: dict) -> Dict[int, str]:
+            """Resolve the per-slot shortcuts.
 
-        def _display_voice_hotkey(self, provider_id=None):
-            provider = provider_id or self._voice_program_settings.get("provider")
-            return config.voice_hotkey_for_provider(self._config, provider,
-                                                    trigger=self._voice_hotkey_trigger(provider))
+            Each slot keeps exactly the shortcut stored for it; an empty entry
+            means "not recorded yet". Slot 1 then mirrors the shared voice
+            shortcut at read time (see :func:`config.voice_slot_hotkey`)."""
+
+            entries = config_data.get("voice_slot_hotkeys")
+            result: Dict[int, str] = {
+                slot: "" for slot in sorted(settings_ui._VOICE_SLOT_DISPLAYS)
+            }
+            if isinstance(entries, dict):
+                for slot in result:
+                    result[slot] = str(entries.get(str(slot), "")).strip()
+            return result
 
         def _get_hotkey_text(self) -> str:
-            mode = self._TRIGGER_MODE_ORDER[self._trigger_mode_index]
-            return self._voice_hotkeys[mode]
+            return self._voice_hotkey
 
         def _set_hotkey_text(self, value: str) -> None:
-            mode = self._TRIGGER_MODE_ORDER[self._trigger_mode_index]
-            if self._set_voice_hotkey_text(mode, value):
+            if self._set_voice_hotkey_text(value):
                 self._mark_settings_dirty()
 
         hotkeyText = Property(str, _get_hotkey_text, _set_hotkey_text, notify=hotkeyTextChanged)
 
-        def _set_voice_hotkey_text(
-            self, mode: key_mapping.VoiceTriggerMode, value: str
-        ) -> bool:
-            if value == self._voice_hotkeys[mode]:
+        def _set_voice_hotkey_text(self, value: str) -> bool:
+            if value == self._voice_hotkey:
                 return False
-            self._voice_hotkeys[mode] = value
+            self._voice_hotkey = value
             self.holdVoiceHotkeyTextChanged.emit()
             self.hotkeyTextChanged.emit()
             return True
 
         def _get_hold_voice_hotkey_text(self) -> str:
-            return self._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD]
+            return self._voice_hotkey
 
         def _set_hold_voice_hotkey_text(self, value: str) -> None:
             logging_setup.get_logger(self._config_root).info(
-                "settings hotkey capture: QML submitted provider=%s chord=%s",
-                self._voice_program_settings.get("provider", ""),
+                "settings hotkey capture: QML submitted chord=%s",
                 value,
             )
-            self._update_and_persist_voice_hotkey(value)
+            self._update_and_persist_hold_voice_hotkey(value)
+
+        def _update_and_persist_hold_voice_hotkey(self, value: str) -> bool:
+            # The hold shortcut is stored locally only: the voice key replays
+            # exactly what the user recorded, so nothing is synced to a
+            # third-party program here.
+            previous = self._voice_hotkey
+            text = str(value).strip()
+            try:
+                text = hotkey.HotkeySpec.from_user_text(text).serialize()
+            except hotkey.HotkeyParseError as exc:
+                self._set_error_message(str(exc), self._VOICE_PAGE_INDEX)
+                self.hotkeyCaptureError.emit(str(exc))
+                return False
+            if text == previous:
+                return True
+            new_config = dict(self._config)
+            new_config["voice_hotkey"] = text
+            new_config["voice_hotkeys"] = {"hold": text}
+            config_path = config.config_path(self._config_root)
+            try:
+                saved_config = config.save_config_and_load(config_path, new_config)
+            except Exception as exc:  # noqa: BLE001 - a Qt slot must not escape
+                self._set_error_message(
+                    f"语音设置保存失败：{exc}",
+                    self._VOICE_PAGE_INDEX,
+                )
+                return False
+            self._config = saved_config
+            self._set_voice_hotkey_text(text)
+            self._bump_settings_revision()
+            self._refresh_settings_dirty_state()
+            self._set_error_message("")
+            self._set_status_message(
+                "语音设置已自动保存。" + self._mapping_save_status_suffix(),
+                self._VOICE_PAGE_INDEX,
+            )
+            return True
 
         holdVoiceHotkeyText = Property(
             str,
@@ -5203,319 +4387,352 @@ def _load_qt_classes() -> dict:
             notify=holdVoiceHotkeyTextChanged,
         )
 
-        voiceHotkeySource = Property(
-            str,
-            lambda self: config.voice_hotkey_source_for_provider(
-                self._config,
-                self._voice_program_settings.get("provider"),
-                trigger=self._voice_hotkey_trigger(),
-            ),
-            notify=voiceHotkeySourceChanged,
+        def _effective_voice_slot_hotkey(self, slot: int) -> str:
+            """The shortcut shown/used for one slot.
+
+            An empty slot 1 means "not recorded yet" and mirrors the shared
+            hold shortcut, matching :func:`config.voice_slot_hotkey`."""
+
+            text = str(self._voice_slot_hotkeys.get(int(slot), ""))
+            if not text and int(slot) == 1:
+                return str(self._voice_hotkey or "")
+            return text
+
+        def _get_voice_slot_hotkeys(self) -> Dict[str, str]:
+            return {
+                str(slot): self._effective_voice_slot_hotkey(slot)
+                for slot in sorted(settings_ui._VOICE_SLOT_DISPLAYS)
+            }
+
+        voiceSlotHotkeys = Property(
+            "QVariantMap",
+            _get_voice_slot_hotkeys,
+            notify=voiceSlotHotkeysChanged,
         )
 
-        def _get_voice_program_options(self) -> List[str]:
-            return list(self._voice_program_options)
+        @Slot(int, result=str)
+        def voiceSlotHotkeyText(self, slot: int) -> str:
+            return self._effective_voice_slot_hotkey(int(slot))
 
-        voiceProgramOptions = Property(
-            list,
-            _get_voice_program_options,
-            notify=voiceProgramOptionsChanged,
+        @Slot(int, result=str)
+        def voiceSlotLabel(self, slot: int) -> str:
+            return settings_ui.voice_slot_display(int(slot))
+
+        def _get_active_voice_slots(self) -> List[int]:
+            """Slots currently assigned to a physical button, in slot order."""
+
+            display_map = self._model.to_display_map()
+            slots = {
+                settings_ui.voice_slot_for_display(text)
+                for text in display_map.values()
+            }
+            return sorted(slot for slot in slots if slot is not None)
+
+        activeVoiceSlots = Property(
+            list, _get_active_voice_slots, notify=voiceSlotHotkeysChanged
         )
 
-        def _get_selected_voice_program_index(self) -> int:
-            return voice_program_manager.provider_index(
-                self._voice_program_settings.get("provider")
-            )
+        @Slot(str, result=bool)
+        def isVoiceActionText(self, text: str) -> bool:
+            return settings_ui.voice_slot_for_display(text) is not None
 
-        def _set_selected_voice_program_index(self, value: int) -> None:
-            if self._voice_hotkey_busy or self._voice_settings_write_start_blocked():
-                return
-            provider_id = voice_program_manager.provider_id_for_index(value)
-            # Disabled/custom IDs remain readable for old configurations only.
-            if (
-                provider_id == voice_program_manager.VOICE_PROGRAM_NONE
-                or provider_id not in voice_program_manager.VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER
-            ):
-                return
-            if provider_id == self._voice_program_settings.get("provider"):
-                self.loadVoiceHotkeyFromProvider()
-                return
-            remembered_hotkey = self._display_voice_hotkey(provider_id)
-            previous_hotkey = self._get_hold_voice_hotkey_text()
-            self._set_voice_hotkey_busy(True)
-            if (
-                config.voice_hotkey_source_for_provider(self._config, provider_id,
-                                                        trigger=self._voice_hotkey_trigger(provider_id))
-                == config.VOICE_HOTKEY_SOURCE_MANUAL
-            ):
-                self._on_selected_voice_program_hotkey_ready(
-                    provider_id,
-                    remembered_hotkey,
-                    previous_hotkey,
-                    True,
-                    voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                        provider_id,
-                        True,
-                        "manual",
-                        remembered_hotkey,
-                        "已保留手动录入的快捷键。",
-                    ),
-                )
-                return
-            self._set_status_message("正在读取语音程序快捷键…", self._VOICE_PAGE_INDEX)
-            self._submit_voice_hotkey_step(
-                lambda: voice_hotkey_sync_windows.read_provider_hotkey(
-                    provider_id,
-                    **({"trigger": "toggle"} if self._voice_hotkey_trigger(provider_id) == "toggle" else {}),
-                ),
-                lambda ok, payload: self._on_selected_voice_program_hotkey_ready(
-                    provider_id,
-                    remembered_hotkey,
-                    previous_hotkey,
-                    ok,
-                    payload,
-                ),
-            )
+        def _get_voice_slot_options(self) -> List[str]:
+            return [
+                settings_ui.voice_slot_display(slot)
+                for slot in range(1, key_mapping.MAX_VOICE_SLOTS + 1)
+            ]
 
-        def _on_selected_voice_program_hotkey_ready(
-            self,
-            provider_id: str,
-            remembered_hotkey: str,
-            previous_hotkey: str,
-            ok: bool,
-            payload: object,
-        ) -> None:
-            if ok:
-                read_result = payload
-            else:
-                read_result = voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                    provider_id,
-                    False,
-                    "read_failed",
-                    message=f"读取语音程序快捷键失败：{payload}",
-                )
-            selected_hotkey = (
-                read_result.hotkey if read_result.ok else remembered_hotkey
-            )
-            self._set_voice_hotkey_text(
-                key_mapping.VoiceTriggerMode.HOLD,
-                selected_hotkey,
-            )
-            updated = dict(self._voice_program_settings)
-            updated["provider"] = provider_id
-            if voice_program_manager.is_launchable_provider(provider_id):
-                preferences = dict(updated.get("launch_on_bridge_start_by_provider", {}))
-                # Preserve the old first-selection default, but never overwrite
-                # an explicit saved false when selecting this program again.
-                preferences.setdefault(provider_id, True)
-                updated["launch_on_bridge_start_by_provider"] = preferences
-            hotkey_source = (
-                config.VOICE_HOTKEY_SOURCE_AUTO
-                if read_result.ok and read_result.code != "manual"
-                else None
-            )
-            allow_empty_hotkey = not read_result.ok and not selected_hotkey.strip()
-            if not self._update_and_persist_voice_program(
-                updated,
-                hotkey_source=hotkey_source,
-                allow_empty_hotkey=allow_empty_hotkey,
-            ):
-                self._set_voice_hotkey_text(
-                    key_mapping.VoiceTriggerMode.HOLD,
-                    previous_hotkey,
-                )
-                self._set_voice_hotkey_save_state("retry")
-                self._finish_voice_hotkey_operation()
+        voiceSlotOptions = Property(list, _get_voice_slot_options, constant=True)
+
+        def _inject_mode_options(self) -> List[dict]:
+            """The per-button backend choices, with live driver availability."""
+
+            from . import injection_backend
+
+            return [
+                {
+                    "value": mode,
+                    "label": injection_backend.INJECT_MODE_LABELS.get(mode, mode),
+                    "available": injection_backend.mode_available(mode),
+                    "reason": injection_backend.mode_status(mode)[1],
+                }
+                for mode in key_mapping.INJECT_MODES
+            ]
+
+        injectModeOptions = Property(
+            list, _inject_mode_options, notify=injectModesChanged
+        )
+
+        @Property(bool, notify=injectModesChanged)
+        def interceptionAvailable(self) -> bool:
+            from . import injection_backend
+
+            return injection_backend.interception_available()
+
+        @Property(str, notify=injectModesChanged)
+        def interceptionUnavailableReason(self) -> str:
+            from . import injection_backend
+
+            return injection_backend.interception_unavailable_reason()
+
+        @Property(str, notify=injectModesChanged)
+        def interceptionUnavailableHint(self) -> str:
+            """User-facing, reason-specific explanation for an unusable driver."""
+
+            from . import injection_backend
+
+            return injection_backend.interception_unavailable_hint()
+
+        @Slot(str, result=str)
+        def buttonInjectMode(self, button_id: str) -> str:
+            return self._model.inject_mode_for(str(button_id))
+
+        @Slot(str, str)
+        def setButtonInjectMode(self, button_id: str, mode: str) -> None:
+            row = self._model.index_of(str(button_id))
+            if row < 0:
                 return
-            if read_result.ok:
-                self._set_voice_hotkey_save_state("saved")
-                self._set_status_message(
-                    read_result.message
-                    + (
-                        self._mapping_save_status_suffix()
-                    ),
-                    self._VOICE_PAGE_INDEX,
-                )
-            elif read_result.code != "local_only":
-                self._set_voice_hotkey_save_state("retry")
-                self._set_status_message("")
-                self._set_error_message(
-                    read_result.message
-                    + (
-                        " 已改用该程序上次保存的快捷键。"
-                        if selected_hotkey
-                        else " 请点击“录入”设置按住型快捷键。"
-                    ),
-                    self._VOICE_PAGE_INDEX,
-                )
-            else:
-                self._set_voice_hotkey_save_state("saved")
-                if provider_id in (
-                    voice_program_manager.VOICE_PROGRAM_WETYPE,
-                    voice_program_manager.VOICE_PROGRAM_CHATTERFLY,
-                ):
-                    self._set_error_message("")
-                    self._set_status_message(read_result.message, self._VOICE_PAGE_INDEX)
-            if provider_id in {voice_program_manager.VOICE_PROGRAM_WETYPE,
-                               voice_program_manager.VOICE_PROGRAM_DOUBAO_IME}:
-                self._prepare_selected_input_profile(provider_id)
-                return
-            self._finish_voice_hotkey_operation()
+            self._model.setInjectModeAt(row, mode)
 
-            if provider_id == voice_program_manager.VOICE_PROGRAM_SOGOU:
-                self._launch_voice_program(
-                    feedback_page_index=self._VOICE_PAGE_INDEX,
-                    prior_error=(self._error_message
-                                 if not read_result.ok and read_result.code != "local_only"
-                                 else ""),
-                )
+        @Property(bool, notify=injectModesChanged)
+        def interceptionInstallerAvailable(self) -> bool:
+            """Whether this build ships the official Interception installer.
 
-        def _prepare_selected_input_profile(self, provider_id: str) -> None:
-            # The choice is already persisted. Keep existing dropdown exclusion
-            # through activation; this operation never starts a voice session.
-            if self._voice_runtime_state in {
-                bridge_runtime_status.VOICE_RUNTIME_ACTIVE,
-                bridge_runtime_status.VOICE_RUNTIME_MIC_CONFIRMED,
-                bridge_runtime_status.VOICE_RUNTIME_RECEIVING_AUDIO,
-                bridge_runtime_status.VOICE_RUNTIME_FINISHING,
-            } or self._get_input_capture_in_use():
-                self._finish_voice_hotkey_operation()
-                self._set_status_message(
-                    "选择已保存；当前语音或按键操作结束后，下次启动语音时切换。",
-                    self._VOICE_PAGE_INDEX,
-                )
-                return
-            revision = self._settings_revision
-            cancel = threading.Event()
-            prior_status, prior_error = self._status_message, self._error_message
-            started = time.monotonic()
-            logger = logging_setup.get_logger(self._config_root)
-            logger.info("input profile selection provider=%s phase=starting", provider_id)
+            Distinct from ``interceptionAvailable`` (the driver is loaded):
+            the installer can be present while the driver is not yet installed.
+            """
 
-            def completed(ok, value):
-                logger.info(
-                    "input profile selection provider=%s phase=finished success=%s "
-                    "elapsed_ms=%d error_type=%s", provider_id, bool(ok),
-                    int((time.monotonic() - started) * 1000),
-                    "none" if ok else type(value).__name__,
-                )
-                if (self._settings_revision != revision or
-                        self._voice_program_settings.get("provider") != provider_id):
-                    self._finish_voice_hotkey_operation()
-                    return
-                self._finish_voice_hotkey_operation()
-                self._set_status_message(prior_status if ok else "", self._VOICE_PAGE_INDEX)
-                if not ok:
-                    self._set_error_message(
-                        "选择已保存，但系统输入法切换未完成；请稍后重试语音。",
-                        self._VOICE_PAGE_INDEX,
-                    )
-                elif prior_error:
-                    self._set_error_message(prior_error, self._VOICE_PAGE_INDEX)
+            from . import interception_driver_install
 
+            return interception_driver_install.installer_available()
+
+        @Property(str, notify=injectModesChanged)
+        def interceptionInstallerUnavailableReason(self) -> str:
+            from . import interception_driver_install
+
+            return interception_driver_install.installer_unavailable_reason()
+
+        def _launch_interception_installer(self, uninstall: bool) -> dict:
+            """Shared body for the install/uninstall slots.
+
+            Only ever reached from an explicit user click in the button
+            editor.  The elevated installer is awaited, so a failed run is
+            reported with its exit code instead of looking like a success.
+            Success still means "reboot required": the driver is not usable
+            until Windows restarts.
+            """
+
+            from . import interception_driver_install
+
+            verb = "卸载" if uninstall else "安装"
             try:
-                operation = wetype_control_windows.begin_input_profile_selection(
-                    provider_id, cancel_event=cancel,
-                )
-            except Exception as exc:
-                completed(False, exc)
-                return
-            self._set_status_message("正在切换输入法…", self._VOICE_PAGE_INDEX)
-            self._submit_voice_hotkey_step(
-                operation.result, completed, cancel_event=cancel,
-            )
+                if uninstall:
+                    interception_driver_install.uninstall_driver()
+                else:
+                    interception_driver_install.install_driver()
+            except interception_driver_install.DriverInstallCancelledError as exc:
+                return {"ok": False, "cancelled": True, "message": str(exc)}
+            except interception_driver_install.DriverInstallerError as exc:
+                return {"ok": False, "cancelled": False, "message": str(exc)}
+            self.injectModesChanged.emit()
+            return {
+                "ok": True,
+                "cancelled": False,
+                "message": (
+                    f"Interception 驱动{verb}程序已成功结束（退出码 0）。"
+                    f"请重启电脑，重启后回到本页重新选择注入方式。"
+                ),
+            }
 
-        selectedVoiceProgramIndex = Property(
-            int,
-            _get_selected_voice_program_index,
-            _set_selected_voice_program_index,
-            notify=selectedVoiceProgramIndexChanged,
+        @Slot(result="QVariantMap")
+        def installInterceptionDriver(self) -> dict:
+            return self._launch_interception_installer(uninstall=False)
+
+        @Slot(result="QVariantMap")
+        def uninstallInterceptionDriver(self) -> dict:
+            return self._launch_interception_installer(uninstall=True)
+
+        @Slot(int, str)
+        def setVoiceSlotHotkey(self, slot: int, value: str) -> None:
+            # Both voice slots are recorded locally. RC003 no longer selects an
+            # input method, so a slot shortcut is stored locally only and never
+            # pushed to a third-party program.
+            self._update_and_persist_voice_slot_hotkey(int(slot), value)
+
+        def _update_and_persist_voice_slot_hotkey(self, slot: int, value: str) -> bool:
+            text = str(value).strip()
+            previous = self._voice_slot_hotkeys.get(slot, "")
+            if text == previous:
+                return True
+            if text:
+                try:
+                    text = hotkey.HotkeySpec.from_user_text(text).serialize()
+                except hotkey.HotkeyParseError as exc:
+                    self._set_error_message(str(exc), self._VOICE_PAGE_INDEX)
+                    self.hotkeyCaptureError.emit(str(exc))
+                    return False
+            self._voice_slot_hotkeys[slot] = text
+            new_config = dict(self._config)
+            new_config["voice_slot_hotkeys"] = {
+                str(index): self._voice_slot_hotkeys.get(index, "")
+                for index in sorted(settings_ui._VOICE_SLOT_DISPLAYS)
+            }
+            config_path = config.config_path(self._config_root)
+            try:
+                saved_config = config.save_config_and_load(config_path, new_config)
+            except Exception as exc:  # noqa: BLE001 - a Qt slot must not escape
+                self._voice_slot_hotkeys[slot] = previous
+                self.voiceSlotHotkeysChanged.emit()
+                self._set_error_message(
+                    f"语音设置保存失败：{exc}",
+                    self._VOICE_PAGE_INDEX,
+                )
+                return False
+            self._config = saved_config
+            self._bump_settings_revision()
+            self.voiceSlotHotkeysChanged.emit()
+            self._set_error_message("")
+            self._set_status_message(
+                "语音设置已自动保存。" + self._mapping_save_status_suffix(),
+                self._VOICE_PAGE_INDEX,
+            )
+            return True
+
+        def _get_voice_input_source(self) -> str:
+            return config.voice_input_source(self._config)
+
+        _VOICE_INPUT_SOURCE_ORDER = (
+            config.VOICE_INPUT_SOURCE_REMOTE,
+            config.VOICE_INPUT_SOURCE_LOCAL,
         )
 
-        voiceProgramMenuIndex = Property(
-            int,
-            lambda self: (
-                voice_program_manager.VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER.index(
-                    self._voice_program_settings.get("provider")
-                ) - 1
-                if self._voice_program_settings.get("provider")
-                in voice_program_manager.VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER
-                else -1
-            ),
-            notify=selectedVoiceProgramIndexChanged,
+        def _get_voice_input_source_index(self) -> int:
+            try:
+                return self._VOICE_INPUT_SOURCE_ORDER.index(
+                    self._get_voice_input_source()
+                )
+            except ValueError:
+                return 0
+
+        voiceInputSource = Property(
+            str, _get_voice_input_source, notify=voiceInputSourceChanged
+        )
+        voiceInputSourceIndex = Property(
+            int, _get_voice_input_source_index, notify=voiceInputSourceChanged
+        )
+        voiceInputSourceOptions = Property(
+            list,
+            lambda self: ["模式1 · 遥控器麦克风", "模式2 · 本机麦克风"],
+            constant=True,
+        )
+
+        def _get_voice_short_press_dismiss(self) -> bool:
+            return config.voice_short_press_dismiss(self._config)
+
+        voiceShortPressDismiss = Property(
+            bool,
+            _get_voice_short_press_dismiss,
+            notify=voiceShortPressDismissChanged,
+        )
+
+        @Slot(bool)
+        def setVoiceShortPressDismiss(self, enabled: bool) -> None:
+            enabled = bool(enabled)
+            if enabled == self._get_voice_short_press_dismiss():
+                return
+            if self._persist_voice_config_fields(
+                {"voice_short_press_dismiss": enabled}
+            ):
+                self.voiceShortPressDismissChanged.emit()
+
+        def _persist_voice_config_fields(self, updates: Dict[str, Any]) -> bool:
+            new_config = dict(self._config)
+            new_config.update(updates)
+            config_path = config.config_path(self._config_root)
+            try:
+                saved_config = config.save_config_and_load(config_path, new_config)
+            except Exception as exc:  # noqa: BLE001 - a Qt slot must not escape
+                self._set_error_message(
+                    f"语音设置保存失败：{exc}",
+                    self._VOICE_PAGE_INDEX,
+                )
+                return False
+            self._config = saved_config
+            self._bump_settings_revision()
+            self._set_error_message("")
+            self._set_status_message(
+                "语音设置已自动保存。" + self._mapping_save_status_suffix(),
+                self._VOICE_PAGE_INDEX,
+            )
+            return True
+
+        @Slot(int)
+        def setVoiceInputSourceIndex(self, index: int) -> None:
+            if index < 0 or index >= len(self._VOICE_INPUT_SOURCE_ORDER):
+                return
+            source = self._VOICE_INPUT_SOURCE_ORDER[index]
+            if source == self._get_voice_input_source():
+                return
+            updates: Dict[str, Any] = {"voice_input_source": source}
+            if (
+                source == config.VOICE_INPUT_SOURCE_LOCAL
+                and not config.voice_local_input_device(self._config)
+            ):
+                devices = local_microphone_windows.list_input_devices()
+                if devices:
+                    updates["voice_local_input_device"] = devices[0]
+            if self._persist_voice_config_fields(updates):
+                self.voiceInputSourceChanged.emit()
+                self.localMicrophoneDeviceChanged.emit()
+                self.localMicrophoneOptionsChanged.emit()
+
+        def _get_local_microphone_options(self) -> List[str]:
+            return local_microphone_windows.list_input_devices()
+
+        localMicrophoneOptions = Property(
+            list,
+            _get_local_microphone_options,
+            notify=localMicrophoneOptionsChanged,
+        )
+
+        def _get_local_microphone_index(self) -> int:
+            device = config.voice_local_input_device(self._config)
+            try:
+                return self._get_local_microphone_options().index(device)
+            except ValueError:
+                return -1
+
+        localMicrophoneIndex = Property(
+            int, _get_local_microphone_index, notify=localMicrophoneDeviceChanged
         )
 
         @Slot(int)
-        def selectVoiceProgramMenuOption(self, index: int) -> None:
-            choices = voice_program_manager.VOICE_PROGRAM_SELECTABLE_PROVIDER_ORDER[1:]
-            if 0 <= index < len(choices):
-                self._set_selected_voice_program_index(
-                    voice_program_manager.provider_index(choices[index])
-                )
+        def setLocalMicrophoneIndex(self, index: int) -> None:
+            devices = self._get_local_microphone_options()
+            if index < 0 or index >= len(devices):
+                return
+            if self._persist_voice_config_fields(
+                {"voice_local_input_device": devices[index]}
+            ):
+                self.localMicrophoneDeviceChanged.emit()
 
-        def _selected_voice_program_is(self, provider_id: str) -> bool:
-            return self._voice_program_settings.get("provider") == provider_id
+        @Slot()
+        def refreshLocalMicrophones(self) -> None:
+            self.localMicrophoneOptionsChanged.emit()
+            self.localMicrophoneDeviceChanged.emit()
 
-        voiceProgramManaged = Property(
-            bool,
-            lambda self: not self._selected_voice_program_is(
-                voice_program_manager.VOICE_PROGRAM_NONE
-            ),
-            notify=selectedVoiceProgramIndexChanged,
-        )
-        voiceProgramSogouSelected = Property(
-            bool,
-            lambda self: self._selected_voice_program_is(
-                voice_program_manager.VOICE_PROGRAM_SOGOU
-            ),
-            notify=selectedVoiceProgramIndexChanged,
-        )
-        voiceProgramWeTypeSelected = Property(
-            bool,
-            lambda self: self._selected_voice_program_is(
-                voice_program_manager.VOICE_PROGRAM_WETYPE
-            ),
-            notify=selectedVoiceProgramIndexChanged,
-        )
-        voiceProgramDoubaoSelected = Property(
-            bool,
-            lambda self: self._selected_voice_program_is(
-                voice_program_manager.VOICE_PROGRAM_DOUBAO_IME
-            ),
-            notify=selectedVoiceProgramIndexChanged,
-        )
-        voiceProgramChatterflySelected = Property(
-            bool,
-            lambda self: self._selected_voice_program_is(
-                voice_program_manager.VOICE_PROGRAM_CHATTERFLY
-            ),
-            notify=selectedVoiceProgramIndexChanged,
-        )
-        voiceProgramCustomSelected = Property(
-            bool,
-            lambda self: self._selected_voice_program_is(
-                voice_program_manager.VOICE_PROGRAM_CUSTOM
-            ),
-            notify=selectedVoiceProgramIndexChanged,
-        )
+        @Slot(int, result=bool)
+        def voiceSlotEditable(self, slot: int) -> bool:
+            """模式1 只允许语音1；模式2 两个槽都能用。"""
 
-        def _get_voice_program_system_managed(self) -> bool:
-            return voice_program_manager.is_system_managed_provider(
-                self._voice_program_settings.get("provider")
-            )
+            if self._get_voice_input_source() == config.VOICE_INPUT_SOURCE_REMOTE:
+                return int(slot) == 1
+            return True
 
-        voiceProgramSystemManaged = Property(
-            bool,
-            _get_voice_program_system_managed,
-            notify=selectedVoiceProgramIndexChanged,
-        )
-
-        voiceProgramLaunchable = Property(
-            bool,
-            lambda self: voice_program_manager.is_launchable_provider(
-                self._voice_program_settings.get("provider")
-            ),
-            notify=selectedVoiceProgramIndexChanged,
+        voiceHotkeySource = Property(
+            str,
+            lambda self: str(self._config.get("voice_hotkey_source", "")),
+            notify=voiceHotkeySourceChanged,
         )
 
         def _get_voice_hotkey_busy(self) -> bool:
@@ -5558,124 +4775,6 @@ def _load_qt_classes() -> dict:
             notify=endpointPreflightBusyChanged,
         )
 
-        def _get_voice_program_custom_path(self) -> str:
-            return str(self._voice_program_settings.get("custom_executable", ""))
-
-        def _set_voice_program_custom_path(self, value: str) -> None:
-            if self._voice_hotkey_busy or self._voice_settings_write_start_blocked():
-                return
-            local_value = QUrl(value).toLocalFile() if value.startswith("file:") else value
-            local_value = local_value.strip()
-            if len(local_value) >= 2 and local_value[0] == local_value[-1] == '"':
-                local_value = local_value[1:-1].strip()
-            if local_value == self._voice_program_settings.get("custom_executable"):
-                return
-            updated = dict(self._voice_program_settings)
-            updated["custom_executable"] = local_value
-            if local_value:
-                candidate = dict(updated, provider=voice_program_manager.VOICE_PROGRAM_CUSTOM)
-                issue = voice_program_manager.voice_configuration_issue(candidate)
-                if issue:
-                    self._set_error_message(issue, self._VOICE_PAGE_INDEX)
-                    self.voiceProgramCustomPathChanged.emit()
-                    return
-            self._update_and_persist_voice_program(updated)
-
-        voiceProgramCustomPath = Property(
-            str,
-            _get_voice_program_custom_path,
-            _set_voice_program_custom_path,
-            notify=voiceProgramCustomPathChanged,
-        )
-
-        def _get_voice_program_launch_on_bridge_start(self) -> bool:
-            return self._voice_program_settings.get("launch_on_bridge_start") is True
-
-        def _set_voice_program_launch_on_bridge_start(self, value: bool) -> None:
-            if self._voice_hotkey_busy or self._voice_settings_write_start_blocked():
-                return
-            value = bool(value)
-            if value == self._get_voice_program_launch_on_bridge_start():
-                return
-            updated = dict(self._voice_program_settings)
-            provider = str(updated.get("provider", ""))
-            if provider != voice_program_manager.VOICE_PROGRAM_CUSTOM:
-                return
-            preferences = dict(updated.get("launch_on_bridge_start_by_provider", {}))
-            preferences[provider] = value
-            updated["launch_on_bridge_start_by_provider"] = preferences
-            updated["launch_on_bridge_start"] = value
-            self._update_and_persist_voice_program(updated)
-
-        voiceProgramLaunchOnBridgeStart = Property(
-            bool,
-            _get_voice_program_launch_on_bridge_start,
-            _set_voice_program_launch_on_bridge_start,
-            notify=voiceProgramLaunchOnBridgeStartChanged,
-        )
-
-        def _get_voice_program_launch_elevated(self) -> bool:
-            return self._voice_program_settings.get("launch_elevated") is True
-
-        def _set_voice_program_launch_elevated(self, value: bool) -> None:
-            if self._voice_hotkey_busy or self._voice_settings_write_start_blocked():
-                return
-            value = bool(value)
-            if value == self._get_voice_program_launch_elevated():
-                return
-            updated = dict(self._voice_program_settings)
-            provider_id = str(updated.get("provider", ""))
-            preferences = updated.get("launch_elevated_by_provider")
-            next_preferences = (
-                dict(preferences) if isinstance(preferences, dict) else {}
-            )
-            next_preferences[provider_id] = value
-            updated["launch_elevated_by_provider"] = next_preferences
-            updated["launch_elevated"] = value
-            self._update_and_persist_voice_program(updated)
-
-        voiceProgramLaunchElevated = Property(
-            bool,
-            _get_voice_program_launch_elevated,
-            _set_voice_program_launch_elevated,
-            notify=voiceProgramLaunchElevatedChanged,
-        )
-
-        def _get_voice_program_settings_dirty(self) -> bool:
-            return self._voice_program_settings_dirty
-
-        voiceProgramSettingsDirty = Property(
-            bool,
-            _get_voice_program_settings_dirty,
-            notify=voiceProgramSettingsDirtyChanged,
-        )
-
-        def _get_voice_program_status_text(self) -> str:
-            return self._voice_program_status_text
-
-        voiceProgramStatusText = Property(
-            str,
-            _get_voice_program_status_text,
-            notify=voiceProgramStatusTextChanged,
-        )
-
-        def _get_voice_program_status_code(self) -> str:
-            return self._voice_program_status_code
-
-        voiceProgramStatusCode = Property(
-            str,
-            _get_voice_program_status_code,
-            notify=voiceProgramStatusCodeChanged,
-        )
-
-        def _get_voice_program_elevation_status(self) -> str:
-            return self._voice_program_elevation_status
-
-        voiceProgramElevationStatus = Property(
-            str,
-            _get_voice_program_elevation_status,
-            notify=voiceProgramElevationStatusChanged,
-        )
 
         def _get_endpoint_options(self) -> List[str]:
             return list(self._endpoint_options)
@@ -5763,11 +4862,6 @@ def _load_qt_classes() -> dict:
         voiceRuntimeState = Property(
             str,
             lambda self: self._voice_runtime_state,
-            notify=voiceRuntimeStatusChanged,
-        )
-        voiceRuntimeProvider = Property(
-            str,
-            lambda self: self._voice_runtime_provider,
             notify=voiceRuntimeStatusChanged,
         )
 
@@ -5935,6 +5029,13 @@ def _load_qt_classes() -> dict:
 
         errorMessage = Property(str, _get_error_message, notify=errorMessageChanged)
 
+        configurationReadOnly = Property(
+            bool, lambda self: bool(self._configuration_issues), constant=True
+        )
+        configurationError = Property(
+            str, lambda self: self._configuration_error, constant=True
+        )
+
         def _get_settings_dirty(self) -> bool:
             return self._settings_dirty
 
@@ -5972,8 +5073,6 @@ def _load_qt_classes() -> dict:
             )
             if value == self._active_page_index:
                 return
-            if self._wetype_hotkey_refresh_cancel is not None:
-                self._wetype_hotkey_refresh_cancel.set()
             self._active_page_index = value
             self.activePageIndexChanged.emit()
 
@@ -6076,7 +5175,8 @@ def _load_qt_classes() -> dict:
             str,
             lambda self: (
                 "安装器"
-                if self._hid_helper_installed_distribution
+                if self._application_update_package_kind()
+                is application_update.PackageKind.INSTALLER
                 else "便携版 ZIP"
             ),
             constant=True,
@@ -6258,9 +5358,9 @@ def _load_qt_classes() -> dict:
         def primaryActionOptionsFor(self, button_id: str) -> List[str]:
             if not button_id:
                 return list(_ORDINARY_PRIMARY_ACTION_OPTIONS)
-            if button_id == "mic":
-                return self._mapping_options_available_now(_MIC_PRIMARY_ACTION_OPTIONS)
-            return self._mapping_options_available_now(_ORDINARY_PRIMARY_ACTION_OPTIONS)
+            # Any physical button may be promoted to a hold-to-talk voice slot;
+            # the numbered labels let several buttons run independent sessions.
+            return self._mapping_options_available_now(_MIC_PRIMARY_ACTION_OPTIONS)
 
         @Slot(str, result=str)
         def actionOptionGroupTitle(self, option: str) -> str:
@@ -6286,18 +5386,20 @@ def _load_qt_classes() -> dict:
                 return {"ok": False, "text": "", "message": str(exc)}
             return {"ok": True, "text": normalized, "message": ""}
 
-        @Slot(str, str, str, result=str)
+        @Slot(str, str, str, str, result=str)
         def buttonActionValidationMessage(
             self,
             button_id: str,
             trigger: str,
             text: str,
+            inject_mode: str,
         ) -> str:
             return settings_ui.button_action_validation_message(
                 button_id,
                 trigger,
                 text,
                 base_bindings=self._bindings,
+                inject_mode=inject_mode,
             )
 
         def _get_secondary_action_options(self) -> List[str]:
@@ -6376,6 +5478,8 @@ def _load_qt_classes() -> dict:
 
         @Slot(bool)
         def setLaunchAtLogin(self, enabled: bool) -> None:
+            if self.configurationReadOnly:
+                return
             enabled = bool(enabled)
             if enabled == self._launch_at_login:
                 return
@@ -6451,6 +5555,8 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def startBridgeOnApplicationStart(self) -> None:
+            if self.configurationReadOnly:
+                return
             if self._maintenance_exit_pending:
                 return
             if (
@@ -6628,9 +5734,6 @@ def _load_qt_classes() -> dict:
             if self._remote_selection_busy:
                 self._schedule_application_exit_poll()
                 return
-            if self._chromecast_setup_client is not None:
-                self._fail_application_exit("谷歌启用进程尚未退出，请重新使用当前设备完成清理后再退出。")
-                return
             if (
                 self._voice_hotkey_busy
                 or self._settings_save_busy
@@ -6761,6 +5864,8 @@ def _load_qt_classes() -> dict:
             return self._record_hid_helper_setup_prompted()
 
         def _record_hid_helper_setup_prompted(self) -> bool:
+            if self.configurationReadOnly:
+                return False
             offer_id = self._hid_helper_offer_id
             if not offer_id:
                 if self._hid_helper_portable_distribution:
@@ -7030,322 +6135,6 @@ def _load_qt_classes() -> dict:
             self._set_error_message(message, self._DEVICE_PAGE_INDEX)
 
         @Slot()
-        def refreshVoiceProgramStatus(self) -> None:
-            self._request_voice_program_status_refresh()
-
-        @Slot()
-        def refreshVoiceProgramOptions(self) -> None:
-            self._request_voice_program_options_refresh()
-
-        def _voice_hotkey_refresh_blocked(self, *, refresh_runtime: bool) -> bool:
-            blocked_states = {
-                bridge_runtime_status.VOICE_RUNTIME_ACTIVE,
-                bridge_runtime_status.VOICE_RUNTIME_FINISHING,
-            }
-            if self._selected_voice_program_is(voice_program_manager.VOICE_PROGRAM_WETYPE):
-                blocked_states.update({
-                    bridge_runtime_status.VOICE_RUNTIME_MIC_CONFIRMED,
-                    bridge_runtime_status.VOICE_RUNTIME_RECEIVING_AUDIO,
-                })
-            if (
-                self._settings_save_busy
-                or self._remote_selection_busy
-                or self._voice_settings_write_start_blocked()
-                or self._get_input_capture_in_use()
-                or self._voice_runtime_state
-                in blocked_states
-            ):
-                return True
-            if refresh_runtime:
-                bridge_running = self._refresh_bridge_status()
-                if bridge_running is None or (
-                    bridge_running and self._bridge_connection_state == "unknown"
-                ):
-                    return True
-            return bool(
-                self._settings_save_busy
-                or self._remote_selection_busy
-                or self._voice_settings_write_start_blocked()
-                or self._get_input_capture_in_use()
-                or self._voice_runtime_state
-                in blocked_states
-            )
-
-        def _voice_hotkey_load_target(self) -> tuple:
-            return (
-                self.activeRemoteKey,
-                str(self._voice_program_settings.get("provider", "")),
-                self._voice_hotkey_trigger(),
-            )
-
-        def _clear_pending_voice_hotkey_load(self) -> None:
-            self._voice_hotkey_load_pending = None
-            self._voice_hotkey_load_timer.stop()
-
-        def _retry_pending_voice_hotkey_load(self) -> None:
-            if self._voice_hotkey_load_pending != self._voice_hotkey_load_target():
-                self._clear_pending_voice_hotkey_load()
-                return
-            self.loadVoiceHotkeyFromProvider()
-
-        @Slot()
-        def _refresh_voice_hotkey_from_provider(self, *, explicit: bool) -> None:
-            if (self._background_shutdown_event.is_set()
-                    or self._application_exit_requested
-                    or self._application_exit_confirmed
-                    or self._application_exit_intent.is_set()):
-                self._clear_pending_voice_hotkey_load()
-                return
-            provider_id = str(self._voice_program_settings.get("provider", ""))
-            if provider_id in {
-                voice_program_manager.VOICE_PROGRAM_NONE,
-                voice_program_manager.VOICE_PROGRAM_CUSTOM,
-            }:
-                self._clear_pending_voice_hotkey_load()
-                return
-            if not explicit and provider_id == voice_program_manager.VOICE_PROGRAM_WETYPE:
-                self._clear_pending_voice_hotkey_load()
-                return
-            if (
-                not explicit
-                and config.voice_hotkey_source_for_provider(
-                    self._config,
-                    provider_id,
-                    trigger=self._voice_hotkey_trigger(provider_id),
-                )
-                == config.VOICE_HOTKEY_SOURCE_MANUAL
-            ):
-                self._clear_pending_voice_hotkey_load()
-                return
-            if self._voice_hotkey_busy or self._voice_hotkey_refresh_blocked(refresh_runtime=True):
-                if not explicit:
-                    self._voice_hotkey_load_pending = self._voice_hotkey_load_target()
-                    self._voice_hotkey_load_timer.start(150)
-                return
-            self._clear_pending_voice_hotkey_load()
-            refresh_target = self._voice_hotkey_load_target()
-            self._set_voice_hotkey_busy(True)
-            if provider_id == voice_program_manager.VOICE_PROGRAM_WETYPE:
-                self._wetype_hotkey_refresh_cancel = threading.Event()
-                cancel_event = _AnyEvent(
-                    self._wetype_hotkey_refresh_cancel,
-                    self._background_shutdown_event,
-                    self._application_exit_intent,
-                )
-                self._set_error_message("")
-                self._set_status_message(
-                    "正在打开微信设置并读取" + ("启动语音输入" if self._voice_hotkey_trigger() == "toggle"
-                                                else "按住说话") + "快捷键…", self._VOICE_PAGE_INDEX
-                )
-                trigger = self._voice_hotkey_trigger()
-                self._submit_voice_hotkey_step(
-                    lambda: voice_hotkey_sync_windows.read_provider_hotkey(
-                        provider_id, allow_settings_window=True, cancel_event=cancel_event,
-                        trigger=trigger,
-                    ),
-                    lambda ok, payload: self._on_voice_hotkey_refresh_ready(
-                        explicit, ok, payload, refresh_target=refresh_target
-                    ),
-                    timeout_ms=6500,
-                )
-                return
-            self._set_status_message("正在读取语音程序快捷键…", self._VOICE_PAGE_INDEX)
-            self._submit_voice_hotkey_step(
-                lambda: voice_hotkey_sync_windows.read_provider_hotkey(
-                    provider_id,
-                    **({"trigger": "toggle"} if self._voice_hotkey_trigger(provider_id) == "toggle" else {}),
-                ),
-                lambda ok, payload: self._on_voice_hotkey_refresh_ready(
-                    explicit,
-                    ok,
-                    payload,
-                    refresh_target=refresh_target,
-                ),
-            )
-
-        @Slot()
-        def loadVoiceHotkeyFromProvider(self) -> None:
-            self._refresh_voice_hotkey_from_provider(explicit=False)
-
-        @Slot()
-        def refreshVoiceHotkeyFromProvider(self) -> None:
-            self._refresh_voice_hotkey_from_provider(explicit=True)
-
-        def _on_voice_hotkey_refresh_ready(
-            self,
-            explicit: bool,
-            ok: bool,
-            payload: object,
-            *,
-            refresh_target: tuple | None = None,
-        ) -> None:
-            if refresh_target is not None and refresh_target != self._voice_hotkey_load_target():
-                self._set_status_message("语音设置已改变；本次刷新结果未保存。", self._VOICE_PAGE_INDEX)
-                self._finish_voice_hotkey_operation()
-                return
-            if (
-                self._wetype_hotkey_refresh_cancel is not None
-                and self._wetype_hotkey_refresh_cancel.is_set()
-            ):
-                self._set_status_message("")
-                self._set_error_message(
-                    "微信快捷键刷新已取消或超时；已保留当前快捷键。", self._VOICE_PAGE_INDEX
-                )
-                self._finish_voice_hotkey_operation()
-                return
-            if self._voice_hotkey_refresh_blocked(refresh_runtime=True):
-                self._set_status_message(
-                    "当前正在录入、保存、说话或收尾，本次未刷新语音按键。",
-                    self._VOICE_PAGE_INDEX,
-                )
-                self._finish_voice_hotkey_operation()
-                if not explicit:
-                    self.loadVoiceHotkeyFromProvider()
-                return
-            self._clear_pending_voice_hotkey_load()
-            if not ok:
-                current_validation = voice_hotkey_sync_windows.validate_provider_hotkey(
-                    self._voice_program_settings.get("provider"),
-                    self._get_hold_voice_hotkey_text(),
-                )
-                self._set_voice_hotkey_save_state(
-                    "saved" if current_validation.ok else "retry"
-                )
-                self._set_status_message("")
-                self._set_error_message(
-                    f"读取语音程序快捷键失败：{payload}；已保留当前快捷键。",
-                    self._VOICE_PAGE_INDEX,
-                )
-                self._finish_voice_hotkey_operation()
-                return
-            result = payload
-            if result.provider_id != self._voice_program_settings.get("provider"):
-                self._set_status_message("")
-                self._set_error_message(
-                    "语音程序已改变；本次刷新结果未保存。", self._VOICE_PAGE_INDEX
-                )
-                self._finish_voice_hotkey_operation()
-                return
-            if not result.ok:
-                current_validation = voice_hotkey_sync_windows.validate_provider_hotkey(
-                    self._voice_program_settings.get("provider"),
-                    self._get_hold_voice_hotkey_text(),
-                )
-                self._set_voice_hotkey_save_state(
-                    "saved" if current_validation.ok else "retry"
-                )
-                self._set_status_message("")
-                self._set_error_message(
-                    result.message + " 已保留当前快捷键。",
-                    self._VOICE_PAGE_INDEX,
-                )
-                self._finish_voice_hotkey_operation()
-                return
-            current = self._get_hold_voice_hotkey_text()
-            current_source = config.voice_hotkey_source_for_provider(
-                self._config,
-                result.provider_id,
-                trigger=self._voice_hotkey_trigger(result.provider_id),
-            )
-            if not explicit and current_source == config.VOICE_HOTKEY_SOURCE_MANUAL:
-                self._finish_voice_hotkey_operation()
-                return
-            if (
-                result.hotkey == current
-                and current_source == config.VOICE_HOTKEY_SOURCE_AUTO
-            ):
-                self._set_voice_hotkey_save_state("saved")
-                self._set_error_message("")
-                self._set_status_message(result.message, self._VOICE_PAGE_INDEX)
-                self._finish_voice_hotkey_operation()
-                return
-            self._set_voice_hotkey_text(
-                key_mapping.VoiceTriggerMode.HOLD,
-                result.hotkey,
-            )
-            if not self._persist_voice_settings(
-                hotkey_source=config.VOICE_HOTKEY_SOURCE_AUTO
-            ):
-                self._set_voice_hotkey_text(
-                    key_mapping.VoiceTriggerMode.HOLD,
-                    current,
-                )
-                self._set_voice_hotkey_save_state("retry")
-                self._finish_voice_hotkey_operation()
-                return
-            self._set_voice_hotkey_save_state("saved")
-            self._set_status_message(
-                result.message
-                + self._mapping_save_status_suffix(),
-                self._VOICE_PAGE_INDEX,
-            )
-            self._finish_voice_hotkey_operation()
-
-        @Slot()
-        def launchVoiceProgram(self) -> None:
-            self._launch_voice_program(
-                feedback_page_index=self._VOICE_PAGE_INDEX
-            )
-
-        def _launch_voice_program(
-            self,
-            *,
-            feedback_page_index: int,
-            prior_error: str = "",
-        ) -> None:
-            if self._voice_hotkey_busy or self._voice_settings_write_start_blocked():
-                return
-            settings_snapshot = dict(self._voice_program_settings)
-            self._set_voice_hotkey_busy(True)
-            self._set_error_message("")
-            self._set_status_message("正在启动语音程序…", feedback_page_index)
-
-            def run() -> None:
-                try:
-                    result = voice_program_manager.launch_voice_program(settings_snapshot)
-                except Exception:  # noqa: BLE001 - optional launch must remain retryable
-                    result = None
-                self._emit_background_result(
-                    self._voiceProgramLaunchReady, (feedback_page_index, result, prior_error)
-                )
-
-            try:
-                self._start_background_task(run, "voice-program-launch")
-            except RuntimeError:
-                self._on_voice_program_launch_ready((feedback_page_index, None, prior_error))
-
-        def _on_voice_program_launch_ready(self, payload: object) -> None:
-            if self._background_shutdown_event.is_set():
-                return
-            feedback_page_index, result = payload[:2]
-            prior_error = payload[2] if len(payload) > 2 else ""
-            self._set_voice_hotkey_busy(False)
-            self._schedule_application_exit_poll()
-            if self._application_exit_intent.is_set() or self._application_exit_requested:
-                return
-            if result is None:
-                self._set_status_message("")
-                self._set_error_message(
-                    prior_error + f"语音程序启动失败，请手动启动后再试；{product_identity.DISPLAY_NAME}和遥控器服务不受影响。",
-                    feedback_page_index,
-                )
-                self._request_voice_program_status_refresh()
-                return
-            message = voice_program_manager.launch_result_text(result)
-            if result.code in {
-                "not_found",
-                "launch_failed",
-                "launch_unconfirmed",
-                "restart_elevated_required",
-            }:
-                self._set_status_message("")
-                self._set_error_message(prior_error + message, feedback_page_index)
-            else:
-                self._set_error_message(prior_error, feedback_page_index)
-                self._set_status_message(message + self._mapping_save_status_suffix(), feedback_page_index)
-            self._request_voice_program_status_refresh()
-
-        @Slot()
         def pollWindowRestoreRequest(self) -> None:
             if (
                 self._maintenance_exit_pending
@@ -7516,13 +6305,6 @@ def _load_qt_classes() -> dict:
             request = self._key_detection_bridge_request
             if not self._key_detection_active:
                 return
-            if not self.isRc003Device and self._key_detection_listener is not None:
-                from .chromecast_client import Client, message
-                receiver = self._key_detection_listener
-                if isinstance(receiver, Client) and receiver.finished.is_set():
-                    self._request_input_stop(kind="key_detection",
-                                             key_detection_success_message=message(receiver.reason))
-                    return
             if (
                 time.monotonic() - self._key_detection_started_at
                 >= self._KEY_DETECTION_TIMEOUT_SECONDS
@@ -7550,9 +6332,8 @@ def _load_qt_classes() -> dict:
             if button_id is not None:
                 self._on_raw_key_detected(button_id, " 来源=后台服务。")
 
-        def _start_hotkey_capture(self, *, enforce_voice_provider: bool) -> bool:
+        def _start_hotkey_capture(self) -> bool:
             logger = logging_setup.get_logger(self._config_root)
-            provider_id = str(self._voice_program_settings.get("provider", ""))
             logger.info(
                 "settings hotkey capture: start requested kind=%s phase=%s "
                 "has_capture=%s key_detection=%s voice_busy=%s",
@@ -7576,13 +6357,13 @@ def _load_qt_classes() -> dict:
         def startHotkeyCapture(self) -> bool:
             """Start the voice-page shortcut recorder."""
 
-            return self._start_hotkey_capture(enforce_voice_provider=True)
+            return self._start_hotkey_capture()
 
         @Slot(result=bool)
         def startMappingHotkeyCapture(self) -> bool:
             """Start the ordinary button-mapping shortcut recorder."""
 
-            return self._start_hotkey_capture(enforce_voice_provider=False)
+            return self._start_hotkey_capture()
 
         @Slot(result=bool)
         def stopHotkeyCapture(self) -> bool:
@@ -7783,6 +6564,8 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def reconnectBridgeNow(self) -> None:
+            if self.configurationReadOnly:
+                return
             if (
                 self._bridge_reconnect_busy
                 or self._maintenance_exit_pending
@@ -7843,6 +6626,8 @@ def _load_qt_classes() -> dict:
             automatic: bool,
             allow_active_voice: bool = False,
         ) -> None:
+            if self.configurationReadOnly:
+                return
             if (
                 self._remote_selection_busy
                 or self._remote_save_uncertain
@@ -7950,6 +6735,8 @@ def _load_qt_classes() -> dict:
             return replacement is None or replacement.pid != stale_status.pid
 
         def _start_bridge_process(self) -> None:
+            if self.configurationReadOnly:
+                return
             if self.activeRemoteKey and not self.activeRemoteReady:
                 self._set_bridge_launch_phase("failed")
                 self._set_launch_status("当前型号尚未提供接收，请在设备页重新选择。")
@@ -7984,7 +6771,7 @@ def _load_qt_classes() -> dict:
                 self._set_bridge_restart_recommended(True)
                 self._set_bridge_launch_phase("failed")
                 self._set_launch_status(
-                    "无法清理上次服务状态；请完全退出无线麦后重试。"
+                    "无法清理上次服务状态；请完全退出MiOpention后重试。"
                 )
                 self._schedule_application_exit_poll()
                 return
@@ -8008,10 +6795,9 @@ def _load_qt_classes() -> dict:
         def startBridge(self) -> None:
             """Start the bridge without saving unrelated unsaved page edits."""
 
-            if self._remote_selection_busy:
+            if self.configurationReadOnly:
                 return
-            if self._chromecast_setup_client is not None:
-                self._set_error_message("谷歌启用进程尚未退出，请先重新使用当前设备完成清理。", self._DEVICE_PAGE_INDEX)
+            if self._remote_selection_busy:
                 return
             if self._remote_save_uncertain:
                 self._set_error_message("设备选择尚未成功保存，请重新选择设备。", self._DEVICE_PAGE_INDEX)
@@ -8117,16 +6903,6 @@ def _load_qt_classes() -> dict:
                 self._legacy_bridge_launch_handoff_attempted = False
                 self._set_bridge_running(True)
                 self._set_bridge_launch_phase("waiting")
-                if (
-                    result.outcome is bridge_launcher.LaunchOutcome.ALREADY_RUNNING
-                    and not self._maintenance_exit_pending
-                    and not self._application_exit_requested
-                    and self._voice_program_settings.get("launch_on_bridge_start")
-                    is True
-                ):
-                    self._launch_voice_program(
-                        feedback_page_index=self._DEVICE_PAGE_INDEX
-                    )
                 self._sync_bridge_connection_status(True)
                 self._schedule_application_exit_poll()
                 return
@@ -8159,6 +6935,8 @@ def _load_qt_classes() -> dict:
         def restoreMappingDefaults(self) -> None:
             """Reset only the button-page values without touching voice setup."""
 
+            if self.configurationReadOnly:
+                return
             defaults = settings_ui.default_display_state(self._selected_device_id())
             self._model.load_display_map(
                 defaults.button_display_map,
@@ -8176,25 +6954,487 @@ def _load_qt_classes() -> dict:
 
         mappingPresets = Property(list, lambda self: self._mapping_preset_rows, notify=mappingPresetsChanged)
 
+        # The voice page renders the same library, labelled with each profile's
+        # automatic mode tag. Sharing one row list keeps the two pages in sync.
+        voiceProfiles = Property(list, lambda self: self._mapping_preset_rows, notify=mappingPresetsChanged)
+
+        def _live_voice_fields(self) -> tuple[str, str]:
+            return (self._get_voice_input_source(),
+                    config.voice_local_input_device(self._config))
+
+        mappingPresetScopeOptions = Property(
+            list,
+            lambda self: [{"value": value, "label": app_profiles.SCOPE_LABELS[value]}
+                          for value in app_profiles.SCOPES],
+            constant=True,
+        )
+
+        @Slot(str, str, str, str, result="QVariantMap")
+        def setMappingPresetStatus(self, identity: str, scope: str, process: str, hotkey: str) -> dict:
+            """Persist one saved preset's switching scope/process/hotkey."""
+            try:
+                if (self._mapping_auto_save_temporarily_blocked() or self._remote_selection_busy
+                        or self._get_input_capture_in_use() or self._application_exit_requested):
+                    raise ValueError("正在处理设置或输入，请完成后重试。")
+                if identity == app_profiles.GLOBAL_ID:
+                    raise ValueError("自动保存项代表当前按键设置，不能设置状态。")
+                app_profiles.AppProfileStore(self._config_root).set_status(
+                    identity, scope, process, hotkey)
+                self._refresh_mapping_presets()
+                return {"ok": True, "id": identity, "message": "配置状态已保存。"}
+            except Exception as exc:  # Qt slots must keep the modal usable on bad input.
+                detail = str(exc)
+                message = detail if len(detail) <= 240 else detail[:240] + "…"
+                return {"ok": False, "id": identity, "message": message}
+
         def _refresh_mapping_presets(self) -> None:
             profile = self._selected_device_id()
-            entries = mapping_presets.PresetStore(self._config_root).view(
-                self._bindings, profile, applied_override=self._mapping_applied_overrides.get(profile))
+            source, device = self._live_voice_fields()
+            entries = app_profiles.AppProfileStore(self._config_root).view(
+                self._bindings, profile,
+                voice_input_source=source, voice_local_input_device=device)
             self._mapping_preset_rows = [
-                {key: entry[key] for key in ("id", "name", "automatic", "applied")}
+                {key: entry[key] for key in ("id", "name", "automatic", "applied",
+                                             "scope", "process", "hotkey",
+                                             "voice_input_source",
+                                             "voice_local_input_device",
+                                             "mode_tag", "label", "voice_conflicts",
+                                             "voice_conflict_text")}
                 for entry in entries
             ]
             self.mappingPresetsChanged.emit()
+            self._refresh_mapping_apps()
+
+        def _resolved_edit_target(self) -> tuple[str, dict]:
+            """The document the button page should display.
+
+            "" means the global layout; a preset id means one application's
+            own layout, layered on top of the global one. Any inconsistency
+            (another remote model, a deleted preset, a broken store) falls back
+            to the global layout instead of leaving the page empty.
+            """
+            profile = self._selected_device_id()
+            identity = self._mapping_edit_target
+            if not identity:
+                return "", self._bindings
+            try:
+                entry = app_profiles.AppProfileStore(self._config_root).get(identity)
+                if entry["scope"] != "app":
+                    return "", self._bindings
+                return identity, app_profiles.apply_to(self._bindings, entry, profile)
+            except Exception:  # noqa: BLE001 - a broken store must not wipe the page
+                return "", self._bindings
+
+        def _active_edit_bindings(self) -> dict:
+            return self._resolved_edit_target()[1]
+
+        def _mapping_edit_target_label(self) -> str:
+            if not self._mapping_edit_target:
+                return ""
+            try:
+                return app_profiles.AppProfileStore(self._config_root).get(
+                    self._mapping_edit_target)["name"]
+            except Exception:  # noqa: BLE001 - label is cosmetic
+                return ""
+
+        def _executable_for_app(self, process: str) -> str:
+            key = str(process or "").casefold()
+            if not key:
+                return ""
+            if key not in self._app_executable_cache:
+                try:
+                    self._app_executable_cache[key] = (
+                        running_apps_windows.executable_for_process(process))
+                except Exception:  # noqa: BLE001 - icon lookup is best effort
+                    self._app_executable_cache[key] = ""
+            return self._app_executable_cache[key]
+
+        def _icon_for(self, executable: str) -> str:
+            if not executable:
+                return ""
+            if executable not in self._app_icon_cache:
+                try:
+                    self._app_icon_cache[executable] = app_icons.icon_file_url(executable)
+                except Exception:  # noqa: BLE001 - icons are cosmetic only
+                    self._app_icon_cache[executable] = ""
+            return self._app_icon_cache[executable]
+
+        def _friendly_app_name(self, process: str, executable: str = "") -> str:
+            path = executable or self._executable_for_app(process)
+            description = ""
+            try:
+                description = running_apps_windows.file_description(path)
+            except Exception:  # noqa: BLE001 - naming is best effort
+                description = ""
+            if not description:
+                wanted = str(process or "").casefold()
+                for row in self._running_applications:
+                    if row["process"] == wanted:
+                        description = str(row.get("name", ""))
+                        break
+            description = "".join(
+                char for char in (description or "") if ord(char) >= 32).strip()
+            description = description or Path(str(process)).stem or str(process)
+            return description if len(description) <= 60 else description[:60] + "…"
+
+        def _refresh_mapping_apps(self) -> None:
+            try:
+                entries = app_profiles.AppProfileStore(self._config_root).list_apps()
+            except Exception:  # noqa: BLE001 - an unreadable store must not break the panel
+                entries = []
+            rows: List[dict] = []
+            for entry in entries:
+                executable = self._executable_for_app(entry["process"])
+                rows.append({
+                    "id": entry["id"],
+                    "name": entry["name"],
+                    "process": entry["process"],
+                    "icon": self._icon_for(executable),
+                    "active": entry["id"] == self._mapping_edit_target,
+                })
+            self._mapping_app_rows = rows
+            self.mappingAppProfilesChanged.emit()
+
+        mappingEditTarget = Property(
+            str,
+            lambda self: self._mapping_edit_target,
+            notify=mappingEditTargetChanged,
+        )
+
+        mappingEditTargetLabel = Property(
+            str,
+            lambda self: self._mapping_edit_target_label(),
+            notify=mappingEditTargetChanged,
+        )
+
+        mappingAppProfiles = Property(
+            list,
+            lambda self: self._mapping_app_rows,
+            notify=mappingAppProfilesChanged,
+        )
+
+        runningApplications = Property(
+            list,
+            lambda self: self._running_applications,
+            notify=runningApplicationsChanged,
+        )
+
+        def _busy_for_app_edit(self) -> None:
+            if (self._mapping_auto_save_temporarily_blocked()
+                    or self._remote_selection_busy
+                    or self._get_input_capture_in_use()
+                    or self._application_exit_requested):
+                raise ValueError("正在处理设置或输入，请完成后重试。")
+
+        @Slot(str, result="QVariantMap")
+        def selectMappingEditTarget(self, identity: str) -> dict:
+            """Point the button page at the global layout or one application."""
+            try:
+                self._busy_for_app_edit()
+                identity = str(identity or "")
+                if identity in ("", app_profiles.GLOBAL_ID):
+                    identity = ""
+                if identity:
+                    entry = app_profiles.AppProfileStore(self._config_root).get(identity)
+                    if entry["scope"] != "app":
+                        raise ValueError("这套配置没有绑定应用程序。")
+                if identity == self._mapping_edit_target:
+                    return {"ok": True, "id": identity,
+                            "message": self._mapping_edit_target_message()}
+                if self._mapping_dirty:
+                    # Flush the layout the user was just editing before the page
+                    # swaps to another one, otherwise the edits would be lost.
+                    self._run_mapping_auto_save()
+                    if self._mapping_dirty:
+                        raise ValueError("上一套按键映射尚未保存完成，请稍后重试。")
+                self._mapping_edit_target = identity
+                self.mappingEditTargetChanged.emit()
+                self._load_bindings_into_model()
+                self._refresh_mapping_apps()
+                return {"ok": True, "id": identity,
+                        "message": self._mapping_edit_target_message()}
+            except Exception as exc:  # noqa: BLE001 - Qt slots must not escape
+                detail = str(exc)
+                message = detail if len(detail) <= 240 else detail[:240] + "…"
+                return {"ok": False, "id": self._mapping_edit_target, "message": message}
+
+        def _mapping_edit_target_message(self) -> str:
+            if self._mapping_edit_target:
+                return f"正在编辑「{self._mapping_edit_target_label()}」的按键映射；切换到该应用时生效。"
+            return "正在编辑全局按键映射。"
+
+        @Slot(result="QVariantMap")
+        def refreshMappingApplications(self) -> dict:
+            """Re-read the list of applications that own a visible window."""
+            try:
+                own_process = os.path.basename(sys.executable).casefold()
+            except Exception:  # noqa: BLE001 - own name is only used to filter
+                own_process = ""
+            known = {row["process"].casefold() for row in self._mapping_app_rows}
+            try:
+                listed = running_apps_windows.list_running_applications()
+            except Exception:  # noqa: BLE001 - enumeration is best effort
+                listed = []
+            rows: List[dict] = []
+            for item in listed:
+                process = str(item.get("process", ""))
+                if not process or process.casefold() == own_process:
+                    continue
+                executable = str(item.get("executable", ""))
+                if executable:
+                    self._app_executable_cache[process.casefold()] = executable
+                rows.append({
+                    "process": process,
+                    "name": str(item.get("name") or process),
+                    "executable": executable,
+                    "title": str(item.get("title", "")),
+                    "icon": self._icon_for(executable),
+                    "selected": process.casefold() in known,
+                })
+            self._running_applications = rows
+            self.runningApplicationsChanged.emit()
+            return {"ok": True, "id": "", "message": ""}
+
+        @Slot(str, str, result="QVariantMap")
+        def addMappingAppProfile(self, value: str, name: str) -> dict:
+            """Add (or select) one application's own button layout."""
+            try:
+                if self.configurationReadOnly:
+                    raise config.ConfigReadOnlyError(self._configuration_error)
+                self._busy_for_app_edit()
+                raw = str(value or "").strip().strip('"')
+                if not raw:
+                    raise ValueError("请先选择或填写应用程序。")
+                if raw.lower().startswith("file:"):
+                    # The file dialog hands us an url, the store wants a path.
+                    raw = QUrl(raw).toLocalFile() or raw
+                has_separator = any(part in raw for part in ("/", "\\", ":"))
+                is_file = Path(raw).is_file() if has_separator else False
+                if has_separator and not is_file:
+                    raise ValueError("请填写进程名（如 chrome.exe），或用“浏览”选择 .exe 文件。")
+                process = running_apps_windows.process_name_from_path(raw)
+                if not process:
+                    raise ValueError("无法识别该应用程序的进程名。")
+                if "." not in process:
+                    process += ".exe"
+                profile = self._selected_device_id()
+                store = app_profiles.AppProfileStore(self._config_root)
+                existing = store.find_app(process)
+                if existing is not None:
+                    identity = existing["id"]
+                else:
+                    executable = raw if is_file else self._executable_for_app(process)
+                    # A window title or file description may carry control
+                    # characters and WILL be rejected by the store, so normalise
+                    # the caller's label before it is saved.
+                    requested = "".join(
+                        char for char in str(name or "") if ord(char) >= 32).strip()
+                    display = requested or self._friendly_app_name(process, executable)
+                    identity = store.ensure_app(
+                        display,
+                        process,
+                        # A new application starts from the global layout; the
+                        # caller decides whether it becomes the edit target.
+                        app_profiles.snapshot(self._bindings, profile),
+                    )
+                entry = store.get(identity)
+                # Follow the Logi Options+ flow: adding an application starts
+                # editing that application, otherwise the button page would keep
+                # writing the global layout and the new row would never change.
+                switched = False
+                if identity != self._mapping_edit_target:
+                    if self._mapping_dirty:
+                        self._run_mapping_auto_save()
+                    if not self._mapping_dirty:
+                        self._mapping_edit_target = identity
+                        switched = True
+                        self.mappingEditTargetChanged.emit()
+                        self._load_bindings_into_model()
+                self._refresh_mapping_presets()
+                message = f"已添加「{entry['name']}」；它的按键映射与全局设置分开保存。"
+                if switched:
+                    message = (f"已添加「{entry['name']}」；按键列表已切换到它，"
+                               "这里改的按键只对这个应用生效。")
+                return {"ok": True, "id": identity, "message": message}
+            except Exception as exc:  # noqa: BLE001 - Qt slots must not escape
+                detail = str(exc)
+                message = detail if len(detail) <= 240 else detail[:240] + "…"
+                return {"ok": False, "id": "", "message": message}
+
+        @Slot(str, result="QVariantMap")
+        def removeMappingAppProfile(self, identity: str) -> dict:
+            """Delete one application's layout; it falls back to the global one."""
+            try:
+                if self.configurationReadOnly:
+                    raise config.ConfigReadOnlyError(self._configuration_error)
+                self._busy_for_app_edit()
+                if identity == app_profiles.GLOBAL_ID:
+                    raise ValueError("自动保存项不能删除。")
+                store = app_profiles.AppProfileStore(self._config_root)
+                entry = store.get(identity)
+                store.delete(identity)
+                if identity == self._mapping_edit_target:
+                    self._mapping_edit_target = ""
+                    self.mappingEditTargetChanged.emit()
+                    self._load_bindings_into_model()
+                self._refresh_mapping_presets()
+                return {"ok": True, "id": "",
+                        "message": f"已删除「{entry['name']}」；该应用改用全局按键映射。"}
+            except Exception as exc:  # noqa: BLE001 - Qt slots must not escape
+                detail = str(exc)
+                message = detail if len(detail) <= 240 else detail[:240] + "…"
+                return {"ok": False, "id": identity, "message": message}
+
+        @Slot(str, result="QVariantMap")
+        def exportMappingBundle(self, text: str) -> dict:
+            """Write the global layout and every application layout to one file."""
+            try:
+                if self.configurationReadOnly:
+                    raise config.ConfigReadOnlyError(self._configuration_error)
+                self._busy_for_app_edit()
+                url = QUrl(text)
+                if not url.isLocalFile():
+                    raise ValueError("请选择本地 JSON 保存位置。")
+                if self._mapping_dirty:
+                    # Export what the user is looking at, not an older version of
+                    # it; the auto save also lands the pending edits on disk.
+                    self._run_mapping_auto_save()
+                    if self._mapping_dirty:
+                        raise ValueError("按键映射尚未保存完成，请稍后重试。")
+                profile = self._selected_device_id()
+                source, device = self._live_voice_fields()
+                store = app_profiles.AppProfileStore(self._config_root)
+                apps = store.list_apps()
+                store.export_bundle(
+                    profile,
+                    app_profiles.snapshot(self._bindings, profile),
+                    apps,
+                    Path(url.toLocalFile()),
+                    voice_input_source=source,
+                    voice_local_input_device=device,
+                )
+                message = (
+                    f"已导出全局按键和 {len(apps)} 个应用配置。"
+                    if apps else "已导出全局按键配置（当前没有应用配置）。"
+                )
+                return {"ok": True, "id": "", "message": message}
+            except Exception as exc:  # noqa: BLE001 - Qt slots must not escape
+                detail = str(exc)
+                message = detail if len(detail) <= 240 else detail[:240] + "…"
+                return {"ok": False, "id": "", "message": message}
+
+        @Slot(str, result="QVariantMap")
+        def exportAllMappingPresets(self, text: str) -> dict:
+            """Back up every saved profile plus the live global layout."""
+            try:
+                if self.configurationReadOnly:
+                    raise config.ConfigReadOnlyError(self._configuration_error)
+                self._busy_for_app_edit()
+                url = QUrl(text)
+                if not url.isLocalFile():
+                    raise ValueError("请选择本地 JSON 保存位置。")
+                if self._mapping_dirty:
+                    self._run_mapping_auto_save()
+                    if self._mapping_dirty:
+                        raise ValueError("按键映射尚未保存完成，请稍后重试。")
+                profile = self._selected_device_id()
+                source, device = self._live_voice_fields()
+                count = app_profiles.AppProfileStore(self._config_root).export_library(
+                    Path(url.toLocalFile()),
+                    profile,
+                    app_profiles.snapshot(self._bindings, profile),
+                    voice_input_source=source,
+                    voice_local_input_device=device,
+                )
+                return {"ok": True, "id": "",
+                        "message": f"已导出 {count} 个配置和当前全局按键。"}
+            except Exception as exc:  # noqa: BLE001 - Qt slots must not escape
+                detail = str(exc)
+                message = detail if len(detail) <= 240 else detail[:240] + "…"
+                return {"ok": False, "id": "", "message": message}
+
+        @Slot(str, result="QVariantMap")
+        def importMappingBundle(self, text: str) -> dict:
+            """Replace the global layout and every application layout from one file."""
+            try:
+                if self.configurationReadOnly:
+                    raise config.ConfigReadOnlyError(self._configuration_error)
+                self._busy_for_app_edit()
+                if self._mapping_dirty:
+                    self._run_mapping_auto_save()
+                    if self._mapping_dirty:
+                        raise ValueError("请先等当前按键映射保存完成，再导入整体配置。")
+                url = QUrl(text)
+                if not url.isLocalFile():
+                    raise ValueError("请选择本地 JSON 配置文件。")
+                profile = self._selected_device_id()
+                bundle = app_profiles.read_bundle(Path(url.toLocalFile()), profile)
+                store = app_profiles.AppProfileStore(self._config_root)
+                voice = {key: bundle[key] for key in app_profiles.VOICE_FIELDS}
+                count = store.replace_apps(bundle["apps"], **voice)
+                config_path = config.config_path(self._config_root)
+                bindings_path = config.key_bindings_path(self._config_root)
+                # Only the three mapping fields travel in the file, so merge them
+                # over the live bindings instead of dropping learned physical
+                # signatures and the combo layer that stay on this machine.
+                new_bindings = app_profiles.apply_to(
+                    self._bindings, {"mapping": bundle["global"]}, profile)
+                previous_voice = self._live_voice_fields()
+                new_config = dict(self._config)
+                new_config.update(voice)
+                config.save_settings_pair(
+                    config_path, new_config, bindings_path, new_bindings)
+                saved_config = config.load_config(config_path)
+                saved_bindings = config.load_key_bindings(bindings_path)
+            except Exception as exc:  # noqa: BLE001 - Qt slots must not escape
+                detail = str(exc)
+                message = detail if len(detail) <= 240 else detail[:240] + "…"
+                return {"ok": False, "id": "", "message": message}
+
+            previous_voice_mapping_ready = self._get_voice_mapping_ready()
+            self._config = saved_config
+            self._bindings = saved_bindings
+            self._bump_settings_revision()
+            if previous_voice != self._live_voice_fields():
+                self.voiceInputSourceChanged.emit()
+                self.localMicrophoneOptionsChanged.emit()
+                self.localMicrophoneDeviceChanged.emit()
+            self._removed_voice_bindings = config.normalize_voice_product_boundary(
+                self._config, self._bindings)
+            if previous_voice_mapping_ready != self._get_voice_mapping_ready():
+                self.voiceMappingReadyChanged.emit()
+            # Every application layout was just replaced, so any row the page was
+            # editing is gone; fall back to the global layout.
+            if self._mapping_edit_target:
+                self._mapping_edit_target = ""
+                self.mappingEditTargetChanged.emit()
+            self._load_bindings_into_model()
+            self._set_mapping_dirty(False)
+            self._set_mapping_auto_save_retry_available(False)
+            self._refresh_settings_dirty_state()
+            try:
+                self._refresh_mapping_presets()
+            except Exception:  # noqa: BLE001 - the import already committed
+                return {"ok": True, "id": "",
+                        "message": f"已导入全局按键和 {count} 个应用配置。 列表未能刷新，请重新打开面板查看。"}
+            message = (
+                f"已导入全局按键和 {count} 个应用配置；按键设置已更新。"
+                if count else "已导入全局按键配置；当前没有应用配置。"
+            )
+            return {"ok": True, "id": "", "message": message}
 
         @Slot(str, str, str, result="QVariantMap")
         def mappingPresetAction(self, operation: str, identity: str, text: str) -> dict:
             """Modal UI operations use stable ids, never mutable row indices."""
             try:
+                if self.configurationReadOnly:
+                    raise config.ConfigReadOnlyError(self._configuration_error)
                 if (self._mapping_auto_save_temporarily_blocked() or self._remote_selection_busy
                         or self._get_input_capture_in_use() or self._application_exit_requested):
                     raise ValueError("正在处理设置或输入，请完成后重试。")
-                store = mapping_presets.PresetStore(self._config_root)
+                store = app_profiles.AppProfileStore(self._config_root)
                 profile = self._selected_device_id()
+                source, device = self._live_voice_fields()
                 message = ""
                 if operation == "refresh":
                     pass
@@ -8204,22 +7444,44 @@ def _load_qt_classes() -> dict:
                         raise ValueError("请选择本地 JSON 配置文件。")
                     identity = store.import_file(Path(url.toLocalFile()), profile)
                     message = "配置已导入；点击“应用配置”后才会生效。"
+                elif operation == "save":
+                    identity = store.create(
+                        text, app_profiles.snapshot(self._bindings, profile),
+                        voice_input_source=source, voice_local_input_device=device)
+                    message = "配置已保存；点击“应用配置”可随时切回。"
                 else:
-                    if identity == mapping_presets.AUTO_ID:
+                    if identity == app_profiles.GLOBAL_ID:
                         if operation in ("rename", "delete"):
                             raise ValueError("自动保存项代表当前按键设置，不能重命名或删除。")
                         if self._mapping_dirty:
                             raise ValueError("当前映射尚未保存，请先完成自动保存或重试保存。")
-                        entry = {"id": mapping_presets.AUTO_ID, "name": mapping_presets.AUTO_NAME,
-                                 "profile": profile,
-                                 "mapping": mapping_presets.snapshot(self._bindings, profile)}
+                        entry = {"id": app_profiles.GLOBAL_ID, "name": app_profiles.GLOBAL_NAME,
+                                 "mapping": app_profiles.snapshot(self._bindings, profile),
+                                 "voice_input_source": source,
+                                 "voice_local_input_device": device}
                     else:
                         entry = store.get(identity)
-                    if entry["profile"] != profile:
-                        raise ValueError("所选配置与当前遥控器型号不符，请重新打开面板。")
                     if operation == "copy":
-                        identity = store.create(text, profile, entry["mapping"])
+                        if entry["id"] == app_profiles.GLOBAL_ID:
+                            identity = store.create(
+                                text, entry["mapping"],
+                                voice_input_source=entry["voice_input_source"],
+                                voice_local_input_device=entry["voice_local_input_device"])
+                        else:
+                            identity = store.copy_profile(
+                                identity, text, bindings=self._bindings, profile=profile)
                         message = "配置已复制。"
+                    elif operation == "update":
+                        if entry["id"] == app_profiles.GLOBAL_ID:
+                            raise ValueError("自动保存项就是当前按键设置，无需更新。")
+                        if (entry["scope"] == "app"
+                                and self._mapping_edit_target != identity):
+                            raise ValueError("请先在按键页切换到该应用配置，再更新它的按键。")
+                        store.update_content(
+                            identity,
+                            app_profiles.snapshot(self._active_edit_bindings(), profile),
+                            voice_input_source=source, voice_local_input_device=device)
+                        message = "配置已更新为当前按键和语音设置。"
                     elif operation == "rename":
                         store.rename(identity, text)
                         message = "配置已重命名。"
@@ -8230,17 +7492,39 @@ def _load_qt_classes() -> dict:
                     elif operation == "apply":
                         if self._mapping_dirty:
                             raise ValueError("当前映射尚未保存，请先完成自动保存或重试保存。")
-                        bindings = mapping_presets.apply_to(self._bindings, entry, profile)
+                        bindings = app_profiles.apply_to(self._bindings, entry, profile)
+                        conflict_buttons = app_profiles.voice_conflicts(
+                            bindings, entry["voice_input_source"], profile)
+                        if conflict_buttons:
+                            raise ValueError(app_profiles.voice_conflict_message(
+                                conflict_buttons) + "，然后再应用该配置。")
                         if not self._save_mapping(replacement=bindings):
                             raise ValueError("未能确认配置保存成功，请检查按键页的保存提示并重试。")
                         message = "配置已应用；正在按住的按键结束后生效。"
+                        switched = False
+                        target = (entry["voice_input_source"],
+                                  entry["voice_local_input_device"])
+                        if target != (source, device):
+                            updates = {"voice_input_source": target[0],
+                                       "voice_local_input_device": target[1]}
+                            if (target[0] == config.VOICE_INPUT_SOURCE_LOCAL
+                                    and not target[1]):
+                                devices = local_microphone_windows.list_input_devices()
+                                if devices:
+                                    updates["voice_local_input_device"] = devices[0]
+                            if not self._persist_voice_config_fields(updates):
+                                raise ValueError(
+                                    "按键已应用，但语音模式未能保存，请在语音页重新选择。")
+                            switched = True
+                        if switched:
+                            self.voiceInputSourceChanged.emit()
+                            self.localMicrophoneDeviceChanged.emit()
+                            message += " 语音模式已切换。"
                         try:
-                            store.mark_applied(profile, identity)
-                            self._mapping_applied_overrides.pop(profile, None)
+                            store.mark_applied(identity)
                         except Exception:
                             # Applying the mapping already succeeded. A separate marker failure
                             # must not misreport it as an unapplied configuration.
-                            self._mapping_applied_overrides[profile] = identity
                             message += " 应用标记未能保存，重启后可能无法保留加粗提示。"
                     elif operation == "export":
                         url = QUrl(text)
@@ -8278,7 +7562,7 @@ def _load_qt_classes() -> dict:
             not misled into thinking anything was written to disk.
             """
 
-            if self._voice_hotkey_busy:
+            if self.configurationReadOnly or self._voice_hotkey_busy:
                 return
 
             defaults = settings_ui.default_display_state(self._selected_device_id())
@@ -8287,12 +7571,7 @@ def _load_qt_classes() -> dict:
                 defaults.secondary_display_map,
                 {},
             )
-            self._set_voice_hotkey_text(
-                key_mapping.VoiceTriggerMode.HOLD,
-                defaults.voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD.value]
-            )
-            self._replace_voice_program_settings({})
-            self._set_voice_program_settings_dirty(True)
+            self._set_voice_hotkey_text(defaults.voice_hotkeys["hold"])
             self._mark_mapping_dirty()
             self._set_error_message("")
             self._set_status_message(
@@ -8302,10 +7581,9 @@ def _load_qt_classes() -> dict:
 
         @Slot(result=bool)
         def openUsageGuide(self) -> bool:
-            target = (
-                f"https://github.com/{application_update.REPOSITORY_SLUG}#readme"
+            result = shell_targets.open_external_target(
+                application_update.WEBSITE_GUIDE_URL
             )
-            result = shell_targets.open_external_target(target)
             self._report_external_target(result, self._DEVICE_PAGE_INDEX)
             return result.outcome is shell_targets.ExternalTargetOutcome.OPENED
 
@@ -8387,6 +7665,17 @@ def _load_qt_classes() -> dict:
             )
 
         def _application_update_package_kind(self):
+            release = self._application_update_release
+            if release is not None:
+                if (
+                    self._hid_helper_installed_distribution
+                    and release.installer is not None
+                ):
+                    return application_update.PackageKind.INSTALLER
+                if release.portable is not None:
+                    return application_update.PackageKind.PORTABLE
+                if release.installer is not None:
+                    return application_update.PackageKind.INSTALLER
             return (
                 application_update.PackageKind.INSTALLER
                 if self._hid_helper_installed_distribution
@@ -8428,6 +7717,13 @@ def _load_qt_classes() -> dict:
             return True
 
         def _start_application_update_check(self, *, silent: bool) -> bool:
+            if not APPLICATION_UPDATE_CHECK_ENABLED:
+                if not silent:
+                    self._set_error_message("")
+                    self._set_status_message(
+                        "本特别版已停用更新检查。", self._DEVICE_PAGE_INDEX
+                    )
+                return False
             if (
                 self._application_update_check_busy
                 or self._application_update_download_busy
@@ -8699,7 +7995,7 @@ def _load_qt_classes() -> dict:
             self._application_update_download_path = str(result.path)
             if result.package_kind is application_update.PackageKind.INSTALLER:
                 self._application_update_message = (
-                    "更新包已保存到桌面并通过校验。请先完全退出无线麦，再在文件夹中"
+                    "更新包已保存到桌面并通过校验。请先完全退出MiOpention，再在文件夹中"
                     "手动运行安装器；程序不会自动安装。"
                 )
             else:
@@ -8793,101 +8089,6 @@ def _load_qt_classes() -> dict:
             )
 
         @Slot()
-        def openVoiceProgramSettings(self) -> None:
-            try:
-                target = (
-                    voice_program_manager.resolve_voice_program_settings_target(
-                        self._voice_program_settings
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001 - Qt slot must not escape
-                self._set_status_message("")
-                self._set_error_message(
-                    f"无法查找语音程序设置入口（{exc}）",
-                    self._VOICE_PAGE_INDEX,
-                )
-                return
-            if not target.available:
-                if (
-                    target.provider_id
-                    == voice_program_manager.VOICE_PROGRAM_SOGOU
-                ):
-                    self._set_error_message("")
-                    self._set_status_message(
-                        "未安装搜狗语音，请在搜狗输入法 AI 工具箱中手动安装。",
-                        self._VOICE_PAGE_INDEX,
-                    )
-                    return
-                self._set_status_message("")
-                message = (
-                    "未找到微信输入法设置程序。"
-                    if target.provider_id
-                    == voice_program_manager.VOICE_PROGRAM_WETYPE
-                    else "未找到豆包输入法设置程序。"
-                    if target.provider_id
-                    == voice_program_manager.VOICE_PROGRAM_DOUBAO_IME
-                    else "未找到 Chatterfly 设置程序。"
-                    if target.provider_id
-                    == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
-                    else "当前语音程序没有可打开的设置入口。"
-                )
-                self._set_error_message(message, self._VOICE_PAGE_INDEX)
-                return
-
-            success_message = f"已打开{target.display_name}设置。"
-            if target.kind == "sogou_manual":
-                self._set_error_message("")
-                self._set_status_message(
-                    "请在任务栏通知区域（必要时先展开隐藏图标）右键搜狗语音图标，选择“设置”。",
-                    self._VOICE_PAGE_INDEX,
-                )
-                return
-            if target.kind == "sogou_toolbox":
-                try:
-                    voice_program_manager.open_voice_program_settings(
-                        Path(target.target),
-                        target.arguments,
-                    )
-                except Exception as exc:  # noqa: BLE001 - Qt slot must not escape
-                    self._set_status_message("")
-                    self._set_error_message(
-                        f"无法打开搜狗输入法 AI 工具箱（{exc}）",
-                        self._VOICE_PAGE_INDEX,
-                    )
-                    return
-                success_message = (
-                    "未安装搜狗语音，已打开 AI 工具箱，请手动安装。"
-                )
-            elif target.kind == "uri":
-                result = shell_targets.open_external_target(target.target)
-                if result.outcome is not shell_targets.ExternalTargetOutcome.OPENED:
-                    self._set_status_message("")
-                    self._set_error_message(
-                        f"无法打开{target.display_name}设置（{result.error}）",
-                        self._VOICE_PAGE_INDEX,
-                    )
-                    return
-            else:
-                try:
-                    voice_program_manager.open_voice_program_settings(
-                        Path(target.target),
-                        target.arguments,
-                    )
-                except Exception as exc:  # noqa: BLE001 - Qt slot must not escape
-                    self._set_status_message("")
-                    self._set_error_message(
-                        f"无法打开{target.display_name}设置（{exc}）",
-                        self._VOICE_PAGE_INDEX,
-                    )
-                    return
-
-            self._set_error_message("")
-            self._set_status_message(
-                success_message,
-                self._VOICE_PAGE_INDEX,
-            )
-
-        @Slot()
         def openSpeechSettings(self) -> None:
             self._report_external_target(
                 shell_targets.open_external_target(shell_targets.SPEECH_SETTINGS_URI),
@@ -8916,6 +8117,10 @@ def _load_qt_classes() -> dict:
             *,
             allow_driver_action: bool = False,
         ) -> bool:
+            if self.configurationReadOnly:
+                if completion is not None:
+                    completion(False, self._configuration_error)
+                return False
             if (
                 _vb_cable_test_active_event.is_set()
                 or self._voice_hotkey_busy
@@ -9514,6 +8719,8 @@ def _load_qt_classes() -> dict:
 
         @Slot()
         def startInitialDiagnostics(self) -> None:
+            if self._settings_controller.configurationReadOnly:
+                return
             if self._check_rows or self._is_refreshing:
                 return
             self.refreshDiagnostics()
@@ -9534,6 +8741,10 @@ def _load_qt_classes() -> dict:
             might not have time for.
             """
 
+            if self._settings_controller.configurationReadOnly:
+                self._diagnostics_error_message = "配置读取异常，请先导出日志排查；本次未启动设备检查。"
+                self.diagnosticsErrorMessageChanged.emit()
+                return
             if self._is_refreshing or self._vb_cable_test_running:
                 return
             if _diagnostics_shutdown_event.is_set():
@@ -9602,6 +8813,11 @@ def _load_qt_classes() -> dict:
 
         def _start_vb_cable_test(self, *, allow_bridge_restart: bool) -> None:
 
+            if self._settings_controller.configurationReadOnly:
+                self._set_vb_cable_test_state(
+                    "fail", "配置读取异常，本次未启动声音通道测试。", running=False,
+                )
+                return
             if self._vb_cable_test_running or self._is_refreshing:
                 return
             if _diagnostics_shutdown_event.is_set():
@@ -9727,9 +8943,7 @@ def _load_qt_classes() -> dict:
                         ):
                             try:
                                 restart_result = (
-                                    bridge_launcher.launch_in_process_bridge(
-                                        launch_voice_program_on_start=False
-                                    )
+                                    bridge_launcher.launch_in_process_bridge()
                                 )
                             except bridge_launcher.BridgeLaunchConfigurationError as exc:
                                 restart_result = bridge_launcher.LaunchResult(
@@ -10109,10 +9323,10 @@ def run_settings_window(
             # Notification cleanup must not skip input/audio shutdown.
             pass
         try:
-            provider_settled = controller.shutdownForProcessExit()
-            if not provider_settled:
+            background_settled = controller.shutdownForProcessExit()
+            if not background_settled:
                 logging_setup.get_logger(config.config_root()).error(
-                    "voice hotkey provider transaction did not settle before desktop shutdown"
+                    "settings background tasks did not settle before desktop shutdown"
                 )
         finally:
             try:

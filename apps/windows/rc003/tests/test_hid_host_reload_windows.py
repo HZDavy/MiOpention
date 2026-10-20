@@ -45,7 +45,7 @@ class HostReloadTests(unittest.TestCase):
 
     def test_fresh_host_needs_no_device_operation(self):
         self.mocks["loaded_gadget_paths"].return_value = []
-        with mock.patch("ovb_rc003.chromecast_gadget_windows.pending_injection_for_host",
+        with mock.patch("ovb_rc003.gadget_windows.pending_injection_for_host",
                         return_value=False) as pending:
             self.assertEqual(reload.ensure_reload_capable_host(1234, DLL), "fresh")
         pending.assert_called_once_with(1234)

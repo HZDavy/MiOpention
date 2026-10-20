@@ -27,7 +27,7 @@ class MouseHoldWiringTests(wiring._AppWiringTestCase):
         self.timers[-1].fire()
 
     def test_four_buttons_both_sources_hold_until_release_without_repeat_or_ten_second_guard(self):
-        for source in ("hid_tap", "chromecast"):
+        for source in ("hid_tap",):
             for kind, mouse in key_mapping.MOUSE_HOLD_BUTTONS.items():
                 with self.subTest(source=source, mouse=mouse):
                     self.bind(kind=kind)
@@ -99,22 +99,6 @@ class MouseHoldWiringTests(wiring._AppWiringTestCase):
         self.app._cancel_input_gestures({"home"}, reason="disconnect", block_until_release=True)
         self.send_mouse_button_up.assert_called_once_with("left")
         self.assertFalse(self.app._button_mouse_holds)
-
-    def test_reset_drains_multiple_mouse_buttons_even_if_one_up_fails(self):
-        self.bind("ok")
-        self.bind("home", key_mapping.ActionKind.MOUSE_RIGHT_HOLD)
-        self.press_long("ok")
-        self.press_long("home")
-        def up(button):
-            if button == "left":
-                raise win32_input.InputCleanupIncompleteError("blocked")
-        self.send_mouse_button_up.side_effect = up
-        self.app._cancel_chromecast_mappings()
-        self.assertFalse(self.app._button_mouse_holds)
-        self.assertEqual(self.app._button_hold_release_pending, {"left"})
-        self.assertFalse(self.app._release_chromecast_inputs())
-        self.send_mouse_button_up.side_effect = None
-        self.assertTrue(self.app._release_chromecast_inputs())
 
     def test_reserved_long_callback_cannot_press_after_release(self):
         self.bind()

@@ -85,7 +85,7 @@ Windows 适配；其它候选能力仍未进入 Windows 配置格式、运行时
 - 方向、返回和音量等适用动作的按住重复；
 - 自定义键盘组合键录入；
 - 打开 Codex、Claude、cmux、微信、Cursor、Slack、企业微信、网易云音乐、
-  Chrome、Edge、Zed 和无线麦设置等固定应用动作；
+  Chrome、Edge、Zed 和MiOpention+设置等固定应用动作；
 - 蓝牙、音频、HID tap、VB-CABLE、桥接进程和日志等 Windows 专属诊断；
 - 托盘入口、设置窗口和桥接进程分离；
 - 音频增益已经是配置值，当前默认 `gain_db=10.0`，但尚未在设置界面开放。

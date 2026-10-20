@@ -748,12 +748,16 @@ def physical_key_is_down_before_injection(
         }
         callback_revision = _PHYSICAL_RALT_CALLBACK_REVISION
         callbacks_in_flight = _PHYSICAL_RALT_CALLBACKS_IN_FLIGHT
-        if active and normalized == VK_RMENU and callbacks_in_flight:
+        if active and normalized in (VK_MENU, VK_RMENU) and callbacks_in_flight:
             return True
         if active and cached_down:
-            # Only the marked voice right-Alt path may reconcile a missed hook
-            # release. Every other modifier keeps the existing fail-closed rule.
-            if normalized != VK_RMENU or draining:
+            # Reconcile only a stale right-Alt owner. Generic Alt may reach this
+            # path for app-switch shortcuts, but left Alt remains fail-closed.
+            if (
+                normalized not in (VK_MENU, VK_RMENU)
+                or draining
+                or any(variant != VK_RMENU for variant in cached_down)
+            ):
                 return True
             newest_edge = max(changed_at.values(), default=0.0)
             if time.monotonic() - newest_edge <= _RALT_STALE_OWNER_GRACE_SECONDS:
@@ -782,13 +786,13 @@ def physical_key_is_down_before_injection(
         }
         current_callback_revision = _PHYSICAL_RALT_CALLBACK_REVISION
         current_callbacks_in_flight = _PHYSICAL_RALT_CALLBACKS_IN_FLIGHT
-        if normalized == VK_RMENU and current_callbacks_in_flight:
+        if normalized in (VK_MENU, VK_RMENU) and current_callbacks_in_flight:
             return True
         if (
             current_down != cached_down
             or current_revisions != revisions
             or (
-                normalized == VK_RMENU
+                normalized in (VK_MENU, VK_RMENU)
                 and current_callback_revision != callback_revision
             )
         ):

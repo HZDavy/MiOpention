@@ -100,6 +100,9 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
     def setUp(self):
         self.timers = []
         self.triggers = []
+        self.holds_started = []
+        self.holds_repeated = []
+        self.holds_ended = []
 
         def timer_factory(_delay, callback):
             timer = _FakeTimer(callback)
@@ -111,15 +114,23 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
                 (button == "up" and trigger == ButtonTrigger.SINGLE_CLICK)
                 or (button == "ok" and trigger == ButtonTrigger.DOUBLE_CLICK)
             ),
-            is_repeatable=lambda button: button == "up",
+            is_default_hold=lambda button: button == "up",
             on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
+            on_hold_start=lambda button, token: self.holds_started.append(
+                (button, token)
+            ),
+            on_hold_repeat=lambda button, token: self.holds_repeated.append(
+                (button, token)
+            ),
+            on_hold_end=lambda token: self.holds_ended.append(token),
             timer_factory=timer_factory,
         )
 
     def test_simple_button_emits_once_and_does_not_duplicate_on_repeat_press(self):
         self.dispatcher.press("up")
         self.dispatcher.press("up")
-        self.assertEqual(self.triggers, [("up", ButtonTrigger.SINGLE_CLICK)])
+        self.assertEqual(self.triggers, [])
+        self.assertEqual(len(self.holds_started), 1)
         self.dispatcher.release("up")
 
     def test_repeat_diagnostics_do_not_change_trigger_count(self):
@@ -134,13 +145,8 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
         self.timers[0].fire()
         self.dispatcher.release("up")
 
-        self.assertEqual(
-            self.triggers,
-            [
-                ("up", ButtonTrigger.SINGLE_CLICK),
-                ("up", ButtonTrigger.SINGLE_CLICK),
-            ],
-        )
+        self.assertEqual(self.triggers, [])
+        self.assertEqual(len(self.holds_repeated), 1)
         self.assertEqual(
             diagnostics[:3],
             [
@@ -153,6 +159,7 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
     def test_wheel_repeat_accelerates_and_release_cancels_next_step(self):
         delays = []
         timers = []
+        repeats = []
 
         def timer_factory(delay, callback):
             delays.append(delay)
@@ -162,8 +169,9 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
 
         dispatcher = ButtonGestureDispatcher(
             is_action_configured=lambda _button, trigger: trigger == ButtonTrigger.SINGLE_CLICK,
-            is_repeatable=lambda _button: True,
+            is_default_hold=lambda _button: True,
             on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
+            on_hold_repeat=lambda button, token: repeats.append((button, token)),
             repeat_interval_for=lambda _button, count: 0.05 if count >= 10 else 0.1,
             timer_factory=timer_factory,
         )
@@ -175,7 +183,7 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
         self.assertEqual(delays[10], 0.05)
         dispatcher.release("home")
         timers[-1].fire()
-        self.assertEqual(len(self.triggers), 11)
+        self.assertEqual(len(repeats), 10)
 
     def test_diagnostic_callback_failure_never_blocks_the_action(self):
         self.dispatcher._on_diagnostic = lambda *_args, **_fields: (_ for _ in ()).throw(
@@ -185,7 +193,9 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
         self.dispatcher.press("up")
         self.dispatcher.release("up")
 
-        self.assertEqual(self.triggers, [("up", ButtonTrigger.SINGLE_CLICK)])
+        self.assertEqual(self.triggers, [])
+        self.assertEqual(len(self.holds_started), 1)
+        self.assertEqual(self.holds_ended, [self.holds_started[0][1]])
 
     def test_double_click_timer_resolves_single_click(self):
         self.dispatcher.press("ok")
@@ -266,7 +276,6 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
             is_action_configured=lambda _button, trigger: (
                 trigger == ButtonTrigger.SINGLE_CLICK
             ),
-            is_repeatable=lambda _button: False,
             on_trigger=on_trigger,
             hold_timer_factory=lambda _delay, callback: _FakeTimer(callback),
         )
@@ -313,7 +322,6 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
             is_action_configured=lambda button, trigger: (
                 button == "ok" and trigger == ButtonTrigger.LONG_PRESS
             ),
-            is_repeatable=lambda button: False,
             on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
             timer_factory=lambda delay, callback: self._new_timer(callback),
         )
@@ -341,20 +349,25 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
         self.dispatcher.reset()
         stale_callback()
 
-        self.assertEqual(self.triggers, [("up", ButtonTrigger.SINGLE_CLICK)])
+        self.assertEqual(self.triggers, [])
+        self.assertEqual(self.holds_repeated, [])
 
     def test_cancel_one_button_preserves_another_active_repeat(self):
         repeat_timers = []
         hold_timers = []
+        holds_started = []
+        holds_repeated = []
         dispatcher = ButtonGestureDispatcher(
             is_action_configured=lambda button, trigger: (
                 button in {"up", "right"}
                 and trigger == ButtonTrigger.SINGLE_CLICK
             ),
-            is_repeatable=lambda button: button in {"up", "right"},
+            is_default_hold=lambda button: button in {"up", "right"},
             on_trigger=lambda button, trigger: self.triggers.append(
                 (button, trigger)
             ),
+            on_hold_start=lambda button, token: holds_started.append(button),
+            on_hold_repeat=lambda button, token: holds_repeated.append(button),
             timer_factory=lambda _delay, callback: repeat_timers.append(
                 _FakeTimer(callback)
             )
@@ -370,14 +383,9 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
         dispatcher.cancel_buttons({"right"})
         repeat_timers[0].fire()
 
-        self.assertEqual(
-            self.triggers,
-            [
-                ("up", ButtonTrigger.SINGLE_CLICK),
-                ("right", ButtonTrigger.SINGLE_CLICK),
-                ("up", ButtonTrigger.SINGLE_CLICK),
-            ],
-        )
+        self.assertEqual(holds_started, ["up", "right"])
+        self.assertEqual(holds_repeated, ["up"])
+        self.assertEqual(self.triggers, [])
         self.assertFalse(repeat_timers[0].cancelled)
         self.assertTrue(repeat_timers[1].cancelled)
         self.assertTrue(dispatcher.has_active_gestures())
@@ -433,13 +441,8 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
 
         stale_callback()
 
-        self.assertEqual(
-            self.triggers,
-            [
-                ("up", ButtonTrigger.SINGLE_CLICK),
-                ("up", ButtonTrigger.SINGLE_CLICK),
-            ],
-        )
+        self.assertEqual(self.triggers, [])
+        self.assertEqual(len(self.holds_started), 2)
         self.assertEqual(len(self.timers), 2)
 
     def test_stale_long_timer_cannot_trigger_a_new_hold_early(self):
@@ -447,7 +450,6 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
             is_action_configured=lambda button, trigger: (
                 button == "ok" and trigger == ButtonTrigger.LONG_PRESS
             ),
-            is_repeatable=lambda button: False,
             on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
             timer_factory=lambda delay, callback: self._new_timer(callback),
         )
@@ -464,21 +466,23 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
     def test_release_cancels_repeat_while_action_callback_is_blocked(self):
         callback_started = threading.Event()
         allow_callback_to_finish = threading.Event()
-        idle_calls = []
+        holds_repeated = []
+        holds_ended = []
 
-        def on_trigger(button, trigger):
-            self.triggers.append((button, trigger))
-            if len(self.triggers) > 1:
-                callback_started.set()
-                allow_callback_to_finish.wait(1.0)
+        def on_hold_repeat(button, token):
+            holds_repeated.append((button, token))
+            callback_started.set()
+            allow_callback_to_finish.wait(1.0)
 
         self.dispatcher = ButtonGestureDispatcher(
             is_action_configured=lambda button, trigger: (
                 button == "up" and trigger == ButtonTrigger.SINGLE_CLICK
             ),
-            is_repeatable=lambda button: button == "up",
-            on_trigger=on_trigger,
-            on_idle=lambda: idle_calls.append("idle"),
+            is_default_hold=lambda button: button == "up",
+            on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
+            on_hold_start=lambda button, token: None,
+            on_hold_repeat=on_hold_repeat,
+            on_hold_end=lambda token: holds_ended.append(token),
             timer_factory=lambda delay, callback: self._new_timer(callback),
         )
         self.dispatcher.press("up")
@@ -491,61 +495,45 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
             target=lambda: (self.dispatcher.release("up"), release_finished.set())
         )
         release_thread.start()
-        self.assertTrue(release_finished.wait(0.5))
+        # Release must wait for the in-flight key-down replay to finish, so the
+        # final key-up can never overtake a key-down still being injected.
+        self.assertFalse(release_finished.wait(0.2))
         allow_callback_to_finish.set()
         repeat_thread.join(1.0)
         release_thread.join(1.0)
 
         self.assertFalse(repeat_thread.is_alive())
         self.assertFalse(release_thread.is_alive())
-        self.assertEqual(len(self.timers), 1)
-        self.assertEqual(idle_calls, ["idle"])
+        self.assertEqual(len(holds_repeated), 1)
+        self.assertEqual(holds_ended, [holds_repeated[0][1]])
+        self.assertEqual(self.triggers, [])
+        self.assertFalse(self.dispatcher.has_active_gestures())
 
-    def test_repeat_stops_if_the_current_mapping_is_no_longer_repeatable(self):
-        repeatable = {"up": True}
-        self.dispatcher = ButtonGestureDispatcher(
-            is_action_configured=lambda button, trigger: (
-                button == "up" and trigger == ButtonTrigger.SINGLE_CLICK
-            ),
-            is_repeatable=lambda button: repeatable.get(button, False),
-            on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
-            timer_factory=lambda delay, callback: self._new_timer(callback),
-        )
+    def test_released_hold_ignores_a_late_repeat_timer(self):
         self.dispatcher.press("up")
-        repeatable["up"] = False
+        stale_callback = self.timers[0].callback
 
-        self.timers[0].fire()
+        self.dispatcher.release("up")
+        # Bypass the timer cancellation to simulate a repeat that was already
+        # queued on the timer thread before the release won the race.
+        stale_callback()
 
-        self.assertEqual(self.triggers, [("up", ButtonTrigger.SINGLE_CLICK)])
-        self.assertEqual(len(self.timers), 1)
+        self.assertEqual(self.triggers, [])
+        self.assertEqual(self.holds_repeated, [])
+        self.assertEqual(len(self.holds_ended), 1)
 
-    def test_repeat_is_not_rescheduled_if_mapping_changes_during_callback(self):
-        repeatable = {"up": True}
+    def test_cancel_during_a_repeat_callback_stops_further_repeats(self):
+        def on_hold_repeat(button, token):
+            self.holds_repeated.append((button, token))
+            self.dispatcher.cancel_buttons({button})
 
-        def on_trigger(button, trigger):
-            self.triggers.append((button, trigger))
-            if len(self.triggers) > 1:
-                repeatable[button] = False
-
-        self.dispatcher = ButtonGestureDispatcher(
-            is_action_configured=lambda button, trigger: (
-                button == "up" and trigger == ButtonTrigger.SINGLE_CLICK
-            ),
-            is_repeatable=lambda button: repeatable.get(button, False),
-            on_trigger=on_trigger,
-            timer_factory=lambda delay, callback: self._new_timer(callback),
-        )
+        self.dispatcher._on_hold_repeat = on_hold_repeat
         self.dispatcher.press("up")
 
         self.timers[0].fire()
 
-        self.assertEqual(
-            self.triggers,
-            [
-                ("up", ButtonTrigger.SINGLE_CLICK),
-                ("up", ButtonTrigger.SINGLE_CLICK),
-            ],
-        )
+        self.assertEqual(self.triggers, [])
+        self.assertEqual(len(self.holds_repeated), 1)
         self.assertEqual(len(self.timers), 1)
 
     def test_double_click_timer_creation_failure_resolves_one_single_click(self):
@@ -555,7 +543,6 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
                 and trigger
                 in {ButtonTrigger.SINGLE_CLICK, ButtonTrigger.DOUBLE_CLICK}
             ),
-            is_repeatable=lambda _button: False,
             on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
             timer_factory=lambda _delay, _callback: (_ for _ in ()).throw(
                 RuntimeError("timer unavailable")
@@ -576,7 +563,6 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
                 and trigger
                 in {ButtonTrigger.SINGLE_CLICK, ButtonTrigger.LONG_PRESS}
             ),
-            is_repeatable=lambda _button: False,
             on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
             timer_factory=lambda _delay, callback: _FakeTimer(
                 callback,
@@ -593,13 +579,17 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
         dispatcher.release("ok")
         self.assertFalse(dispatcher.has_active_gestures())
 
-    def test_initial_repeat_timer_creation_failure_keeps_only_initial_click(self):
+    def test_initial_repeat_timer_creation_failure_keeps_only_the_hold(self):
+        holds_started = []
+        holds_repeated = []
         dispatcher = ButtonGestureDispatcher(
             is_action_configured=lambda button, trigger: (
                 button == "up" and trigger == ButtonTrigger.SINGLE_CLICK
             ),
-            is_repeatable=lambda button: button == "up",
+            is_default_hold=lambda button: button == "up",
             on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
+            on_hold_start=lambda button, token: holds_started.append((button, token)),
+            on_hold_repeat=lambda button, token: holds_repeated.append((button, token)),
             timer_factory=lambda _delay, _callback: (_ for _ in ()).throw(
                 RuntimeError("timer unavailable")
             ),
@@ -610,11 +600,15 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
         dispatcher.press("up")
         dispatcher.release("up")
 
-        self.assertEqual(self.triggers, [("up", ButtonTrigger.SINGLE_CLICK)])
+        self.assertEqual(self.triggers, [])
+        self.assertEqual(len(holds_started), 1)
+        self.assertEqual(holds_repeated, [])
         self.assertFalse(dispatcher.has_active_gestures())
 
     def test_repeat_reschedule_failure_stops_repeating_but_releases_cleanly(self):
         timers = []
+        holds_repeated = []
+        holds_ended = []
 
         def timer_factory(_delay, callback):
             if timers:
@@ -627,8 +621,11 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
             is_action_configured=lambda button, trigger: (
                 button == "up" and trigger == ButtonTrigger.SINGLE_CLICK
             ),
-            is_repeatable=lambda button: button == "up",
+            is_default_hold=lambda button: button == "up",
             on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
+            on_hold_start=lambda button, token: None,
+            on_hold_repeat=lambda button, token: holds_repeated.append((button, token)),
+            on_hold_end=lambda token: holds_ended.append(token),
             timer_factory=timer_factory,
             hold_timer_factory=lambda _delay, callback: _FakeTimer(callback),
         )
@@ -637,22 +634,20 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
         timers[0].fire()
         dispatcher.release("up")
 
-        self.assertEqual(
-            self.triggers,
-            [
-                ("up", ButtonTrigger.SINGLE_CLICK),
-                ("up", ButtonTrigger.SINGLE_CLICK),
-            ],
-        )
+        self.assertEqual(self.triggers, [])
+        self.assertEqual(len(holds_repeated), 1)
+        self.assertEqual(len(holds_ended), 1)
         self.assertFalse(dispatcher.has_active_gestures())
 
     def test_hold_guard_start_failure_never_leaves_a_repeat_or_hold_latched(self):
+        holds_started = []
         dispatcher = ButtonGestureDispatcher(
             is_action_configured=lambda button, trigger: (
                 button == "up" and trigger == ButtonTrigger.SINGLE_CLICK
             ),
-            is_repeatable=lambda button: button == "up",
+            is_default_hold=lambda button: button == "up",
             on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
+            on_hold_start=lambda button, token: holds_started.append((button, token)),
             timer_factory=lambda _delay, callback: _FakeTimer(callback),
             hold_timer_factory=lambda _delay, callback: _FakeTimer(
                 callback,
@@ -664,7 +659,8 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
         dispatcher.press("up")
         dispatcher.release("up")
 
-        self.assertEqual(self.triggers, [("up", ButtonTrigger.SINGLE_CLICK)])
+        self.assertEqual(self.triggers, [])
+        self.assertEqual(holds_started, [])
         self.assertFalse(dispatcher.has_active_gestures())
 
     def test_timer_cancel_failure_still_clears_all_dispatcher_state(self):
@@ -682,7 +678,6 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
             is_action_configured=lambda button, trigger: (
                 button == "ok" and trigger == ButtonTrigger.DOUBLE_CLICK
             ),
-            is_repeatable=lambda _button: False,
             on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
             timer_factory=timer_factory,
             hold_timer_factory=timer_factory,
@@ -701,6 +696,116 @@ class ButtonGestureDispatcherTests(unittest.TestCase):
         timer = _FakeTimer(callback)
         self.timers.append(timer)
         return timer
+
+
+class DefaultHoldGestureTests(unittest.TestCase):
+    """A button with no configured secondary action holds its single key.
+
+    Every button that is neither a mouse-button hold nor a voice action and
+    that has no configured long-press/double-click action turns its physical
+    press into one sustained hold of the single-click key: a single hold-start
+    at press time, the matching hold-end only on release, and a stream of
+    key-down replays in between - never a tap and never a stream of taps.
+    """
+
+    def setUp(self):
+        self.timers = []
+        self.hold_timers = []
+        self.triggers = []
+        self.holds_started = []
+        self.holds_repeated = []
+        self.holds_ended = []
+
+        def timer_factory(_delay, callback):
+            timer = _FakeTimer(callback)
+            self.timers.append(timer)
+            return timer
+
+        def hold_timer_factory(_delay, callback):
+            timer = _FakeTimer(callback)
+            self.hold_timers.append(timer)
+            return timer
+
+        self.dispatcher = ButtonGestureDispatcher(
+            is_action_configured=lambda _button, trigger: (
+                trigger == ButtonTrigger.SINGLE_CLICK
+            ),
+            is_default_hold=lambda button: button in {"tv", "up"},
+            on_trigger=lambda button, trigger: self.triggers.append((button, trigger)),
+            on_hold_start=lambda button, token: self.holds_started.append(
+                (button, token)
+            ),
+            on_hold_repeat=lambda button, token: self.holds_repeated.append(
+                (button, token)
+            ),
+            on_hold_end=lambda token: self.holds_ended.append(token),
+            timer_factory=timer_factory,
+            hold_timer_factory=hold_timer_factory,
+        )
+
+    def test_default_hold_starts_one_hold_and_ends_it_on_release(self):
+        self.dispatcher.press("tv")
+
+        self.assertEqual(len(self.holds_started), 1)
+        self.assertEqual(self.holds_started[0][0], "tv")
+        self.assertEqual(self.triggers, [])
+        self.assertEqual(len(self.timers), 1)
+        self.assertTrue(self.dispatcher.has_active_gestures())
+
+        self.dispatcher.release("tv")
+
+        self.assertEqual(self.holds_ended, [self.holds_started[0][1]])
+        self.assertEqual(self.triggers, [])
+        self.assertFalse(self.dispatcher.has_active_gestures())
+
+    def test_default_hold_ignores_a_second_press_before_release(self):
+        self.dispatcher.press("tv")
+        self.dispatcher.press("tv")
+
+        self.assertEqual(len(self.holds_started), 1)
+        self.assertEqual(self.triggers, [])
+
+    def test_default_hold_survives_the_ten_second_guard_until_release(self):
+        self.dispatcher.press("tv")
+        self.assertEqual(len(self.hold_timers), 1)
+
+        # The ten second guard must not end the hold - the key stays down
+        # until the physical button is released, so the gesture still owns the
+        # mapping and no idle callback may fire.
+        self.hold_timers[0].fire()
+
+        self.assertEqual(self.holds_ended, [])
+        self.assertTrue(self.dispatcher.has_active_gestures())
+
+        self.dispatcher.release("tv")
+
+        self.assertEqual(self.holds_ended, [self.holds_started[0][1]])
+        self.assertFalse(self.dispatcher.has_active_gestures())
+
+    def test_held_button_replays_its_key_down_until_release(self):
+        self.dispatcher.press("up")
+
+        self.assertEqual(self.triggers, [])
+        self.assertEqual(len(self.holds_started), 1)
+        self.assertEqual(len(self.timers), 1)
+
+        self.timers[0].fire()
+
+        self.assertEqual(len(self.holds_repeated), 1)
+        self.assertEqual(len(self.timers), 2)
+
+        self.dispatcher.release("up")
+
+        self.assertEqual(self.triggers, [])
+        self.assertEqual(self.holds_ended, [self.holds_started[0][1]])
+
+    def test_reset_releases_an_active_default_hold(self):
+        self.dispatcher.press("tv")
+
+        self.dispatcher.reset()
+
+        self.assertEqual(self.holds_ended, [self.holds_started[0][1]])
+        self.assertFalse(self.dispatcher.has_active_gestures())
 
 
 if __name__ == "__main__":

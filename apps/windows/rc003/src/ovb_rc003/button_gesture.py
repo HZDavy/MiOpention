@@ -7,10 +7,11 @@ small amount of timer/repeat plumbing needed by the Raw Input callback.
 
 The important contract is deliberately explicit:
 
-* a button with no secondary action keeps immediate single-click behavior;
+* a button with no secondary action holds its single-click key for the whole
+  physical press, replaying only the key-down at the caller's repeat rate;
 * configuring double-click delays the single action by 300 ms;
 * configuring long-press fires it at 550 ms and suppresses single-click;
-* any configured secondary action disables ordinary hold-repeat.
+* any configured secondary action replaces the ordinary hold.
 
 The physical microphone button never enters this module.  The app routes it
 through the ATVV voice lifecycle, matching the reference implementation.
@@ -176,7 +177,7 @@ class ButtonGestureRecognizer:
 TimerFactory = Callable[[float, Callable[[], None]], object]
 ActionConfigured = Callable[[str, ButtonTrigger], bool]
 TriggerCallback = Callable[[str, ButtonTrigger], None]
-RepeatableCallback = Callable[[str], bool]
+HoldRepeatCallback = Callable[[str, object], None]
 RepeatIntervalCallback = Callable[[str, int], float]
 IdleCallback = Callable[[], None]
 DiagnosticCallback = Callable[..., None]
@@ -195,32 +196,33 @@ class ButtonGestureDispatcher:
     LONG_PRESS_SECONDS = 0.550
     REPEAT_DELAY_SECONDS = 0.350
     REPEAT_INTERVAL_SECONDS = 0.100
-    BACK_REPEAT_INTERVAL_SECONDS = 0.050
     MAX_HOLD_SECONDS = 10.0
 
     def __init__(
         self,
         *,
         is_action_configured: ActionConfigured,
-        is_repeatable: RepeatableCallback,
         on_trigger: TriggerCallback,
         repeat_interval_for: Optional[RepeatIntervalCallback] = None,
         on_idle: Optional[IdleCallback] = None,
         on_diagnostic: Optional[DiagnosticCallback] = None,
         timer_factory: Optional[TimerFactory] = None,
         hold_timer_factory: Optional[TimerFactory] = None,
+        is_default_hold: Optional[Callable[[str], bool]] = None,
         is_sustained: Optional[Callable[[str], bool]] = None,
         on_hold_start: Optional[Callable[[str, object], None]] = None,
+        on_hold_repeat: Optional[HoldRepeatCallback] = None,
         on_hold_end: Optional[Callable[[object], None]] = None,
     ) -> None:
         self._is_action_configured = is_action_configured
-        self._is_repeatable = is_repeatable
         self._repeat_interval_for = repeat_interval_for
         self._on_trigger = on_trigger
         self._on_idle = on_idle
         self._on_diagnostic = on_diagnostic
+        self._is_default_hold = is_default_hold or (lambda button: False)
         self._is_sustained = is_sustained or (lambda button: False)
         self._on_hold_start = on_hold_start or (lambda button, token: on_trigger(button, ButtonTrigger.LONG_PRESS))
+        self._on_hold_repeat = on_hold_repeat or (lambda button, token: None)
         self._on_hold_end = on_hold_end or (lambda token: None)
         self._sustained_tokens: Dict[str, object] = {}
         self._timer_factory = timer_factory or (
@@ -248,6 +250,7 @@ class ButtonGestureDispatcher:
 
     def press(self, button_id: str) -> None:
         callbacks: List[ButtonTrigger] = []
+        sustained_token: Optional[object] = None
         with self._lock:
             if button_id in self._blocked_until_release_buttons:
                 return
@@ -268,14 +271,23 @@ class ButtonGestureDispatcher:
                 callbacks.append(ButtonTrigger.SINGLE_CLICK)
                 if not self._schedule_hold_guard_locked(button_id):
                     self._rollback_button_hold_locked(button_id)
-                elif self._is_repeatable(button_id):
-                    hold_token = object()
-                    self._repeat_hold_tokens[button_id] = hold_token
+                    if self._is_default_hold(button_id):
+                        callbacks = []
+                elif self._is_default_hold(button_id):
+                    # A button whose single-click action is an ordinary key
+                    # press holds that key for the whole physical hold: the
+                    # action becomes a key-down at press time and the matching
+                    # key-up only arrives on release.  Because injected keys
+                    # never auto-repeat, the same key-down is replayed at the
+                    # caller's repeat rate until the button is released.
+                    sustained_token = object()
+                    self._sustained_tokens[button_id] = sustained_token
+                    self._repeat_hold_tokens[button_id] = sustained_token
                     self._repeat_counts[button_id] = 0
                     if not self._schedule_repeat_locked(
                         button_id,
                         self.REPEAT_DELAY_SECONDS,
-                        hold_token,
+                        sustained_token,
                     ):
                         self._repeat_hold_tokens.pop(button_id, None)
             else:
@@ -298,19 +310,19 @@ class ButtonGestureDispatcher:
             callbacks,
             generation,
             button_generation,
+            require_sustained_token=sustained_token,
             reservation=reservation,
         )
 
     def release(self, button_id: str) -> None:
         # Sustained actions serialize their final down/up with timer callbacks.
         # Ordinary releases retain the existing nonblocking repeat cancellation.
-        if self._is_sustained(button_id):
+        with self._lock:
+            token = self._sustained_tokens.get(button_id)
+        if token is not None:
             with self._callback_lock:
-                with self._lock:
-                    token = self._sustained_tokens.get(button_id)
                 self._release(button_id)
-                if token is not None:
-                    self._on_hold_end(token)
+                self._on_hold_end(token)
         else:
             self._release(button_id)
 
@@ -415,6 +427,7 @@ class ButtonGestureDispatcher:
             return bool(
                 self._held_immediate_buttons
                 or self._repeat_hold_tokens
+                or self._sustained_tokens
                 or self._callback_reservations
                 or self._recognizer.has_active_gestures()
             )
@@ -674,11 +687,6 @@ class ButtonGestureDispatcher:
                 self._repeat_timers.pop(button_id, None)
                 self._repeat_timer_tokens.pop(button_id, None)
                 return
-            if not self._is_repeatable(button_id):
-                self._repeat_timers.pop(button_id, None)
-                self._repeat_timer_tokens.pop(button_id, None)
-                self._repeat_hold_tokens.pop(button_id, None)
-                return
             self._repeat_timers.pop(button_id, None)
             self._repeat_timer_tokens.pop(button_id, None)
             reservation = self._reserve_callbacks_locked(
@@ -705,7 +713,6 @@ class ButtonGestureDispatcher:
                 generation != self._generation
                 or self._repeat_hold_tokens.get(button_id) is not hold_token
                 or button_id not in self._held_immediate_buttons
-                or not self._is_repeatable(button_id)
             ):
                 if self._repeat_hold_tokens.get(button_id) is hold_token:
                     self._repeat_hold_tokens.pop(button_id, None)
@@ -715,8 +722,6 @@ class ButtonGestureDispatcher:
                 interval = (
                     self._repeat_interval_for(button_id, repeat_count)
                     if self._repeat_interval_for is not None
-                    else self.BACK_REPEAT_INTERVAL_SECONDS
-                    if button_id == "back"
                     else self.REPEAT_INTERVAL_SECONDS
                 )
                 if not self._schedule_repeat_locked(
@@ -799,6 +804,11 @@ class ButtonGestureDispatcher:
                             return emitted
                     if require_sustained_token is not None:
                         self._on_hold_start(button_id, require_sustained_token)
+                    elif require_hold_token is not None:
+                        # A held button replays only the key-down so the target
+                        # sees the same sustained press a physical keyboard
+                        # produces while a key stays down.
+                        self._on_hold_repeat(button_id, require_hold_token)
                     else:
                         self._on_trigger(button_id, trigger)
                     emitted = True

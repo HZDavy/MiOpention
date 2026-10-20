@@ -9,7 +9,7 @@
 
 ## 文档定位
 
-本文是独立维护的无线麦 Windows 客户端的项目认知主入口。它依据源码
+本文是独立维护的MiOpention+ Windows 客户端的项目认知主入口。它依据源码
 检查、现有测试、构建安装链和已经取得的真机反馈，沉淀以后接手项目时仍然
 需要知道的背景与原理，主要回答：
 
@@ -87,7 +87,8 @@ RC003 原本是面向电视/机顶盒的蓝牙语音遥控器。Windows 可以�
 - Remote Mic 主项目调研快照：`HD838A/remote-mic-app` 的 `main` 在
   2026-08-20 核验为 `4d526175817ad2c4c5fbe1650d528c946a3cdbf3`，主要维护
   macOS，不是本 Windows 客户端的直接代码基线。
-- 当前 Windows 公共仓库：`ZSTDJan/windows-remote-mic-app`；本地维护历史最初从
+- 当前 Windows 公共仓库：`HZDavy/MiOpention`（2026-10-20 由
+  `HZDavy/windows-remote-mic-app` 改名）；本地维护历史最初从
   `miaomiaozii/windows-remote-mic-app` 派生。
 - Windows 派生起点：`271ed7947eec19c4c691ed3ba97f338461be8051`；内部实现
   基于 GPL-3.0-only 项目 `nijez/open-voice-bridge` 的 Windows RC003 客户端。
@@ -319,9 +320,10 @@ Windows 的物理边沿，不执行映射。tap 从 `READY` 变为失联或异�
 `raw_input_windows.physical_signature()` 把可移植的键盘/HID字段组成签名；
 签名不包含设备接口路径。`physical_bindings` 可把未知签名学习为逻辑按钮。
 
-`button_gesture.py` 在单击、双击、长按和可重复按住之间做纯状态机判定。
-连接清理会递增 generation 并取消定时器，旧连接的延迟回调不能在重连后产生
-动作。
+`button_gesture.py` 在单击、双击和长按之间做纯状态机判定。长按统一为 sustained：
+按键仍被按住时只补发该键自身的 key-down，不发送 key-up，由系统与前台程序看到
+连续的按下状态。连接清理会递增 generation 并取消定时器，旧连接的延迟回调不能在
+重连后产生动作。
 
 `key_mapping.py` 保存语义动作，而不是界面文字。`app.py` 再把语义动作交给：
 
@@ -337,9 +339,15 @@ Windows 的物理边沿，不执行映射。tap 从 `READY` 变为失联或异�
 专用语音发送器保持各自已有合同，不因普通键补码改写。对应验证见
 `TESTING.md` 的 `CHECK-KEY-SCAN-001`。
 
-麦克风键配置为普通动作时仍可使用单击、双击和长按。只有方向、退格、音量和滚轮
-语义动作允许按住重复，且滚轮仍受实体键连发白名单限制；自定义组合键无论放在方向键还是其他键上，都只执行
-一次完整点按，避免定时重放修饰键组合。
+麦克风键配置为普通动作时仍可使用单击、双击和长按。未配置长按动作的按键在按住
+期间的行为按注入后端分化（2026-10-19）：方向键、退格和音量在 `SendInput`（默认）
+时保留连击，初次点按发一次完整 down+up，之后每次重复重放同一完整点按，因为
+`SendInput` 注入不触发 Windows 原生 typematic 自动重复；只有 `Interception`
+（驱动级）保持 sustained，按住期间只补发该动作自身的 key-down、松手才发一次
+key-up，因为驱动级会模拟 Windows 长按。滚轮、自定义组合键、ESC、菜单键等不在
+方向/退格/音量名单内的动作仍统一为 sustained：持续补发自身 key-down，不重放完整
+点按，也不在按住期间发送 key-up。元素导航仍按点按处理。只有显式配置了长按动作的
+键才在长按阈值处切换到另一个动作。
 
 配置迁移先执行产品边界归一化。旧开关型、非话筒键语音或次级手势语音会把
 对应整键标记为停用，连同该键的单击、双击和长按一起停止执行，直到用户在
@@ -373,9 +381,9 @@ Windows 的物理边沿，不执行映射。tap 从 `READY` 变为失联或异�
 已被全局钩子吞下的输入不会进入该分支。Qt 按下/松开所有权与 RC003 原始边沿关联
 分离，退出后的已认领松键仍完成清理，不将普通字符或修饰组合认领为导航。
 
-谷歌接收器的 `chromecast_hid_tap_windows` 在校验驱动布局和所选适配器地址后读取输入。
-2026-09-28 源码兼容 A 款 8 字节内部键码及 B 款 2 字节 Consumer usage；后者通过
-`remote_layout.CHROMECAST_CONSUMER_USAGES` 转换成既有内部格式，再交给同一
+遥控器接收器在校验驱动布局和所选适配器地址后读取输入。
+2026-09-28 源码兼容 A 款 8 字节内部键码及 B 款 2 字节 Consumer usage；后者
+转换成既有内部格式，再交给同一
 `HidButtonReceiver` 处理按下、重复和松开。未知 usage 不映射，不修改 Windows 缓冲区。
 同宿主下游复制计数继续仅作诊断，不能替代所选地址的来源证明。
 
@@ -391,7 +399,7 @@ ContainerId，HID 宿主定位经节点 ContainerID 取得同一身份。共享�
 核实时仍拒绝接管，并显示 `selected_device_shared_host`；这不等于必须重启电脑。
 独立诊断的未传选择参数路径保留旧多候选 ATVV 探测，生产桥接不得使用该路径。
 
-谷歌的独立入口 `chromecast_device_windows.SelectedDevice.open_voice` 枚举所选设备的
+独立入口 `SelectedDevice.open_voice` 枚举所选设备的
 实时 GATT 服务，服务查询最多等待 10 秒。直接 WinRT 路径先创建所选设备的 `GattSession`
 并启用保持连接，服务查询后确认会话活跃；会话创建和活跃等待分别上限 5 秒。按完整 ATVV
 UUID 选择唯一 TX/AUDIO/CONTROL，验证接口属性，以实际特征对象订阅、实际声明句柄路由；
@@ -400,11 +408,11 @@ UUID 选择唯一 TX/AUDIO/CONTROL，验证接口属性，以实际特征对象�
 失败或取消也执行清理；服务或会话关闭失败时保留引用供最终清理再试，失败状态禁止重开。
 普通按键、心跳和停止处理继续独立运行。
 初次服务查询超时或返回不可达时，可补查一次缓存接口供诊断，缓存结果不启用语音。
-初次会话/连接超时或服务不可达时，`chromecast_hid_worker` 仅在同次运行出现所选普通按键
+初次会话/连接超时或服务不可达时，HID worker 仅在同次运行出现所选普通按键
 活动后补试一次；不重试未知布局、
 权限或能力协商失败，不重启蓝牙适配器。异步查询期间继续接收普通按键、心跳和停止请求。
-当前源码与设备待测边界见 `CHECK-CHROMECAST-B-VOICE-SESSION-001`；本轮连接和接口修改
-已进入 `.79` 本地测试包，旧 `.78` 包对应此前 `CHECK-CHROMECAST-B-CONSUMER-VOICE-001`。
+当前源码与设备待测边界见 `CHECK-REMOTE-B-VOICE-SESSION-001`；本轮连接和接口修改
+已进入 `.79` 本地测试包，旧 `.78` 包对应此前 `CHECK-REMOTE-B-CONSUMER-VOICE-001`。
 
 连接后主要特征为：
 
@@ -452,6 +460,50 @@ producer lock 保护。一般控制仍优先，但 `AUDIO_STOP` 必须先排空�
 同一实体会话的按下和抬起；运行时保存本次实际发送的快捷键与后端，设置变化不能把
 旧会话的抬起发到新组合键。
 
+语音输入分两种模式（2026-10-20）。**模式1** 用遥控器自带麦克风，并且只允许
+遥控器话筒键触发语音1：`voiceSlotEditable()` 让语音2 在设置页只读，按键页拒绝把
+语音动作放到非话筒键。模式1 只支持长按，并且**按下即注入、松手即结束**（2026-10-20
+重打 8 删除 0.55 秒短按守卫）：HID 物理边沿、ATVV `MicButtonPressed` 与
+`AudioStarted` 三条触发路径都在按下瞬间下发快捷键 key-down，宿主输入法因此零延迟
+弹出；释放由物理松手或 `AudioStopped` 推断，立即补 key-up，且模式1 的短按一律
+判为 CLOSE 而不锁存（遥控器只在按住期间送音频，锁存会让界面显示录音中却没有声音）。
+代价：短按会让输入法收到一次极短按压。补偿手段是可选项
+`voice_short_press_dismiss`（默认 `False`，语音页「短按补偿」开关）：打开后模式1
+的短按在释放时按**真人双击的节奏**补发一次同一快捷键，形成
+down/up/[90 ms]/down/[30 ms]/up 的自动双击，让输入法把刚弹出的面板关掉（2026-10-20
+重打 10 修正：此前补发紧跟在松手后 3 ms 内完成，驱动级注入下输入法面板还没真正
+创建，第二次按键被当作重复事件吞掉，真机表现为补偿不生效）。补发由
+`_dismiss_short_voice_press_locked()` 排定延迟定时器，定时器到点后在
+`_voice_shortcut.lock` 内复核「仍是模式1、开关仍开、没有新的按住会话、没有物理源
+仍按下」才按下，再单独排一个保持 30 ms 的松开定时器；松手定时器不会被下一次短按
+取消，保证补发按下过的键一定松开。补发按下时显式把该按键自己的 `inject_mode`
+传给 `_release_voice_shortcut_edge_locked()`，down/up 成对走同一后端（`SendInput`
+或驱动级），不再依赖 `pending_inject_mode`。长按不补发，模式2 不参与；物理松手与
+`AudioStopped` 两条释放路径都在短按判定（`LATCH` 被强转为 `CLOSE`）之后调用一次。
+**模式2** 用本机麦克风：
+`local_microphone_windows.py` 用 `sounddevice.RawInputStream`（16 kHz 单声道 int16、
+480 样本/块）采集并逐块交给同一 `_on_pcm_frame` 播放/重采样链路；运行期丢弃遥控器
+PCM，也不发送 `MIC_OPEN`/`MIC_CLOSE`，语音1／语音2 可绑任意按键，短按锁存与长按
+按住语义不变。模式保存在 `config.json` 的 `voice_input_source`、`voice_local_input_device` 与
+`voice_short_press_dismiss`；模式1 的设备名一律归一化为空。
+
+`voice_gesture.py` 的 `VoiceGestureLatch` 状态机区分短按与长按（2026-10-19 修正）：
+ATVV `MicButtonPressed` 只有按下、没有配对释放 opcode，无 HID 物理边沿时按压与
+释放完全由 BLE 音频生命周期推断。ATVV 认领与 `AudioStarted` 回退认领都推进
+`on_press()`；`AudioStopped` 在「按住且无物理语音源按下」时按 `on_release()` 判定
+——按压时长小于 `DEFAULT_TAP_MAX_SECONDS`（0.550 s）为短按，进入 `LATCHED` 持续
+开麦，直到第二次物理短按经 `_close_latched_voice_session_locked` 结束会话并关麦；
+达到阈值为长按，松手即关麦。此前该路径不调用手势 `on_press`，短按无法锁存。
+锁存只用于**模式2**（本机麦克风）；模式1 在两条释放路径都把短按的 `LATCH` 强制改为
+`CLOSE`，因为遥控器只在按住期间送音频，锁存会让界面显示录音中却没有声音。
+
+注入的 key-down 不会触发 Windows 原生 typematic 自动重复，`SendInput`、`keybd_event`
+和 Interception 都一样。因此 `voice_shortcut_session.py` 在 key-down 已发出且按键仍
+按住时，按系统键盘重复率（`SPI_GETKEYBOARDSPEED`，钳制在 20–65 ms）主动补发同一
+快捷键的 key-down，只按下、不抬起；初次补发延迟与长按阈值 0.550 s 对齐，避免短按
+被输入法误判为长按。key-up、松手、取消或发送失败都会先停止补发计时器。补发走
+`key_repeat`，跳过“物理键已按下”预检，避免把自身注入当成物理按键。
+
 微信按住后端由 `WeTypeVoiceControl` 持有唯一快捷键会话。初次激活输入法后、发键前
 取得 Core Audio 采集基线，复用 `CaptureWatch` 按微信录音进程与端点/会话实例筛选，
 只把本轮新出现且唯一的活动采集确认为开麦。不再用隐私历史记录或自动切换/松键重按判断启动。
@@ -460,7 +512,7 @@ producer lock 保护。一般控制仍优先，但 `AUDIO_STOP` 必须先排空�
 基线超时、原有活动会话和身份歧义均为未知，同一控制器最多一个观察线程。松键唤醒采集
 及静音观察的等待，新轮次限时等旧线程退出后再取发键前基线；原生读取仍阻塞时保留未知，
 不并发查询、不用旧结果补认。观察不触发停止；原有松手、设备停止、断连、退出及 120 秒
-保险继续负责清理。谷歌两种微信模式仍要求 9 秒内收到 ready，超时后不接受迟到确认。
+保险继续负责清理。微信按住模式仍要求 9 秒内收到 ready，超时后不接受迟到确认。
 
 有声音且正常松键但微信开麦未知时，运行结果为 `host_unconfirmed`，不会标为
 `host_start_failed` 或成功；真实发送/松键失败及无音频仍分别表达。确认发布与代次切换串行，
@@ -471,7 +523,7 @@ producer lock 保护。一般控制仍优先，但 `AUDIO_STOP` 必须先排空�
 
 Chatterfly 保留内部 `chatterfly_hotkey` 标识，实际控制由 `ChatterflyVoiceControl`
 唯一持有：调用宿主已有 WM_COPYDATA 协议 1，命令 2 开始、3 结束，不模拟按键。
-小米按住、谷歌按住与开关共用此所有者。开始前拒绝已有浮窗；冻结 IPC HWND、PID、
+小米按住共用此所有者。开始前拒绝已有浮窗；冻结 IPC HWND、PID、
 进程创建时间与本地代次，并保留查询句柄。消息回执仅证明传输，后台观察到本轮新浮窗
 才发布 ready／允许 PCM 与 MIC_OPEN；等待不占用调用者的语音锁。
 取消后观察截止内迟到的气泡并清理；不向未观察到的会话盲发结束。停止只发一次，
@@ -562,8 +614,9 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 
 | 路径 | 内容 |
 | --- | --- |
-| `config.json` | 设备选择、增益、重试、按住说话快捷键、输出端点 |
-| `key_bindings.json` | 主/次手势动作、可移植物理签名映射 |
+| `config.json` | 设备选择、增益、重试、按住说话快捷键、输出端点、语音输入模式与本机麦克风 |
+| `key_bindings.json` | 主/次手势动作、可移植物理签名映射；同时代表“全局”档案 |
+| `app_profiles.json` | 应用档案库：单个“全局”档案加若干按应用的覆盖档案，另有当前生效档案标记 |
 | `logs\app.log` | 轮转运行日志 |
 | `logs\hid-helper.log` | 普通主进程一次写入并立即关闭的管理员按键组件结果 |
 | `bridge-runtime-status-s<会话 ID>.json` | 当前 Windows 登录会话的桥接心跳、连接与输入通道状态 |
@@ -576,6 +629,19 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 设置页保存两份文件时走 `config.save_settings_pair()`：先验证两份结构和隐私
 字段，第二份保存失败就把第一份按原始字节原子恢复。这样普通的文件占用、
 权限、序列化或 replace 失败不会留下混合版本。
+
+`app_profiles.json` 由 `app_profiles.py` 的 `AppProfileStore` 独立管理，同样按临时
+文件、flush、`fsync`、`os.replace` 原子替换。旧的 `mapping_presets.json`（版本 1–3）
+在首次读取时原子迁移为 `app_profiles.json`（当前版本 5），原文件保留为备份。版本 5
+起每条档案同时携带保存时的 `voice_input_source` 与 `voice_local_input_device`，应用
+档案会一并切换语音模式与麦克风；列表行由 `mode_tag()` 生成「模式1」或
+「模式2 · <麦克风>」，`display_label()` 拼成「名称（标签）」。`voice_conflicts()` 在
+模式1 下逐键列出话筒键以外的语音动作（含语音2），应用时整体拒绝并保持实时布局不变。
+「导出全部」走 `export_library()`，格式为 `RemoteMic.profile-library`（版本 1），
+包含当前全局映射、全局语音模式与所有档案，拒绝写入数据目录。档案解析为
+“全局打底 + 命中档案覆盖”：前台进程 basename 不区分大小写精确匹配某个应用档案时，
+该档案定义的按键覆盖全局，未定义的按键回退全局；“全局”不是另一份快照，而是实时
+`key_bindings.json` 的投影。
 
 “按键”页以编辑弹窗的“完成”为提交边界：一次弹窗内的主动作、双击、长按和备注变化
 合并为一次自动保存；恢复内置默认确认后也走同一保存链。桥接启动、端点预检、驱动操作
@@ -610,9 +676,14 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 `qt_settings_app.py` 把 Python model/controller 暴露给 QML。主要页面：
 
 - `DevicePage.qml`：设备、按键接收、遥控器服务、运行日志、更新和桌面行为；
-- `ButtonsPage.qml`：13 键整宽矩阵，按单击/双击/长按统一展示和编辑主/次动作，
-  通过共享 selected state 承接真实按键检测定位，编辑完成后自动保存映射；
-- `VoicePage.qml`：虚拟音频、输出端点、语音程序、分程序快捷键和实际说话验证；
+- `ButtonsPage.qml`：顶部应用条（“全局”加各应用档案再加“新增应用”按钮），点击
+  即切换当前生效档案并给生效项打勾；主体是可视图化的遥控器照片热点映射，按下
+  真实按键会高亮对应热点并把左右卡片聚焦到该键的单击/双击/长按主/次动作；底栏
+  “整体配置”负责导出／导入全局按键与全部应用档案；编辑完成后自动保存映射；
+- `VoicePage.qml`：语音输入模式（模式1 遥控器话筒／模式2 本机麦克风）、本机麦克风
+  设备选择与刷新、输出端点、语音程序、分程序快捷键、实际说话验证，以及「配置档案」
+  区（应用此配置／更新／重命名／复制／删除确认／导出单条，底部保存当前为配置、
+  导出全部与导入配置）；
 - `main.qml` / `Tokens.qml`：窗口、三页导航和设计 token。
 
 设置窗口采用一套固定全局框架：顶部保留产品标识与三页导航，中间页面独立滚动，
@@ -632,11 +703,12 @@ session detach 成功即证明其脚本不再被会话持有；单独 script unl
 ### 11.1 手动更新边界
 
 软件更新的正式来源是 `application_update.py`。只有用户点击“检查更新”后，设置
-控制器才在后台 worker 访问固定的 `ZSTDJan/windows-remote-mic-app` GitHub Releases；
+控制器才在后台 worker 访问固定的 `HZDavy/MiOpention` GitHub Releases；
 启动、后台运行和定时器均不触发联网，客户端不保存 GitHub 凭据。Release tag 只作
-发布编号，版本比较严格读取同一次 Release 中安装器与便携 ZIP 文件名携带的内部版本；
+发布编号，版本比较严格读取同一次 Release 中安装器或便携 ZIP 文件名携带的内部版本；
 资产、`SHA256SUMS.txt`、预发行状态或版本不能互相印证时，该 Release 不可用。
-新发布仅包含免安装 ZIP 和校验清单，不再要求安装器；新 tag 与 VERSION 一致，
+当前发布以 Inno Setup 安装器为主（`MiOpentionSetup-<版本>-unsigned.exe`），只提供
+安装器的 Release 同样可用；便携 ZIP 仍作为兼容格式保留。新 tag 与 VERSION 一致，
 命名规则见 `VALIDATION-AND-DELIVERY.md`，历史 tag 与资产格式继续兼容。
 
 API 请求只允许 `api.github.com`；资产初始地址必须属于本仓库的 `github.com` Release，
@@ -658,7 +730,9 @@ API 请求只允许 `api.github.com`；资产初始地址必须属于本仓库�
 13 个实体按键的主映射统一可编辑；只有实体话筒键额外提供“按住说话”，其他
 按键只提供普通动作或组合键。语音页按程序分别记忆一套按住型快捷键，并记录默认、
 自动读取或手动录入来源；普通自动读取不覆盖合法手动值，用户主动刷新成功时才切回
-自动来源。保存层拒绝把语音动作放入非话筒键或次级手势；麦克风键默认映射为
+自动来源。语音槽是否可选由 `voiceSlotEditable()` 决定：模式1 只开放语音1（话筒键），
+模式2 开放语音1／语音2 且可绑任意按键。模式1 下应用带冲突的旧档案会被
+`voice_conflicts()` 整体拒绝，并提示先改掉那些按键上的语音动作。麦克风键默认映射为
 按住说话，但可以改为普通动作。
 
 多个输入来源可能同时尝试认领该请求。`key_detection_bridge.py` 必须先用
@@ -762,15 +836,15 @@ UIA 标准名称，未知值写 `UnknownControl`。`visited`、候选、排除�
 语义后备记录方法返回/不可用，不冒充底层语义方法的原生堆栈。所有记录沿用当前
 异步 writer、轮转、采集失败标记及最终 ZIP，不增加日志文件、配置或清单版本。
 
-2026-09-28 谷歌接收器停止诊断沿用 `app.log`、故障报告和既有导出白名单。
-`bridge_control_windows` 的固定来源标记随停止请求记录；`ChromecastRuntime`、`Client` 和
+2026-09-28 遥控器接收器停止诊断沿用 `app.log`、故障报告和既有导出白名单。
+`bridge_control_windows` 的固定来源标记随停止请求记录；`Client` 和
 HID worker 只记录固定清理阶段、状态、耗时与最近完成阶段，`CleanupProgress` 在 Python
 业务栈被 Cython 隐藏时仍可供超时快照读取。接收管道从版本 16 起在严格枚举的诊断消息中允许
 有界 `elapsed_ms`；具体报文、用户路径和任意异常文字不得进入这些日志。OS 确认异常退出后，
 父进程复用现有单线程、限时的只读 PowerShell 采集队列查询 Application Error 1000，按
 PID/创建时间和窗口匹配，只投影安全的模块 basename、版本、异常码与偏移；无事件、查询失败
 或应用结束前来不及完成时明确记不可用。此元数据与线程快照均不等于原生栈或根因证明。
-对应 `CHECK-CHROMECAST-SHUTDOWN-001`；该停止诊断已进入 `.77` 本地测试 ZIP。
+对应 `CHECK-REMOTE-SHUTDOWN-001`；该停止诊断已进入 `.77` 本地测试 ZIP。
 
 2026-10-10 源码内部协议 25 增加固定 `voice_cleanup` 记录，`SelectedDevice` 的
 即时观察回调由两条 worker 接到既有 `Observation → Channel → Client → app.log`。
@@ -795,7 +869,7 @@ PID/创建时间和窗口匹配，只投影安全的模块 basename、版本、�
 查询与连接快照合计最多 16 项，沿用现有日志和导出路径；正常退出另有固定清理阶段日志。
 直接 WinRT 通知按解析后的控制/音频类别计数，协商后的缓冲重放不重复计数。版本 18
 已进入 `.79` 本地测试包；`.78` 仍为版本 17，一只 B 款的普通按键与微信按住说话已实测，见
-`CHECK-CHROMECAST-B-VOICE-SESSION-001`。
+`CHECK-REMOTE-B-VOICE-SESSION-001`。
 
 未打包源码的管道版本 20 扩展版本 19 新增的 `hid_startup`：HID 启动线程通过最多 128 条
 的独立队列提供固定阶段、状态、耗时、允许的异常类型/原因类型、数字错误码、宿主 PID、
@@ -810,7 +884,7 @@ PID/创建时间和窗口匹配，只投影安全的模块 basename、版本、�
 已失败的启动任务不再重复记成清理失败，真实启动清理失败保留失败状态并影响 worker 退出码。
 环境采集先保存固定磁盘驱动指纹和完整 PnP 型号片段，再查询 Windows 提供的型号/固件属性；
 超时保留最后完整快照并注明部分结果，不将缺失属性或 PnP REV 推断为真实硬件版本。
-不新增 BLE 连接、设备命令或恢复动作，见 `CHECK-CHROMECAST-HID-STARTUP-001`。
+不新增 BLE 连接、设备命令或恢复动作，见 `CHECK-REMOTE-HID-STARTUP-001`。
 
 2026-09-13 设置页原“日志目录”入口改为“导出日志”。`log_export` 复用
 `logging_setup` 与 `diagnostic_trace` 的文件名和轮转数量，只读取固定白名单，
@@ -964,6 +1038,33 @@ Frida Gadget 与 VB-CABLE 包都使用固定 URL/version/SHA-256。运行时仍�
 打包或发布，因此这些结果证明当前源码的自动化基线，不证明冻结 EXE、安装器、计划任务
 或真机链路已经通过。详细历史审查命令与证据见
 `reviews/2026-08-21-full-code-audit.md`，后续批次见 `MAINTENANCE.md`。
+
+2026-10-20 双语音模式与配置档案批次：本机 `unittest discover` 全量 3378 项通过、
+10 项按环境条件跳过，耗时 485.835 秒。其中模式1 的短按守卫、模式2 的本机采集转
+发、档案语音字段与冲突拒绝、`export_library()` 的库格式与数据目录防护均有定向用例；
+元素导航模块 269 项通过，覆盖 `ignore_dirty`／`max_age` 快路径与既有诊断契约。
+这些结果只证明自动化基线，不证明真实遥控器麦克风、真实本机麦克风音质、真实
+Chromium 应用的浮窗手感或冻结 EXE 行为；真机验收项见 `TESTING.md` 的对应批次。
+
+2026-10-20 模式1 短按守卫全路径与语音页整理批次：唯一正式入口
+`build/build-candidate.ps1` 编译后 3383 项通过、11 项按环境条件跳过，耗时
+478.646 秒，88 个业务原生模块与两份 EXE 的内部归档核验通过。新增 5 项回归用例
+覆盖 ATVV `MicButtonPressed`、`AudioStarted` 先行的首次触发与 `AudioStopped`
+三条路径的短按零注入，并确认驱动级（Interception）短按 `backend_for` 从未被调用；
+拦截点在 `_voice_shortcut.apply` 之前，因此与注入后端无关。语音页的配置档案收进
+`SettingsDialog`，`localMicrophoneRow` 去掉状态/操作占位列后不再压住说明文字。
+这些结果只证明自动化基线，不证明真实遥控器短按是否会被第三方输入法忽略，也不
+证明最小窗口下的弹窗滚动手感；真机验收项见 `TESTING.md` 的「重打 7」。
+
+2026-10-20 模式1 语音键按下即弹批次：删除 0.55 秒短按守卫及其全部调用点与测试替身，
+HID 物理边沿、ATVV `MicButtonPressed`、作为首次触发的 `AudioStarted` 三条路径都在
+按下瞬间注入 key-down，物理抬起或 `AudioStopped` 立即补 key-up；模式1 的两条释放
+路径把 `LATCH` 强制改为 `CLOSE`，短按不再锁存，避免设备流已停却仍显示录音中。
+唯一正式入口 `build/build-candidate.ps1` 编译后 3382 项通过、11 项按环境条件跳过，
+耗时 463.599 秒，88 个业务原生模块与两份 EXE 的内部归档核验通过；`VoiceRemoteMicrophoneModeTests`
+8 项覆盖三条触发路径的即时注入、`AudioStarted` 去重与驱动级在按下时的 `backend_for` 调用。
+代价是短按会让输入法收到一次极短按压（用户已确认接受）；这些结果只证明自动化基线，
+真机手感与输入法实际弹出时机见 `TESTING.md` 的「重打 8」。
 
 截至 2026-08-30，历史异机结果已证明：多候选中可选出唯一可用 RC003、全部
 普通按键可在映射页识别、记事本映射有效、按住语音得到非零 PCM 和识别文字、

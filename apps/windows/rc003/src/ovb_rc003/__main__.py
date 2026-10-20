@@ -38,6 +38,10 @@ built from the standalone ``src/launcher.py`` entry point - see XRBM-021):
                    modules used by the settings window and verifies the
                    frozen main QML file exists. It constructs no window and
                    touches no BLE/HID/audio resource.
+- ``--probe-rc003-candidate``  HIDDEN disposable ATVV query worker. One
+                  device ID arrives through an inherited anonymous pipe;
+                  it never opens the desktop or acquires bridge ownership.
+                  Cancellation/timeout is handled by its owning parent.
 - ``--diagnose-ble-candidates <result-path>``  HIDDEN, undocumented in
                   ``--help`` on purpose (XRBM-035 RETRY 1): the settings
                   window's "检查与修复" page's BLE candidate check
@@ -207,7 +211,6 @@ def _dry_run() -> int:
         device_catalog,
         device_profile,
         dev_session,
-        doubao_rpc,
         element_navigation_control_windows,
         element_navigation_runtime,
         frida_compat,
@@ -535,7 +538,7 @@ def _handoff_previous_application(
         handoff_guard.__enter__()
     except single_instance.DuplicateInstanceError:
         single_instance.show_bridge_startup_blocked_notice(
-            "正在切换无线麦版本，请稍候。\n\n"
+            "正在切换MiOpention版本，请稍候。\n\n"
             "如果一直没有完成，请从旧版通知区域选择“完全退出”。"
         )
         return False
@@ -807,31 +810,24 @@ def _handoff_previous_application(
 
 def main() -> None:
     args = dev_session.consume_marker(sys.argv[1:])
+    if "--probe-rc003-candidate" in args:
+        import os
+        from . import ble_candidate_probe_process
+        if args[0] != ble_candidate_probe_process.FLAG:
+            raise SystemExit(2)
+        # The query has already closed its GATT handles. Avoid interpreter
+        # teardown waiting on the daemon watcher reading the parent pipe.
+        os._exit(ble_candidate_probe_process.child_main(args[1:]))
     if "--capture-hotkey-worker" in args:
         from . import hotkey_capture_process
         if args[0] != hotkey_capture_process.FLAG:
             raise SystemExit(2)
         raise SystemExit(hotkey_capture_process.child_main(args[1:]))
-    if "--doubao-handsfree-finish" in args:
-        from . import chromecast_doubao_handsfree
-        if args[0] != chromecast_doubao_handsfree.FLAG:
-            raise SystemExit(2)
-        raise SystemExit(chromecast_doubao_handsfree.child_main(args[1:]))
-    if "--sogou-normal-submit" in args:
-        from . import sogou_submit_windows
-        if args[0] != sogou_submit_windows.FLAG:
-            raise SystemExit(2)
-        raise SystemExit(sogou_submit_windows.child_main(args[1:]))
     if "--rc003-source-injector" in args:
         from . import hid_source_injector
         if args[0] != hid_source_injector.FLAG:
             raise SystemExit(2)
         raise SystemExit(hid_source_injector.main(args[1:]))
-    if "--chromecast-worker" in args:
-        if args[0] != "--chromecast-worker":
-            raise SystemExit(2)
-        from . import chromecast_worker
-        raise SystemExit(chromecast_worker.main(args[1:]))
     if dev_session.is_isolated() and any(flag in args for flag in (
         "--request-exit", "--install-hid-helper", "--uninstall-hid-helper",
         "--element-navigation", "--background", "--bridge",
@@ -1024,7 +1020,7 @@ def _migrate_legacy_bridge_before_desktop_start() -> bool:
     single_instance.show_bridge_startup_blocked_notice(
         "旧版遥控器服务仍在运行，当前版本没有打开。\n\n"
         "请从旧版通知区域选择“完全退出”；看不到图标时，"
-        "请在任务管理器结束旧版无线麦后重试。"
+        "请在任务管理器结束旧版MiOpention后重试。"
     )
     raise SystemExit(LEGACY_BRIDGE_STARTUP_BLOCKED_EXIT_CODE)
 
@@ -1047,7 +1043,7 @@ def _run_settings(
             hid_elevation_windows.query_process_elevated()
         except Exception:  # noqa: BLE001 - the desktop startup must fail closed
             single_instance.show_bridge_startup_blocked_notice(
-                "无法确认无线麦当前的权限状态。\n\n"
+                "无法确认MiOpention当前的权限状态。\n\n"
                 "请关闭程序后重新普通双击打开。"
             )
             raise SystemExit(DESKTOP_PERMISSION_UNAVAILABLE_EXIT_CODE)
@@ -1064,7 +1060,7 @@ def _run_settings(
         if maintenance_active:
             if not start_hidden:
                 single_instance.show_bridge_startup_blocked_notice(
-                    "无线麦正在安装或卸载。完成后再打开。"
+                    "MiOpention正在安装或卸载。完成后再打开。"
                 )
             raise SystemExit(INSTALLER_MAINTENANCE_ACTIVE_EXIT_CODE)
 
@@ -1125,7 +1121,7 @@ def _run_settings(
                 except single_instance.DuplicateInstanceError:
                     single_instance.activate_existing_settings_window()
                     single_instance.show_bridge_startup_blocked_notice(
-                        "旧版退出后，另一个无线麦副本先取得了运行权。"
+                        "旧版退出后，另一个MiOpention副本先取得了运行权。"
                         "当前副本没有继续启动，请使用已经打开的窗口。"
                     )
     except single_instance.DuplicateInstanceError:
@@ -1156,7 +1152,7 @@ def _run_isolated_settings() -> None:
             settings_ui.main(start_bridge=False)
     except single_instance.DuplicateInstanceError:
         single_instance.show_bridge_startup_blocked_notice(
-            "隔离测试没有启动。请先从通知区域完全退出正在运行的无线麦，再打开测试版。"
+            "隔离测试没有启动。请先从通知区域完全退出正在运行的MiOpention，再打开测试版。"
         )
         raise SystemExit(single_instance.DUPLICATE_INSTANCE_EXIT_CODE)
     except Exception as exc:

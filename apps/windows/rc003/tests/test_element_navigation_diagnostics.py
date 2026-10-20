@@ -55,7 +55,7 @@ class NavigationDiagnosticsTests(unittest.TestCase):
         self.worker._reset_hierarchy_for_selected = lambda: None
         self.worker._sync_window_geometry = lambda: True
         self.worker._target_is_navigable = lambda target: True
-        self.worker._cache_is_reusable = lambda hwnd: False
+        self.worker._cache_is_reusable = lambda hwnd, **kwargs: False
 
     def test_local_input_owns_qt_repeats_and_release_without_system_injection(self):
         allowed = [True]

@@ -350,16 +350,6 @@ class PyInstallerSpecTests(unittest.TestCase):
         )
         self.assertNotIn("if REMOTE_PHOTO.is_file():", text)
 
-    def test_spec_requires_and_bundles_the_chromecast_photo(self):
-        text = _strip_hash_comments(_SPEC_PATH.read_text(encoding="utf-8"))
-        self.assertIn('CHROMECAST_PHOTO = REPO_ROOT / "Resources"', text)
-        self.assertIn('if not CHROMECAST_PHOTO.is_file():', text)
-        self.assertIn(
-            'datas.append((str(CHROMECAST_PHOTO), "Resources"))',
-            text,
-        )
-        self.assertNotIn("if CHROMECAST_PHOTO.is_file():", text)
-
     def test_spec_bundles_the_verified_vb_cable_zip_as_data_not_a_binary_dependency(self):
         # XRBM-031: unlike Frida, the pinned VB-CABLE base package IS now
         # bundled - but only as opaque `datas` (an ordinary file PyInstaller
@@ -470,33 +460,6 @@ class LauncherEntryPointTests(unittest.TestCase):
         text = _LAUNCHER_PATH.read_text(encoding="utf-8")
         self.assertIn('if __name__ == "__main__":', text)
 
-
-class ChromecastFrozenClosureContractTests(unittest.TestCase):
-    def setUp(self):
-        self.spec_text = _SPEC_PATH.read_text(encoding="utf-8")
-        self.package_main_text = _PACKAGE_MAIN_PATH.read_text(encoding="utf-8")
-
-    def test_every_chromecast_source_module_is_an_explicit_hidden_import(self):
-        source_modules = {
-            f"ovb_rc003.{path.stem}"
-            for path in (_RC003_ROOT / "src" / "ovb_rc003").glob("chromecast_*.py")
-        }
-        hidden_modules = {
-            module
-            for module in _spec_hidden_imports(self.spec_text)
-            if module.startswith("ovb_rc003.chromecast_")
-        }
-        self.assertTrue(source_modules, "no Chromecast runtime modules found")
-        self.assertEqual(hidden_modules, source_modules)
-
-    def test_internal_chromecast_process_entries_remain_discoverable(self):
-        for flag, module in (
-            ("--chromecast-worker", "chromecast_worker"),
-            ("--doubao-handsfree-finish", "chromecast_doubao_handsfree"),
-        ):
-            with self.subTest(flag=flag):
-                self.assertIn(f'if "{flag}" in args:', self.package_main_text)
-                self.assertIn(f"from . import {module}", self.package_main_text)
 
 class HidHelperLauncherTests(unittest.TestCase):
     def _load_launcher(self):
@@ -656,7 +619,7 @@ class InnoSetupScriptTests(unittest.TestCase):
     def test_installer_bundles_the_current_user_readme(self):
         files_section = _iss_section(self.text, "Files")
         self.assertIn(
-            'Source: "readme-rc003.txt"; DestDir: "{app}"; '
+            'Source: "readme-rc003.txt"; DestDir: "{app}"; DestName: "README.txt"; '
             "Flags: isreadme ignoreversion",
             files_section,
         )
@@ -1472,9 +1435,10 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         self.assertLess(write_index, assert_index)
         self.assertIn("rc003-build-input.json", self.text)
 
-    def test_installer_compilation_is_suspended(self):
-        self.assertNotIn("ISCC.exe", self.text)
-        self.assertNotIn("choco install innosetup", self.text)
+    def test_installer_compilation_is_required(self):
+        self.assertIn("ISCC.exe", self.text)
+        self.assertIn("choco install innosetup", self.text)
+        self.assertIn("Inno Setup installer compilation failed", self.text)
 
     def test_packages_from_the_shared_runtime_version_file(self):
         self.assertIn(
@@ -1493,8 +1457,9 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", _strip_hash_comments(self.text))
 
     def test_never_runs_the_compiled_installer(self):
-        self.assertNotIn("Compile Inno Setup installer", self.text)
-        self.assertNotIn("releaseInstallerPath", self.text)
+        self.assertIn("Compile", self.text)
+        self.assertNotIn("Start-Process -FilePath $installerPath", self.text)
+        self.assertNotIn("& $installerPath", self.text)
 
     def test_uses_pinned_supported_actions(self):
         self.assertIn(
@@ -1589,9 +1554,9 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         upload_step = self.text[upload_step_start:]
         self.assertIn("if: startsWith(github.ref, 'refs/tags/')", upload_step)
 
-    def test_ci_checks_third_party_inventory_without_installer_toolchain(self):
+    def test_ci_checks_third_party_inventory_with_installer_toolchain(self):
         self.assertIn("check-third-party-notices.py", self.text)
-        self.assertNotIn("choco install innosetup", self.text)
+        self.assertIn("choco install innosetup", self.text)
         self.assertIn("group: windows-rc003-ci-${{ github.workflow }}-${{ github.ref }}", self.text)
 
     def test_test_suite_is_gated_by_resource_warning(self):
@@ -1660,7 +1625,7 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         self.assertIn("Compress-Archive", self.text)
         self.assertIn("Get-FileHash", self.text)
         self.assertIn("SHA256SUMS.txt", self.text)
-        self.assertIn("无线麦-Windows-$version-免安装.zip", self.text)
+        self.assertIn("MiOpention-$version-免安装.zip", self.text)
 
     def test_portable_zip_stages_license_source_assets_attribution_and_readme(self):
         # XRBM-022 controller pre-review correction: the portable ZIP
@@ -1831,11 +1796,13 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         self.assertLess(final_index, installer_index)
         self.assertGreaterEqual(step.count("Assert-RC003BuildProvenanceMatches"), 2)
 
-    def test_release_packaging_only_selects_the_current_portable_zip(self):
+    def test_release_packaging_only_selects_the_current_installer(self):
         step = self._package_step_text()
-        self.assertNotIn('installerExe', step)
-        self.assertNotIn('Get-ChildItem -Path dist/installer', step)
-        self.assertIn('$zipPath = "dist/portable/无线麦-Windows-$version-免安装.zip"', step)
+        self.assertIn(
+            '$installerPath = "dist/installer/MiOpentionSetup-$version-unsigned.exe"',
+            step,
+        )
+        self.assertNotIn("Get-ChildItem -Path dist/installer", step)
 
     def test_portable_staging_directory_is_a_single_versioned_top_level_folder(self):
         # Compress-Archive given a bare directory path (not a "/*" content
@@ -1851,7 +1818,7 @@ class WindowsCiWorkflowTests(unittest.TestCase):
 
     def _package_step_text(self):
         start = self.text.index(
-            "- name: Package deterministic unsigned release directory"
+            "- name: Package unsigned installer"
         )
         end = self.text.index(
             "- name: Upload deterministic distribution artifacts", start
@@ -1877,13 +1844,13 @@ class WindowsCiWorkflowTests(unittest.TestCase):
             step,
         )
         self.assertIn(
-            "Copy-Item -Path $zipPath -Destination $releaseZipPath -Force", step
+            "Copy-Item -Path $installerPath -Destination $releaseInstallerPath -Force", step
         )
-        self.assertNotIn("releaseInstallerPath", step)
+        self.assertNotIn("releaseZipPath", step)
 
     def test_release_directory_is_cleaned_before_the_copies_are_staged(self):
         step = self._package_step_text()
-        self.assertLess(step.index('Remove-Item $releaseDir'), step.index('Copy-Item -Path $zipPath'))
+        self.assertLess(step.index('Remove-Item $releaseDir'), step.index('Copy-Item -Path $installerPath'))
 
     def test_release_manifest_is_generated_from_the_staged_copies_not_the_originals(self):
         # The manifest must hash the files actually sitting in dist/release
@@ -1892,9 +1859,9 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         # reflected in the manifest the preflight below verifies.
         step = self._package_step_text()
         self.assertIn(
-            "Get-FileHash -Algorithm SHA256 -LiteralPath $releaseZipPath", step
+            "Get-FileHash -Algorithm SHA256 -LiteralPath $releaseInstallerPath", step
         )
-        self.assertNotIn("Get-FileHash -Algorithm SHA256 -LiteralPath $releaseInstallerPath", step)
+        self.assertNotIn("Get-FileHash -Algorithm SHA256 -LiteralPath $releaseZipPath", step)
         self.assertIn(
             "Set-Content -Path $releaseManifestPath -Value $lines -Encoding utf8",
             step,
@@ -1905,7 +1872,7 @@ class WindowsCiWorkflowTests(unittest.TestCase):
         step = self._package_step_text()
         self.assertIn("$releaseFiles.Count -ne 2", step)
         self.assertIn(
-            '$expectedNames = @($zipName, "SHA256SUMS.txt") | Sort-Object',
+            '$expectedNames = @($installerName, "SHA256SUMS.txt") | Sort-Object',
             step,
         )
         self.assertIn(
@@ -2099,7 +2066,6 @@ class BuildProvenanceScriptTests(unittest.TestCase):
             r"LICENSE.md",
             r'Join-Path $RepoRoot "README.md"',
             r"Resources\RC003-remote-photo.png",
-            r"Resources\Chromecast-remote-photo.png",
             r"THIRD_PARTY_NOTICES.md",
             r"THIRD_PARTY_SOURCE.md",
             r".github\workflows\windows-rc003-ci.yml",
@@ -2153,13 +2119,14 @@ class BuildProvenanceScriptTests(unittest.TestCase):
             repo_root = Path(temporary_directory) / "repo"
             rc003_root = repo_root / "apps" / "windows" / "rc003"
             source_file = rc003_root / "src" / "ovb_rc003" / "app.py"
-            chromecast_photo = repo_root / "Resources" / "Chromecast-remote-photo.png"
+            remote_photo = repo_root / "Resources" / "RC003-remote-photo.png"
             fixture_files = {
                 source_file: "alpha",
                 rc003_root / "src" / "ovb_rc003" / "VERSION": "0.0.1-test\n",
                 rc003_root / "tests" / "test_sample.py": "VALUE = 1\n",
                 rc003_root / "build" / "build-candidate.ps1": "fixture\n",
                 rc003_root / "build" / "package-local-test.ps1": "fixture\n",
+                rc003_root / "build" / "package-installer.ps1": "fixture\n",
                 rc003_root / "build" / "portable-layout.ps1": "fixture\n",
                 rc003_root / "build" / "build-provenance.ps1": "fixture\n",
                 rc003_root / "build" / "product-presentation.py": "fixture\n",
@@ -2170,11 +2137,14 @@ class BuildProvenanceScriptTests(unittest.TestCase):
                 rc003_root / "build" / "native_inventory.py": "fixture\n",
                 rc003_root / "build" / "check_native.py": "fixture\n",
                 rc003_root / "build" / "fetch-frida-gadget.ps1": "fixture\n",
+                rc003_root / "build" / "fetch-interception.ps1": "fixture\n",
                 rc003_root / "build" / "fetch-vb-cable.ps1": "fixture\n",
                 rc003_root / "build" / "stop-dev.ps1": "fixture\n",
                 rc003_root / "build" / "RemoteMicRC003.spec": "fixture\n",
                 rc003_root / "build" / "generate-app-icon.py": "fixture\n",
                 rc003_root / "build" / "third_party" / "VBCABLE_Driver_Pack45.zip": b"zip",
+                rc003_root / "build" / "third_party" / "interception" / "interception.dll": b"dll",
+                rc003_root / "build" / "third_party" / "interception" / "install-interception.exe": b"exe",
                 rc003_root / "requirements.txt": "fixture\n",
                 rc003_root / "requirements-dev.txt": "fixture\n",
                 rc003_root / "pyproject.toml": "fixture\n",
@@ -2188,7 +2158,6 @@ class BuildProvenanceScriptTests(unittest.TestCase):
                 repo_root / ".github" / "workflows" / "windows-rc003-ci.yml": "fixture\n",
                 repo_root / "README.md": "fixture\n",
                 repo_root / "Resources" / "RC003-remote-photo.png": b"png",
-                chromecast_photo: b"chromecast-photo",
                 repo_root / "ASSET_LICENSES.md": "fixture\n",
                 repo_root / "COPYRIGHT.md": "fixture\n",
                 repo_root / "LICENSE.md": "fixture\n",
@@ -2215,10 +2184,10 @@ class BuildProvenanceScriptTests(unittest.TestCase):
 
             build_root = rc003_root / "dist" / "RemoteMicRC003"
             built_files = {
-                build_root / "无线麦 win版 0.0.1-test.exe": b"main",
-                build_root / "程序文件" / "RemoteMicRC003HidHelper.exe": b"helper",
-                build_root / "程序文件" / "ovb_rc003" / "VERSION": b"0.0.1-test\n",
-                build_root / "程序文件" / "hidden.dat": b"hidden",
+                build_root / "MiOpention 0.0.1-test.exe": b"main",
+                build_root / "app" / "RemoteMicRC003HidHelper.exe": b"helper",
+                build_root / "app" / "ovb_rc003" / "VERSION": b"0.0.1-test\n",
+                build_root / "app" / "hidden.dat": b"hidden",
             }
             for path, content in built_files.items():
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -2232,24 +2201,24 @@ class BuildProvenanceScriptTests(unittest.TestCase):
                     "RC003_FIXTURE_REPO": str(repo_root),
                     "RC003_FIXTURE_BUILD": str(build_root),
                     "RC003_FIXTURE_SOURCE": str(source_file),
-                    "RC003_FIXTURE_CHROMECAST_PHOTO": str(chromecast_photo),
-                    "RC003_FIXTURE_HIDDEN": str(build_root / "程序文件" / "hidden.dat"),
+                    "RC003_FIXTURE_REMOTE_PHOTO": str(remote_photo),
+                    "RC003_FIXTURE_HIDDEN": str(build_root / "app" / "hidden.dat"),
                     "RC003_FIXTURE_PRESENTATION": json.dumps(
                         {
                             "schema_version": 1,
                             "version": "0.0.1-test",
-                            "presentation_label": "无线麦 win版 0.0.1-test",
-                            "main_executable_name": "无线麦 win版 0.0.1-test.exe",
-                            "main_executable_stem": "无线麦 win版 0.0.1-test",
-                            "portable_folder_name": "无线麦 win版 0.0.1-test",
-                            "runtime_directory_name": "程序文件",
-                            "documentation_directory_name": "说明与许可",
-                            "portable_readme_name": "使用说明.txt",
+                            "presentation_label": "MiOpention 0.0.1-test",
+                            "main_executable_name": "MiOpention 0.0.1-test.exe",
+                            "main_executable_stem": "MiOpention 0.0.1-test",
+                            "portable_folder_name": "MiOpention 0.0.1-test",
+                            "runtime_directory_name": "app",
+                            "documentation_directory_name": "docs",
+                            "portable_readme_name": "README.txt",
                             "hid_helper_executable_name": "RemoteMicRC003HidHelper.exe",
-                            "hid_helper_file_description": "无线麦 权限助手",
-                            "main_file_description": "无线麦 win版 0.0.1-test",
-                            "product_name": "无线麦 win版",
-                            "main_original_filename": "无线麦 win版 0.0.1-test.exe",
+                            "hid_helper_file_description": "MiOpention 权限助手",
+                            "main_file_description": "MiOpention 0.0.1-test",
+                            "product_name": "MiOpention",
+                            "main_original_filename": "MiOpention 0.0.1-test.exe",
                             "helper_original_filename": "RemoteMicRC003HidHelper.exe",
                         },
                         ensure_ascii=True,
@@ -2298,15 +2267,15 @@ Assert-RC003BuildProvenance `
     -RC003Root $env:RC003_FIXTURE_ROOT `
     -RepoRoot $env:RC003_FIXTURE_REPO `
     -BuildRoot $env:RC003_FIXTURE_BUILD | Out-Null
-[System.IO.File]::WriteAllText($env:RC003_FIXTURE_CHROMECAST_PHOTO, 'changed-photo')
+[System.IO.File]::WriteAllText($env:RC003_FIXTURE_REMOTE_PHOTO, 'changed-photo')
 try {
     Assert-RC003BuildProvenance `
         -RC003Root $env:RC003_FIXTURE_ROOT `
         -RepoRoot $env:RC003_FIXTURE_REPO `
         -BuildRoot $env:RC003_FIXTURE_BUILD | Out-Null
-    throw 'stale Chromecast photo was accepted'
+    throw 'stale remote photo was accepted'
 } catch {
-    if ($_.Exception.Message -eq 'stale Chromecast photo was accepted') {
+    if ($_.Exception.Message -eq 'stale remote photo was accepted') {
         throw
     }
     if ($_.Exception.Message -notmatch 'build inputs changed') {
@@ -2383,18 +2352,18 @@ class WindowsPowerShellBuildContractTests(unittest.TestCase):
     _presentation = {
         "schema_version": 1,
         "version": "0.0.1-test",
-        "presentation_label": "无线麦 win版 0.0.1-test",
-        "main_executable_name": "无线麦 win版 0.0.1-test.exe",
-        "main_executable_stem": "无线麦 win版 0.0.1-test",
-        "portable_folder_name": "无线麦 win版 0.0.1-test",
-        "runtime_directory_name": "程序文件",
-        "documentation_directory_name": "说明与许可",
-        "portable_readme_name": "使用说明.txt",
+        "presentation_label": "MiOpention 0.0.1-test",
+        "main_executable_name": "MiOpention 0.0.1-test.exe",
+        "main_executable_stem": "MiOpention 0.0.1-test",
+        "portable_folder_name": "MiOpention 0.0.1-test",
+        "runtime_directory_name": "app",
+        "documentation_directory_name": "docs",
+        "portable_readme_name": "README.txt",
         "hid_helper_executable_name": "RemoteMicRC003HidHelper.exe",
-        "hid_helper_file_description": "无线麦 权限助手",
-        "main_file_description": "无线麦 win版 0.0.1-test",
-        "product_name": "无线麦 win版",
-        "main_original_filename": "无线麦 win版 0.0.1-test.exe",
+        "hid_helper_file_description": "MiOpention 权限助手",
+        "main_file_description": "MiOpention 0.0.1-test",
+        "product_name": "MiOpention",
+        "main_original_filename": "MiOpention 0.0.1-test.exe",
         "helper_original_filename": "RemoteMicRC003HidHelper.exe",
     }
 
@@ -2475,7 +2444,7 @@ if (-not (Test-Path -LiteralPath $paths.ProvenanceFile -PathType Leaf)) {
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(
                 Path(result_path.read_text(encoding="utf-8")),
-                build_root / "程序文件" / "build-provenance.json",
+                build_root / "app" / "build-provenance.json",
             )
 
     def _create_staging_tree(self, root):
@@ -2998,7 +2967,7 @@ class UserFacingDocumentationContractTests(unittest.TestCase):
     def test_download_and_checksum_are_explicit(self):
         for text in (self.guide, self.landing):
             self.assertIn("SHA256SUMS.txt", text)
-            self.assertIn("完整解压", text)
+            self.assertIn("安装", text)
         self.assertIn("Get-FileHash -Algorithm SHA256", self.guide)
         self.assertIn("未签名", self.guide)
 
@@ -3007,7 +2976,7 @@ class UserFacingDocumentationContractTests(unittest.TestCase):
             self.assertIn("CABLE Input", text)
             self.assertIn("CABLE Output", text)
             self.assertIn("记事本", text)
-        self.assertIn("无线麦写入声音的一侧", self.guide)
+        self.assertIn("MiOpention写入声音的一侧", self.guide)
         self.assertIn("输入法读取麦克风的一侧", self.guide)
         for provider in ("搜狗", "微信", "豆包"):
             self.assertIn(provider, self.guide)
@@ -3025,8 +2994,8 @@ class UserFacingDocumentationContractTests(unittest.TestCase):
     def test_landing_page_identifies_the_formal_version(self):
         version = _formal_version_from_landing(self.landing)
         self.assertIn(f"当前正式版为 **{version}**", self.landing)
-        self.assertIn(f"RemoteMicRC003-{version}-portable-unsigned.zip", self.landing)
-        self.assertIn("无线麦 win版 <版本号>.exe", self.landing)
+        self.assertIn(f"MiOpentionSetup-{version}-unsigned.exe", self.landing)
+        self.assertIn("MiOpentionSetup-<版本号>-unsigned.exe", self.landing)
 
 
 class RootDocumentConsistencyTests(unittest.TestCase):
@@ -3042,7 +3011,6 @@ class RootDocumentConsistencyTests(unittest.TestCase):
 
     def test_root_readme_does_not_lump_windows_in_with_planned_research(self):
         self.assertIn("小米蓝牙语音遥控器 2 Pro", self.root_readme_text)
-        self.assertIn("谷歌 TV Chromecast 遥控器", self.root_readme_text)
         self.assertIn("[开发者文档](apps/windows/rc003/README.md)", self.root_readme_text)
 
     def test_root_readme_places_the_admin_workaround_in_usage_limits(self):
@@ -3100,7 +3068,7 @@ class RootDocumentConsistencyTests(unittest.TestCase):
         # A local test build can be newer than the public download.
         windows_readme_text = _README_PATH.read_text(encoding="utf-8")
         version = _formal_version_from_landing(self.root_readme_text)
-        self.assertIn(f"RemoteMicRC003-{version}-portable-unsigned.zip", self.root_readme_text)
+        self.assertIn(f"MiOpentionSetup-{version}-unsigned.exe", self.root_readme_text)
         self.assertIn("下载页面与最新版说明", windows_readme_text)
 
 
@@ -3148,7 +3116,7 @@ class PortableReleasePackagingReplayTests(unittest.TestCase):
         script = "\n".join(line[10:] for line in text[start:end].splitlines())
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            name = "无线麦-Windows-0.2.0-candidate.31-免安装.zip"
+            name = "MiOpention-Windows-0.2.0-candidate.31-免安装.zip"
             package = root / name
             package.write_bytes(b"synthetic ZIP for packaging-only verification")
             release = root / "apps/windows/rc003/dist/release"
@@ -3189,9 +3157,9 @@ class PrereleaseDownloadInstructionsContractTests(unittest.TestCase):
         guide = _README_PATH.read_text(encoding="utf-8")
         version = _formal_version_from_landing(landing)
         self.assertIn(f"/releases/tag/v{version}", landing)
-        self.assertIn(f"RemoteMicRC003-{version}-portable-unsigned.zip", landing)
+        self.assertIn(f"MiOpentionSetup-{version}-unsigned.exe", landing)
         self.assertIn("SHA256SUMS.txt", landing)
-        self.assertIn("https://github.com/ZSTDJan/windows-remote-mic-app/releases", guide)
+        self.assertIn("https://github.com/HZDavy/MiOpention/releases", guide)
         self.assertNotIn("miaomiaozii/windows-remote-mic-app", guide)
 
 
@@ -3212,18 +3180,18 @@ class ApplicationUpdateDocumentationContractTests(unittest.TestCase):
         landing = _ROOT_README_PATH.read_text(encoding="utf-8")
         self.assertIn("[使用说明](apps/windows/rc003/README.md)", landing)
         self.assertIn("检查更新", guide)
-        self.assertIn("不会自动运行下载文件或覆盖当前文件夹", guide)
-        self.assertIn("把新 ZIP 解压到新文件夹", guide)
+        self.assertIn("不会自动运行下载文件或覆盖当前安装", guide)
+        self.assertIn("再运行新下载的安装包", guide)
 
 
 class PortableAndInstallerFlowContractTests(unittest.TestCase):
-    """Current distribution is a portable ZIP; installer docs are history."""
+    """Current distribution is the per-user Inno Setup installer."""
 
     def test_portable_start_and_exit_are_usable(self):
         guide = _README_PATH.read_text(encoding="utf-8")
-        self.assertIn("免安装 ZIP", guide)
-        self.assertIn("文件夹顶层的无线麦 EXE", guide)
-        self.assertIn("不要只把 EXE 单独取出来", _normalize_whitespace(guide))
+        self.assertIn("MiOpentionSetup-<版本号>-unsigned.exe", guide)
+        self.assertIn("开始菜单与桌面快捷方式", guide)
+        self.assertIn("卸载", guide)
         self.assertIn("通知区域", guide)
         self.assertIn("完全退出", guide)
 
@@ -3256,7 +3224,7 @@ class WindowsPrereleaseAssetScopeContractTests(unittest.TestCase):
     def test_download_instructions_name_only_this_release_assets(self):
         landing = _ROOT_README_PATH.read_text(encoding="utf-8")
         version = _formal_version_from_landing(landing)
-        self.assertIn(f"RemoteMicRC003-{version}-portable-unsigned.zip", landing)
+        self.assertIn(f"MiOpentionSetup-{version}-unsigned.exe", landing)
         self.assertIn("SHA256SUMS.txt", landing)
         self.assertNotIn("每个预发行版恰好包含以下三个文件", landing)
 

@@ -11,11 +11,7 @@ param(
 $ErrorActionPreference = "Stop"
 $RC003Root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $RunScript = (Resolve-Path (Join-Path $PSScriptRoot "run-dev.ps1")).Path
-$ProductName = -join @(
-    [char]0x65E0,
-    [char]0x7EBF,
-    [char]0x9EA6
-)
+$ProductName = "MiOpention"
 $DevLabel = -join @(
     [char]0x5F00,
     [char]0x53D1,

@@ -6,13 +6,12 @@ name: windows-rc003-ci
 # PyInstaller artifact, smoke-checks the narrow HID helper with --self-check,
 # then checks the built executable with --dry-run and --qt-runtime-check (loads
 # the real Qt DLL chain and verifies main.qml while
-# touching no GUI/BLE/HID/audio), and
-# packages a deterministic unsigned portable ZIP (a versioned staging
-# folder containing the built app plus the project license, copyright,
-# third-party notices and licenses, corresponding-source record, asset
-# license record, attribution and README - the same legal/provenance and
-# instructional content the historical installer carries) +
-# SHA256SUMS.txt artifact set.
+# touches no GUI/BLE/HID/audio), and
+# packages the unsigned per-user Inno Setup installer (built from
+# installer/RemoteMicRC003Setup.iss, which bundles the app plus the project
+# license, copyright, third-party notices and licenses, corresponding-source
+# record, asset license record, attribution and README) + SHA256SUMS.txt
+# artifact set.
 #
 # Honest disclosure of what this CI run DOES touch: the Windows-only tests
 # under tests/windows/ (self-skipping everywhere else) exercise a real,
@@ -26,8 +25,8 @@ name: windows-rc003-ci
 # device attached anyway, so real-device behavior remains a manual
 # verification step (see this subtree's README.md "Known gaps" section).
 #
-# All active gates below are required. Installer distribution is suspended;
-# its source is retained for historical maintenance only.
+# All active gates below are required. The installer is the primary
+# distribution format; the portable staging step remains a build self-check.
 #
 # Exit-code gating (XRBM-014 review RETRY P2 #3): console commands below check
 # $LASTEXITCODE explicitly, since a non-zero native exit code does not
@@ -372,7 +371,12 @@ jobs:
           Write-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot -InputState $inputState -ExecutableMetadataVerified -PythonExecutable "python" | Out-Null
           Assert-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot -PythonExecutable "python" | Out-Null
 
-      - name: Package deterministic unsigned release directory (ZIP + SHA256SUMS)
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+
+      - name: Package unsigned installer (EXE + SHA256SUMS)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -435,7 +439,7 @@ jobs:
           Copy-Item -Path "installer/readme-portable-rc003.txt" -Destination (Join-Path $documentationDir ([string]$productPresentation.portable_readme_name)) -Force
 
           Assert-RC003PortableStagingRoot -StagingDirectory $stagingDir -ProductPresentation $productPresentation
-          $zipPath = "dist/portable/无线麦-Windows-$version-免安装.zip"
+          $zipPath = "dist/portable/MiOpention-$version-免安装.zip"
           if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 
           # XRBM-025 RETRY 1 (controller-accepted self-found blocker):
@@ -605,24 +609,45 @@ jobs:
           $finalBuildProvenance = Assert-RC003BuildProvenance -RC003Root $rc003Root -RepoRoot $repoRoot -BuildRoot $buildRoot
           Assert-RC003BuildProvenanceMatches -Expected $initialBuildProvenance -Actual $finalBuildProvenance -Context "CI post-package verification"
 
-          # Upload only the verified portable ZIP and its UTF-8 checksum manifest.
+          # Publish only the installer and its UTF-8 checksum manifest.
           # Both producer and upload use the workspace-absolute release directory.
           $releaseDir = "$env:GITHUB_WORKSPACE/apps/windows/rc003/dist/release"
           if (Test-Path $releaseDir) { Remove-Item $releaseDir -Recurse -Force }
           New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 
-          $zipName = Split-Path $zipPath -Leaf
-          $releaseZipPath = Join-Path $releaseDir $zipName
+          # Build the per-user Inno Setup installer and publish it as the
+          # primary release asset (the portable staging above stays a build
+          # self-check, not the downloadable package).
+          $iscc = ""
+          $isccCommand = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+          if ($null -ne $isccCommand) { $iscc = $isccCommand.Source }
+          if (-not $iscc) { $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) {
+            Write-Error "Inno Setup 6 (ISCC.exe) is required to build the installer"
+            exit 1
+          }
+          & $iscc (Join-Path $rc003Root "installer/RemoteMicRC003Setup.iss")
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Inno Setup installer compilation failed"
+            exit 1
+          }
+          $installerPath = "dist/installer/MiOpentionSetup-$version-unsigned.exe"
+          if (-not (Test-Path $installerPath)) {
+            Write-Error "expected installer not found: $installerPath"
+            exit 1
+          }
+          $installerName = Split-Path $installerPath -Leaf
+          $releaseInstallerPath = Join-Path $releaseDir $installerName
           $releaseManifestPath = Join-Path $releaseDir "SHA256SUMS.txt"
 
-          Copy-Item -Path $zipPath -Destination $releaseZipPath -Force
+          Copy-Item -Path $installerPath -Destination $releaseInstallerPath -Force
 
           # The manifest is generated from, and verified against, the
           # STAGED release-directory copies below - not the original
           # dist/portable|installer files - so a copy failure or a
           # mismatch between the two locations can never pass unnoticed.
           $hashed = @(
-            (Get-FileHash -Algorithm SHA256 -LiteralPath $releaseZipPath)
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $releaseInstallerPath)
           )
           $lines = $hashed |
             Sort-Object { Split-Path $_.Path -Leaf } |
@@ -641,7 +666,7 @@ jobs:
             exit 1
           }
 
-          $expectedNames = @($zipName, "SHA256SUMS.txt") | Sort-Object
+          $expectedNames = @($installerName, "SHA256SUMS.txt") | Sort-Object
           $actualNames = @($releaseFiles.Name) | Sort-Object
           $nameDiff = Compare-Object -ReferenceObject $expectedNames -DifferenceObject $actualNames
           if ($nameDiff) {

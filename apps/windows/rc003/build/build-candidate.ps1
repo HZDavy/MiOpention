@@ -76,6 +76,28 @@ function Invoke-FrozenExecutableCheck {
     }
 }
 
+function Find-InnoSetupCompiler {
+    $roots = @(
+        ${env:ProgramFiles(x86)},
+        $env:ProgramFiles,
+        (Join-Path $env:LOCALAPPDATA "Programs")
+    )
+    foreach ($root in $roots) {
+        if ([string]::IsNullOrWhiteSpace($root)) {
+            continue
+        }
+        $candidate = Join-Path $root "Inno Setup 6\ISCC.exe"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return $candidate
+        }
+    }
+    $command = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+    if ($null -ne $command) {
+        return $command.Source
+    }
+    return ""
+}
+
 function Get-PythonMinorVersion {
     param(
         [Parameter(Mandatory = $true)]
@@ -208,6 +230,10 @@ try {
     Write-Host "-- fetch + verify Frida Gadget --"
     & powershell -ExecutionPolicy Bypass -File (Join-Path "build" "fetch-frida-gadget.ps1")
     Assert-LastExitCode "fetch-frida-gadget.ps1"
+
+    Write-Host "-- fetch + verify Interception client library --"
+    & powershell -ExecutionPolicy Bypass -File (Join-Path "build" "fetch-interception.ps1")
+    Assert-LastExitCode "fetch-interception.ps1"
 
     $inputStateBeforeBuild = Get-RC003BuildInputState `
         -RC003Root $RC003Root `
@@ -348,6 +374,21 @@ try {
         -RepoRoot $RepoRoot `
         -BuildRoot $BuildRoot `
         -PythonExecutable $venvPython | Out-Null
+
+    Write-Host "-- compile unsigned Inno Setup installer --"
+    $iscc = Find-InnoSetupCompiler
+    if ([string]::IsNullOrWhiteSpace($iscc)) {
+        throw "Inno Setup 6 is required to build the installer; install it or put ISCC.exe on PATH"
+    }
+    & $iscc (Join-Path "installer" "RemoteMicRC003Setup.iss")
+    Assert-LastExitCode "Inno Setup installer"
+    $installerPath = Join-Path $RC003Root (
+        "dist\installer\MiOpentionSetup-$sourceVersion-unsigned.exe"
+    )
+    if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
+        throw "expected installer not found: $installerPath"
+    }
+    Write-Host "installer: $installerPath"
 
     Write-Host "== build complete: dist\RemoteMicRC003\ (unsigned) =="
     } catch {

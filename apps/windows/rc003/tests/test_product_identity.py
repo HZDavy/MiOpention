@@ -11,8 +11,6 @@ from ovb_rc003 import (
     product_identity,
     qt_settings_app,
     settings_ui,
-    voice_hotkey_sync_windows,
-    voice_program_manager,
 )
 
 
@@ -24,15 +22,15 @@ class ProductIdentityTests(unittest.TestCase):
         version = "1.0.51-candidate.51"
         self.assertEqual(
             product_identity.windows_presentation_label(version),
-            "无线麦 win版 1.0.51-candidate.51",
+            "MiOpention 1.0.51-candidate.51",
         )
         self.assertEqual(
             product_identity.windows_executable_name(version),
-            "无线麦 win版 1.0.51-candidate.51.exe",
+            "MiOpention 1.0.51-candidate.51.exe",
         )
         self.assertEqual(
             product_identity.windows_portable_folder_name(version),
-            "无线麦 win版 1.0.51-candidate.51",
+            "MiOpention 1.0.51-candidate.51",
         )
         self.assertEqual(
             product_identity.windows_fixed_file_version(version),
@@ -44,9 +42,12 @@ class ProductIdentityTests(unittest.TestCase):
         cases = {
             "RemoteMicRC003.exe": "legacy",
             "REMOTEMICRC003.EXE": "legacy",
-            "无线麦 win版 1.0.51-candidate.51.exe": "current",
-            "无线麦 WIN版 1.0.51-candidate.51.EXE": "current",
-            "无线麦 win版 1.0.51.exe": "current",
+            "MiOpention 1.0.51-candidate.51.exe": "current",
+            "MIOPENTION 1.0.51-CANDIDATE.51.EXE": "current",
+            "MiOpention 1.0.51.exe": "current",
+            # 旧版本名继续被识别，升级时才能接管旧的启动项和权限助手。
+            "MiOpention+ win版 1.0.51-candidate.51.exe": "current",
+            "MiOpention+ 1.0.51-candidate.51.exe": "current",
         }
         for name, layout in cases.items():
             with self.subTest(name=name):
@@ -57,13 +58,13 @@ class ProductIdentityTests(unittest.TestCase):
 
         for name in (
             "RemoteMicRC003-old.exe",
-            "无线麦 win版.exe",
-            "无线麦 win版 1.0.exe",
-            "无线麦 win版 01.0.51.exe",
-            "无线麦 win版 1.0.51-.exe",
-            "C:\\Apps\\无线麦 win版 1.0.51.exe",
-            "..\\无线麦 win版 1.0.51.exe",
-            "无线麦 win版 1.0.51.exe.bak",
+            "MiOpention.exe",
+            "MiOpention 1.0.exe",
+            "MiOpention 01.0.51.exe",
+            "MiOpention 1.0.51-.exe",
+            "C:\\Apps\\MiOpention 1.0.51.exe",
+            "..\\MiOpention 1.0.51.exe",
+            "MiOpention 1.0.51.exe.bak",
         ):
             with self.subTest(name=name):
                 self.assertIsNone(
@@ -78,9 +79,9 @@ class ProductIdentityTests(unittest.TestCase):
         )
         self.assertEqual(
             product_identity.windows_runtime_relative_directory_for_executable(
-                "无线麦 win版 1.0.51-candidate.51.exe"
+                "MiOpention 1.0.51-candidate.51.exe"
             ),
-            Path("程序文件"),
+            Path("app"),
         )
 
     def test_windows_version_rejects_unsafe_or_unrepresentable_values(self):
@@ -122,9 +123,9 @@ class ProductIdentityTests(unittest.TestCase):
             payload["main_executable_name"],
             product_identity.windows_executable_name(version),
         )
-        self.assertEqual(payload["runtime_directory_name"], "程序文件")
-        self.assertEqual(payload["documentation_directory_name"], "说明与许可")
-        self.assertEqual(payload["portable_readme_name"], "使用说明.txt")
+        self.assertEqual(payload["runtime_directory_name"], "app")
+        self.assertEqual(payload["documentation_directory_name"], "docs")
+        self.assertEqual(payload["portable_readme_name"], "README.txt")
         self.assertTrue(completed.stdout.isascii())
 
     def test_windows_version_metadata_distinguishes_main_and_helper(self):
@@ -132,55 +133,26 @@ class ProductIdentityTests(unittest.TestCase):
         helper = product_identity.windows_hid_helper_version_metadata(
             "1.0.51-candidate.51"
         )
-        self.assertEqual(main["file_description"], "无线麦 win版 1.0.51-candidate.51")
-        self.assertEqual(main["original_filename"], "无线麦 win版 1.0.51-candidate.51.exe")
+        self.assertEqual(main["file_description"], "MiOpention 1.0.51-candidate.51")
+        self.assertEqual(main["original_filename"], "MiOpention 1.0.51-candidate.51.exe")
         self.assertEqual(main["internal_name"], "RemoteMicRC003")
-        self.assertEqual(helper["file_description"], "无线麦 权限助手")
+        self.assertEqual(helper["file_description"], "MiOpention 权限助手")
         self.assertEqual(helper["original_filename"], "RemoteMicRC003HidHelper.exe")
         self.assertTrue(main["prerelease"])
 
     def test_user_visible_name_has_one_runtime_source(self):
-        self.assertEqual(product_identity.DISPLAY_NAME, "无线麦")
+        self.assertEqual(product_identity.DISPLAY_NAME, "MiOpention")
         self.assertEqual(
             settings_ui._action_to_display(
                 key_mapping.ButtonAction(key_mapping.ActionKind.OPEN_REMOTE_MIC)
             ),
-            "打开无线麦",
+            "打开MiOpention",
         )
 
         tooltip_default = inspect.signature(
             bridge_tray_windows.BridgeTray
         ).parameters["tooltip"].default
-        self.assertEqual(tooltip_default, "无线麦 · 小米遥控器2 Pro")
-
-    def test_voice_statuses_use_the_display_name(self):
-        read_result = voice_hotkey_sync_windows.read_provider_hotkey(
-            voice_program_manager.VOICE_PROGRAM_CUSTOM,
-            platform="win32",
-        )
-        save_result = voice_hotkey_sync_windows.sync_provider_hotkey(
-            voice_program_manager.VOICE_PROGRAM_WETYPE,
-            "lctrl+lshift+f9",
-            platform="win32",
-        )
-        disabled_status = voice_program_manager.VoiceProgramStatus(
-            provider_id=voice_program_manager.VOICE_PROGRAM_NONE,
-            display_name="不管理",
-            available=False,
-            running=False,
-            elevated=None,
-            executable=None,
-            code="disabled",
-        )
-
-        for text in (
-            read_result.message,
-            save_result.message,
-        ):
-            self.assertIn(product_identity.DISPLAY_NAME, text)
-            self.assertNotIn("Remote Mic", text)
-        self.assertEqual(voice_program_manager.status_text(disabled_status),
-                         "请选择语音程序；未配置时仅普通按键可用。")
+        self.assertEqual(tooltip_default, "MiOpention · 小米遥控器2 Pro")
 
     def test_qml_reads_the_controller_identity_instead_of_copying_the_name(self):
         qml_dir = _RC003_ROOT / "src" / "ovb_rc003" / "qml"
@@ -225,8 +197,8 @@ class ProductIdentityTests(unittest.TestCase):
         installer = (
             _RC003_ROOT / "installer" / "RemoteMicRC003Setup.iss"
         ).read_text(encoding="utf-8")
-        self.assertIn('#define AppName "无线麦"', installer)
-        self.assertIn("DefaultGroupName=无线麦", installer)
+        self.assertIn('#define AppName "MiOpention"', installer)
+        self.assertIn("DefaultGroupName=MiOpention", installer)
         self.assertIn("UsePreviousGroup=no", installer)
         self.assertNotIn("[InstallDelete]", installer)
         cleanup_start = installer.index("procedure DeleteObsoleteShortcuts;")
@@ -271,16 +243,15 @@ class ProductIdentityTests(unittest.TestCase):
         self.assertLess(commit, files_completed)
         self.assertLess(files_completed, cleanup_call)
         self.assertLess(cleanup_call, helper_install)
-        self.assertIn('#define AppExeName "RemoteMicRC003.exe"', installer)
-        self.assertIn("DefaultDirName={localappdata}\\RemoteMic\\{#AppFolder}", installer)
+        self.assertIn('#define AppExeName AppName + " " + AppVersion + ".exe"', installer)
+        self.assertIn("DefaultDirName={localappdata}\\MiOpention", installer)
         self.assertIn("'RemoteMicRC003'", installer)
 
     def test_development_shortcut_uses_new_name_and_validates_legacy_owner(self):
         script = (
             _RC003_ROOT / "build" / "install-dev-shortcut.ps1"
         ).read_text(encoding="utf-8")
-        for codepoint in ("0x65E0", "0x7EBF", "0x9EA6"):
-            self.assertIn(codepoint, script)
+        self.assertIn('$ProductName = "MiOpention"', script)
         self.assertIn("LegacyMatchesThisCheckout", script)
         self.assertIn("WorkingDirectory", script)
         self.assertIn("$LegacyShortcut.Arguments -eq $ShortcutArguments", script)

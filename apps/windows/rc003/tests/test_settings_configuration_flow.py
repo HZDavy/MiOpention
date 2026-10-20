@@ -76,6 +76,10 @@ class ConfigurationFlowTests(unittest.TestCase):
 
     def test_combined_save_also_keeps_output_restart_action(self):
         controller, _ = self.controller()
+        # Slot 1 must carry a recorded shortcut before a full save can pass: an
+        # empty voice slot is deliberately fail-closed instead of silently
+        # falling back to a fabricated wake shortcut.
+        controller._voice_slot_hotkeys[1] = "ralt"
         controller._set_bridge_running(True)
         endpoint = qt_settings_app.audio_output.AudioEndpoint("CABLE Input", "Windows WASAPI")
         controller._endpoint_values = [endpoint]
@@ -93,7 +97,6 @@ class ConfigurationFlowTests(unittest.TestCase):
 
     def test_mapping_autosave_and_restore_work_with_empty_voice_hotkey(self):
         data = config.default_config()
-        config.set_voice_hotkey_for_provider(data, "none", "")
         config.save_config(config.config_path(config.config_root()), data)
         controller, model = self.controller()
         model.setActionTextAt(model.index_of("power"), "ctrl+l")
@@ -137,7 +140,7 @@ class ConfigurationFlowTests(unittest.TestCase):
                               ("double_click", model.DoubleClickTextRole),
                               ("long_press", model.LongPressTextRole)):
             label = model.data(model.index(row, 0), role)
-            self.assertEqual(controller.buttonActionValidationMessage("power", gesture, label), "")
+            self.assertEqual(controller.buttonActionValidationMessage("power", gesture, label, "sendinput"), "")
             if gesture == "single_click":
                 self.assertEqual(label, "左 Ctrl（键码 0xA2） + Shift")
                 model.setActionTextAt(row, label.lower().replace(" + ", "＋"))
@@ -170,157 +173,6 @@ class ConfigurationFlowTests(unittest.TestCase):
         with self.assertRaises(win32_keys.UnknownKeyTokenError):
             win32_input.send_key_combo_tap(invalid.keys, _sender=sender, _key_down_query=lambda vk: False)
         sender.assert_not_called()
-
-    def test_invalid_voice_key_keeps_saved_value_and_never_syncs_provider(self):
-        controller, _ = self.controller()
-        controller.selectedVoiceProgramIndex = 2
-        controller.holdVoiceHotkeyText = "ctrl+shift+f9"
-        previous = controller.holdVoiceHotkeyText
-        path = config.config_path(config.config_root())
-        before = path.read_bytes()
-        self.fixture._voice_hotkey_sync_mock.reset_mock()
-        for text, reason in (("Ctrl+A+A", "一个普通键"), ("Ctrl+vk_00", "无效"),
-                             ("Ctrl+numpad_left", "NumLock")):
-            with self.subTest(text=text):
-                controller.holdVoiceHotkeyText = text
-                self.assertEqual(controller.holdVoiceHotkeyText, previous)
-                self.assertEqual(path.read_bytes(), before)
-                self.assertIn(reason, controller.errorMessage)
-                self.assertEqual(controller.voiceHotkeySaveState, "retry")
-        self.fixture._voice_hotkey_sync_mock.assert_not_called()
-
-    def test_voice_launch_keeps_qt_responsive_and_rejects_duplicate_requests(self):
-        from PySide6.QtCore import QTimer
-
-        controller, _ = self.controller()
-        controller._background_task_runner = None
-        started, release = threading.Event(), threading.Event()
-        ticks = []
-
-        def launch(_settings):
-            started.set()
-            release.wait(2)
-            return qt_settings_app.voice_program_manager.VoiceProgramLaunchResult(
-                "none", False, False, "cancelled"
-            )
-
-        timer = QTimer()
-        timer.setInterval(5)
-        timer.timeout.connect(lambda: ticks.append(True))
-        timer.start()
-        try:
-            with mock.patch.object(qt_settings_app.voice_program_manager, "launch_voice_program", side_effect=launch) as run:
-                controller.launchVoiceProgram()
-                self.assertTrue(controller.voiceHotkeyBusy)
-                self.assertTrue(started.wait(1))
-                controller.launchVoiceProgram()
-                deadline = time.monotonic() + 1
-                while not ticks and time.monotonic() < deadline:
-                    self.qt.processEvents()
-                    time.sleep(.005)
-                self.assertTrue(ticks, "Qt timer could not run during provider launch")
-                self.assertEqual(run.call_count, 1)
-                release.set()
-                self.fixture._wait_for_qt(self.qt, lambda: not controller.voiceHotkeyBusy, "launch stayed busy")
-                self.assertEqual(controller.errorMessage, "")
-        finally:
-            release.set()
-            timer.stop()
-            controller.shutdownBackgroundTasks()
-
-    def test_voice_launch_exception_and_late_exit_result_are_safe(self):
-        controller, _ = self.controller()
-        queued = []
-        controller._background_task_runner = lambda task, _name: queued.append(task)
-        with mock.patch.object(qt_settings_app.voice_program_manager, "launch_voice_program", side_effect=OSError("failed")):
-            controller.launchVoiceProgram()
-            queued.pop()()
-        self.assertFalse(controller.voiceHotkeyBusy)
-        self.assertIn("启动失败", controller.errorMessage)
-        controller.launchVoiceProgram()
-        message = controller.statusMessage
-        controller._application_exit_intent.set()
-        with mock.patch.object(qt_settings_app.voice_program_manager, "launch_voice_program"):
-            queued.pop()()
-        self.assertFalse(controller.voiceHotkeyBusy)
-        self.assertEqual(controller.statusMessage, message)
-
-    def test_sogou_timeout_keeps_operation_owned_until_external_write_settles(self):
-
-        controller, _ = self.controller()
-        controller.selectedVoiceProgramIndex = 1  # Sogou, through the public property.
-        pending = []
-        controller._background_task_runner = lambda callback, _name: pending.append(callback)
-        config_file = config.config_path(config.config_root())
-        local_before = config_file.read_bytes()
-        provider_root = config.config_root() / "sogou-appdata"
-        provider_file = (
-            qt_settings_app.voice_hotkey_sync_windows._sogou_config_path(provider_root)
-        )
-        provider_file.parent.mkdir(parents=True)
-        provider_file.write_text(
-            json.dumps(
-                {
-                    "setting": {
-                        "shortcutKeysPress": ["RightCtrl"],
-                        "longPressEnabled": True,
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
-        replace_started = threading.Event()
-        release_replace = threading.Event()
-        original_replace = qt_settings_app.voice_hotkey_sync_windows._replace_bytes_atomically
-
-        def blocked_replace(path, content, **kwargs):
-            replace_started.set()
-            if not release_replace.wait(2.0):
-                raise TimeoutError("test did not release provider write")
-            original_replace(path, content, **kwargs)
-
-        def real_temporary_sync(provider_id, shortcut, **kwargs):
-            self.assertEqual(provider_id, "sogou")
-            return qt_settings_app.voice_hotkey_sync_windows._sync_sogou_hotkey(
-                shortcut,
-                appdata=provider_root,
-                cancel_event=kwargs.get("cancel_event"),
-            )
-
-        self.fixture._voice_hotkey_sync_mock.side_effect = real_temporary_sync
-        with mock.patch.object(
-            qt_settings_app.voice_hotkey_sync_windows,
-            "_sogou_voice_process_running",
-            return_value=False,
-        ), mock.patch.object(
-            qt_settings_app.voice_hotkey_sync_windows,
-            "_replace_bytes_atomically",
-            side_effect=blocked_replace,
-        ):
-            controller.holdVoiceHotkeyText = "lctrl+lshift+f10"
-            self.assertTrue(controller.voiceHotkeyBusy)
-            self.assertEqual(len(pending), 1)
-            worker = threading.Thread(target=pending.pop(), daemon=True)
-            worker.start()
-            try:
-                self.assertTrue(replace_started.wait(1.0))
-                controller._on_voice_hotkey_task_timeout()
-                self.assertTrue(controller.voiceHotkeyBusy)
-                self.assertIn("等待安全结束", controller.statusMessage)
-            finally:
-                release_replace.set()
-                worker.join(1.0)
-
-        self.qt.processEvents()
-        external = qt_settings_app.voice_hotkey_sync_windows._read_sogou_hotkey(
-            appdata=provider_root
-        )
-        self.assertTrue(external.ok)
-        self.assertEqual(external.hotkey, "rctrl")
-        self.assertEqual(config_file.read_bytes(), local_before)
-        self.assertNotEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f10")
-        self.assertFalse(controller.voiceHotkeyBusy)
-
 
 @unittest.skipUnless(controller_tests._HAS_PYSIDE6, controller_tests._SKIP_REASON)
 class ConfigurationQmlFlowTests(unittest.TestCase):

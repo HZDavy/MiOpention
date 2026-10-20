@@ -1,8 +1,11 @@
 """Named button snapshots, independent of the current per-device settings.
 
-Only this module owns mapping_presets.json (schema 2, reads schema 1) under config_root.
-It is user data, never a build asset. Removing a saved snapshot never writes
-config.json or key_bindings.json. Portable exports contain no device identity.
+Only this module owns mapping_presets.json (schema 3, reads schema 1/2) under
+config_root. Each preset also carries a switching state: a scope (global, or
+app-bound to a foreground process name) and an optional keyboard hotkey that
+switches to it. It is user data, never a build asset. Removing a saved snapshot
+never writes config.json or key_bindings.json. Portable exports contain no
+device identity and only the mapping.
 """
 from __future__ import annotations
 
@@ -15,12 +18,25 @@ from . import config, device_catalog, key_mapping, remote_layout, settings_ui, w
 
 FILENAME = "mapping_presets.json"
 FORMAT = "RemoteMic.key-mapping"
+# One file that carries the global layout plus every application layout, so a
+# user can move a whole setup between machines instead of one snapshot at a time.
+BUNDLE_FORMAT = "RemoteMic.full-configuration"
+BUNDLE_SCHEMA_VERSION = 1
+BUNDLE_FIELDS = {"format", "schema_version", "profile", "global", "apps"}
+BUNDLE_APP_FIELDS = {"name", "process", "hotkey", "mapping"}
 MAX_BYTES = 2 * 1024 * 1024
 MAX_PRESETS = 100
 MAPPING_FIELDS = ("bindings", "secondary_bindings", "display_notes")
-PROFILES = (device_catalog.RC003_ID, device_catalog.CHROMECAST_ID)
+PROFILES = (device_catalog.RC003_ID,)
 AUTO_ID = "automatic"
 AUTO_NAME = "26-1012 自动保存"
+SCHEMA_VERSION = 3
+SCOPES = ("global", "app")
+SCOPE_LABELS = {"global": "全局配置", "app": "软件配置"}
+DEFAULT_SCOPE = "global"
+ENTRY_FIELDS = ("id", "name", "profile", "mapping", "scope", "process", "hotkey")
+HOTKEY_MAX_LENGTH = 64
+PROCESS_MAX_LENGTH = 128
 
 
 def validate_name(value: object) -> str:
@@ -29,6 +45,47 @@ def validate_name(value: object) -> str:
     if any(ord(char) < 32 for char in value):
         raise ValueError("名称不能包含换行或控制字符。")
     return value.strip()
+
+
+def validate_scope(value: object) -> str:
+    if value not in SCOPES:
+        raise ValueError("配置状态只能是全局配置或软件配置。")
+    return str(value)
+
+
+def validate_process(value: object, scope: str) -> str:
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        raise ValueError("进程名格式无效。")
+    value = value.strip()
+    if len(value) > PROCESS_MAX_LENGTH:
+        raise ValueError("进程名最多 128 个字符。")
+    if any(ord(char) < 32 for char in value):
+        raise ValueError("进程名不能包含换行或控制字符。")
+    if scope == "app" and not value:
+        raise ValueError("软件配置需要填写进程名（如 chrome.exe）。")
+    return value
+
+
+def validate_hotkey(value: object) -> str:
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        raise ValueError("快捷键格式无效。")
+    value = value.strip()
+    if len(value) > HOTKEY_MAX_LENGTH:
+        raise ValueError("快捷键最长 64 个字符。")
+    if not value:
+        return ""
+    tokens = [token for token in value.split("+") if token]
+    if not 1 <= len(tokens) <= 6:
+        raise ValueError("快捷键需要 1～6 个按键。")
+    try:
+        win32_keys.resolve_vk_codes(tokens)
+    except ValueError as exc:
+        raise ValueError(f"快捷键含无法识别的按键：{value}") from exc
+    return value
 
 
 def validate_mapping(value: object, profile: str) -> dict:
@@ -48,11 +105,8 @@ def validate_mapping(value: object, profile: str) -> dict:
     for button, actions in result["secondary_bindings"].items():
         if not isinstance(actions, dict) or set(actions) - {"double_click", "long_press"}:
             raise ValueError("双击或长按配置无效。")
-        primary = key_mapping.ButtonAction.from_dict(result["bindings"][button])
         for trigger, raw in actions.items():
-            action = _validate_action(raw, button, trigger, profile)
-            if key_mapping.is_voice_action(primary) and action.kind != key_mapping.ActionKind.DISABLED:
-                raise ValueError("语音键不能同时配置双击或长按。")
+            _validate_action(raw, button, trigger, profile)
     for notes in result["display_notes"].values():
         if not isinstance(notes, dict) or set(notes) - {trigger.value for trigger in key_mapping.ButtonTrigger}:
             raise ValueError("按键备注格式无效。")
@@ -62,7 +116,7 @@ def validate_mapping(value: object, profile: str) -> dict:
 
 
 def _validate_action(raw: object, button: str, trigger: str, profile: str) -> key_mapping.ButtonAction:
-    if not isinstance(raw, dict) or set(raw) - {"kind", "keys", "uri"}:
+    if not isinstance(raw, dict) or set(raw) - {"kind", "keys", "uri", "inject_mode"}:
         raise ValueError("按键动作格式无效。")
     action = key_mapping.ButtonAction.from_dict(raw)
     if action.kind in {key_mapping.ActionKind.VOICE, key_mapping.ActionKind.VOICE_TOGGLE}:
@@ -73,11 +127,6 @@ def _validate_action(raw: object, button: str, trigger: str, profile: str) -> ke
         settings_ui._validated_button_action(button, trigger, settings_ui._action_to_display(action))
     except settings_ui.SettingsValidationError as exc:
         raise ValueError(exc.message) from exc
-    if profile == device_catalog.CHROMECAST_ID and button == "mic":
-        if trigger == "single_click" and action.kind != key_mapping.ActionKind.VOICE_HOLD:
-            raise ValueError("谷歌话筒键须保留语音动作。")
-        if trigger != "single_click" and action.kind != key_mapping.ActionKind.DISABLED:
-            raise ValueError("谷歌话筒键不支持双击或长按映射。")
     return action
 
 
@@ -103,7 +152,7 @@ def _comparable_mapping(mapping: dict, profile: str) -> dict:
     """Match the loader's normalization without rewriting the saved snapshot."""
     result = copy.deepcopy(mapping)
     config._normalize_semantic_actions(result)
-    config._normalize_display_notes(result, profile)
+    config._normalize_display_notes(result)
     result["bindings"] = {button: key_mapping.ButtonAction.from_dict(raw).to_dict()
                           for button, raw in result["bindings"].items()}
     secondary = {}
@@ -142,6 +191,61 @@ def _validate_document(value: dict) -> dict:
             "mapping": validate_mapping(value["mapping"], value["profile"])}
 
 
+def build_bundle(profile: str, global_mapping: dict, app_entries: list[dict]) -> dict:
+    """Pack the global layout and every application layout into one document.
+
+    Preset identifiers stay behind: an imported bundle always creates fresh
+    entries, exactly like the single-preset export does.
+    """
+    if profile not in PROFILES:
+        raise ValueError("此配置的遥控器型号不受支持。")
+    return {
+        "format": BUNDLE_FORMAT,
+        "schema_version": BUNDLE_SCHEMA_VERSION,
+        "profile": profile,
+        "global": validate_mapping(global_mapping, profile),
+        "apps": [{"name": validate_name(entry["name"]),
+                  "process": validate_process(entry["process"], "app"),
+                  "hotkey": validate_hotkey(entry.get("hotkey", "")),
+                  "mapping": validate_mapping(entry["mapping"], profile)}
+                 for entry in app_entries],
+    }
+
+
+def validate_bundle(value: object, profile: str) -> dict:
+    """Validate one full-configuration export before anything is written."""
+    if profile not in PROFILES:
+        raise ValueError("此配置的遥控器型号不受支持。")
+    if (not isinstance(value, dict) or set(value) != BUNDLE_FIELDS
+            or value.get("format") != BUNDLE_FORMAT
+            or type(value.get("schema_version")) is not int
+            or value["schema_version"] != BUNDLE_SCHEMA_VERSION):
+        raise ValueError("请选择本软件导出的整体配置文件（版本 1）。")
+    if value.get("profile") != profile:
+        raise ValueError("配置的遥控器型号与当前型号不同，请先切换设备。")
+    apps = value.get("apps")
+    if not isinstance(apps, list) or len(apps) > MAX_PRESETS:
+        raise ValueError("整体配置文件里的应用列表无效。")
+    result, processes = [], set()
+    for app in apps:
+        if not isinstance(app, dict) or set(app) != BUNDLE_APP_FIELDS:
+            raise ValueError("整体配置文件里的应用配置格式无效。")
+        process = validate_process(app["process"], "app")
+        if process.casefold() in processes:
+            raise ValueError(f"整体配置里有两份绑定同一进程 {process} 的配置。")
+        processes.add(process.casefold())
+        result.append({"name": validate_name(app["name"]), "process": process,
+                       "hotkey": validate_hotkey(app["hotkey"]),
+                       "mapping": validate_mapping(app["mapping"], profile)})
+    return {"profile": profile, "global": validate_mapping(value["global"], profile),
+            "apps": result}
+
+
+def read_bundle(path: Path, profile: str) -> dict:
+    """Read and validate one full-configuration export from disk."""
+    return validate_bundle(_read(Path(path)), profile)
+
+
 class PresetStore:
     def __init__(self, root: Path):
         self.root = Path(root)
@@ -151,21 +255,26 @@ class PresetStore:
         try:
             value = _read(self.path)
         except FileNotFoundError:
-            return {"schema_version": 2, "presets": [], "applied_ids": {}}
+            return {"schema_version": SCHEMA_VERSION, "presets": [], "applied_ids": {}}
         version = value.get("schema_version")
         expected = {"schema_version", "presets"}
-        if version == 2:
+        if version in (2, 3):
             expected.add("applied_ids")
         if (set(value) != expected or type(version) is not int
-                or version not in (1, 2) or not isinstance(value["presets"], list)
+                or version not in (1, 2, 3) or not isinstance(value["presets"], list)
                 or len(value["presets"]) > MAX_PRESETS):
             raise ValueError("保存的配置列表损坏或版本不受支持；原文件已保留。")
+        entry_fields = set(ENTRY_FIELDS) if version >= 3 else {"id", "name", "profile", "mapping"}
         result = []
         ids, names = set(), set()
         for entry in value["presets"]:
-            if not isinstance(entry, dict) or set(entry) != {"id", "name", "profile", "mapping"}:
+            if not isinstance(entry, dict) or set(entry) != entry_fields:
                 raise ValueError("保存的配置格式无效；原文件已保留。")
             identity = str(UUID(entry["id"]))
+            if entry["profile"] not in PROFILES:
+                # A saved preset for a device type this build no longer
+                # supports is skipped instead of making the list unreadable.
+                continue
             document = _validate_document({"format": FORMAT, "schema_version": 1,
                                           **{key: entry[key] for key in ("name", "profile", "mapping")}})
             name_key = (entry["profile"], document["name"].casefold())
@@ -173,15 +282,21 @@ class PresetStore:
                 raise ValueError("保存的配置含重复名称或标识；原文件已保留。")
             ids.add(identity)
             names.add(name_key)
-            result.append({"id": identity, **{key: document[key] for key in ("name", "profile", "mapping")}})
+            scope = validate_scope(entry.get("scope", DEFAULT_SCOPE))
+            process = validate_process(entry.get("process", ""), scope)
+            hotkey = validate_hotkey(entry.get("hotkey", ""))
+            result.append({"id": identity, **{key: document[key] for key in ("name", "profile", "mapping")},
+                           "scope": scope, "process": process, "hotkey": hotkey})
         applied_ids = value.get("applied_ids", {})
-        if not isinstance(applied_ids, dict) or set(applied_ids) - set(PROFILES):
+        if not isinstance(applied_ids, dict):
             raise ValueError("配置列表状态无效；原文件已保留。")
+        applied_ids = {profile: identity for profile, identity in applied_ids.items()
+                       if profile in PROFILES}
         for profile, identity in applied_ids.items():
             if identity != AUTO_ID and not any(
                     entry["id"] == identity and entry["profile"] == profile for entry in result):
                 raise ValueError("配置列表的应用标记无效；原文件已保留。")
-        return {"schema_version": 2, "presets": result, "applied_ids": applied_ids}
+        return {"schema_version": SCHEMA_VERSION, "presets": result, "applied_ids": applied_ids}
 
     def load(self) -> list[dict]:
         return self._load_document()["presets"]
@@ -204,9 +319,35 @@ class PresetStore:
         if current is None or not any(entry["id"] == active and _comparable_mapping(entry["mapping"], profile)
                    == _comparable_mapping(current, profile) for entry in entries):
             active = AUTO_ID
-        rows = [{"id": AUTO_ID, "name": AUTO_NAME, "profile": profile, "mapping": current}, *entries]
+        rows = [{"id": AUTO_ID, "name": AUTO_NAME, "profile": profile, "mapping": current,
+                 "scope": DEFAULT_SCOPE, "process": "", "hotkey": ""}, *entries]
         return [{**entry, "automatic": entry["id"] == AUTO_ID, "applied": entry["id"] == active}
                 for entry in rows]
+
+    def resolve_for_process(self, profile: str, process_basename: str) -> str | None:
+        """Return the app-scoped preset bound to a running process, if any."""
+        if profile not in PROFILES:
+            return None
+        wanted = (process_basename or "").strip().casefold()
+        if not wanted:
+            return None
+        for entry in self._load_document()["presets"]:
+            if (entry["profile"] == profile and entry["scope"] == "app"
+                    and entry["process"].casefold() == wanted):
+                return entry["id"]
+        return None
+
+    def resolve_hotkey(self, profile: str, hotkey: str) -> str | None:
+        """Return the preset bound to a configured switch hotkey, if any."""
+        if profile not in PROFILES:
+            return None
+        wanted = (hotkey or "").strip().casefold()
+        if not wanted:
+            return None
+        for entry in self._load_document()["presets"]:
+            if entry["profile"] == profile and entry["hotkey"].casefold() == wanted:
+                return entry["id"]
+        return None
 
     def mark_applied(self, profile: str, identity: str) -> None:
         if profile not in PROFILES:
@@ -234,7 +375,8 @@ class PresetStore:
     def get(self, identity: str) -> dict:
         return self._find(self.load(), identity)
 
-    def create(self, name: str, profile: str, mapping: dict, *, unique: bool = False) -> str:
+    def create(self, name: str, profile: str, mapping: dict, *, unique: bool = False,
+               scope: str = DEFAULT_SCOPE, process: str = "", hotkey: str = "") -> str:
         document = self._load_document()
         entries = document["presets"]
         name = validate_name(name)
@@ -248,11 +390,41 @@ class PresetStore:
                 index += 1
         elif name.casefold() in names:
             raise ValueError("已有同名配置，请换一个名称。")
+        scope = validate_scope(scope)
+        process = validate_process(process, scope)
+        hotkey = validate_hotkey(hotkey)
+        self._check_bindings_free(entries, profile, "", process, hotkey)
         identity = str(uuid4())
         entries.append({"id": identity, "name": name, "profile": profile,
-                        "mapping": validate_mapping(mapping, profile)})
+                        "mapping": validate_mapping(mapping, profile),
+                        "scope": scope, "process": process, "hotkey": hotkey})
         self._save(document)
         return identity
+
+    @staticmethod
+    def _check_bindings_free(entries: list[dict], profile: str, identity: str,
+                             process: str, hotkey: str) -> None:
+        process_key = process.casefold()
+        hotkey_key = hotkey.casefold()
+        for other in entries:
+            if other["id"] == identity or other["profile"] != profile:
+                continue
+            if process_key and other["scope"] == "app" and other["process"].casefold() == process_key:
+                raise ValueError("已有配置绑定该进程，请先修改或删除它。")
+            if hotkey_key and other["hotkey"].casefold() == hotkey_key:
+                raise ValueError("已有配置使用该快捷键，请换一个快捷键。")
+
+    def set_status(self, identity: str, scope: str, process: str, hotkey: str) -> None:
+        """Update a saved preset's switching state without touching its mapping."""
+        document = self._load_document()
+        entries = document["presets"]
+        entry = self._find(entries, identity)
+        scope = validate_scope(scope)
+        process = validate_process(process, scope)
+        hotkey = validate_hotkey(hotkey)
+        self._check_bindings_free(entries, entry["profile"], identity, process, hotkey)
+        entry["scope"], entry["process"], entry["hotkey"] = scope, process, hotkey
+        self._save(document)
 
     def rename(self, identity: str, name: str) -> None:
         document = self._load_document()
@@ -275,6 +447,87 @@ class PresetStore:
                                    for profile, active in document["applied_ids"].items()}
         self._save(document)
 
+    def list_apps(self, profile: str) -> list[dict]:
+        """Return the app-scoped presets of one profile, in document order."""
+        if profile not in PROFILES:
+            raise ValueError("此配置的遥控器型号不受支持。")
+        return [copy.deepcopy(entry) for entry in self.load()
+                if entry["profile"] == profile and entry["scope"] == "app"]
+
+    def find_app(self, profile: str, process: str) -> dict | None:
+        """Return the app-scoped preset bound to a process name, if any."""
+        if profile not in PROFILES:
+            return None
+        wanted = (process or "").strip().casefold()
+        if not wanted:
+            return None
+        for entry in self.load():
+            if (entry["profile"] == profile and entry["scope"] == "app"
+                    and entry["process"].casefold() == wanted):
+                return copy.deepcopy(entry)
+        return None
+
+    def ensure_app(self, name: str, profile: str, process: str,
+                   mapping: dict) -> str:
+        """Create (or reuse) the app-scoped preset bound to one process name."""
+        existing = self.find_app(profile, process)
+        if existing is not None:
+            return existing["id"]
+        return self.create(name, profile, mapping, unique=True, scope="app", process=process)
+
+    def update_mapping(self, identity: str, mapping: dict) -> None:
+        """Replace a saved preset's mapping without touching its switching state."""
+        document = self._load_document()
+        entry = self._find(document["presets"], identity)
+        entry["mapping"] = validate_mapping(mapping, entry["profile"])
+        self._save(document)
+
+    def replace_apps(self, profile: str, apps: list[dict]) -> int:
+        """Swap every app-scoped preset of one profile in a single write.
+
+        Global presets and the other remote model are kept untouched. Imported
+        entries get a fresh identifier and a de-duplicated name; a hotkey that
+        is already taken is dropped instead of failing the whole import.
+        """
+        if profile not in PROFILES:
+            raise ValueError("此配置的遥控器型号不受支持。")
+        document = self._load_document()
+        replaced = {entry["id"] for entry in document["presets"]
+                    if entry["profile"] == profile and entry["scope"] == "app"}
+        kept = [entry for entry in document["presets"] if entry["id"] not in replaced]
+        names = {entry["name"].casefold() for entry in kept if entry["profile"] == profile}
+        names.add(AUTO_NAME.casefold())
+        hotkeys = {entry["hotkey"].casefold() for entry in kept
+                   if entry["profile"] == profile and entry["hotkey"]}
+        processes = {entry["process"].casefold() for entry in kept
+                     if entry["profile"] == profile and entry["scope"] == "app"}
+        created = []
+        for app in apps:
+            name = validate_name(app["name"])
+            process = validate_process(app["process"], "app")
+            if process.casefold() in processes:
+                raise ValueError(f"已有配置绑定进程 {process}，请先修改或删除它。")
+            processes.add(process.casefold())
+            base, index = name, 2
+            while name.casefold() in names:
+                suffix = f" ({index})"
+                name = base[:64 - len(suffix)] + suffix
+                index += 1
+            names.add(name.casefold())
+            hotkey = validate_hotkey(app["hotkey"])
+            if hotkey and hotkey.casefold() in hotkeys:
+                hotkey = ""
+            if hotkey:
+                hotkeys.add(hotkey.casefold())
+            created.append({"id": str(uuid4()), "name": name, "profile": profile,
+                            "mapping": validate_mapping(app["mapping"], profile),
+                            "scope": "app", "process": process, "hotkey": hotkey})
+        document["presets"] = [*kept, *created]
+        document["applied_ids"] = {key: (AUTO_ID if value in replaced else value)
+                                   for key, value in document["applied_ids"].items()}
+        self._save(document)
+        return len(created)
+
     def import_file(self, path: Path, profile: str) -> str:
         document = _validate_document(_read(Path(path)))
         if document["profile"] != profile:
@@ -291,3 +544,12 @@ class PresetStore:
         document = _validate_document({"format": FORMAT, "schema_version": 1,
                     **{key: entry[key] for key in ("name", "profile", "mapping")}})
         config._save_json_atomic(destination, document)
+
+    def export_bundle(self, profile: str, global_mapping: dict,
+                      app_entries: list[dict], path: Path) -> None:
+        """Write the global layout and every application layout to one file."""
+        destination = Path(path).resolve()
+        if destination.is_relative_to(self.root.resolve()):
+            raise ValueError("请导出到桌面等位置，不能覆盖软件的数据目录。")
+        config._save_json_atomic(
+            destination, build_bundle(profile, global_mapping, app_entries))

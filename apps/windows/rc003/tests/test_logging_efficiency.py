@@ -78,17 +78,14 @@ class LoggingEfficiencyTests(unittest.TestCase):
 
     def test_disabled_voice_diagnostics_skip_capture_and_preserve_attempt_state(self):
         from ovb_rc003.app import RC003App
-        from ovb_rc003 import wetype_control_windows as hotkey
         with tempfile.TemporaryDirectory() as tmp:
             owner = RC003App.__new__(RC003App)
             owner._voice_attempt_id = None
             owner._voice_shortcut = types.SimpleNamespace(ui_confirmation='confirmed')
             owner._voice_text_observation = 'grew'
             owner._diagnostic_trace = trace.DiagnosticTrace(Path(tmp), enabled=False)
-            with mock.patch.object(trace, 'foreground_context') as capture, \
-                    mock.patch.object(hotkey, '_diagnostic_trace', owner._diagnostic_trace):
+            with mock.patch.object(trace, 'foreground_context') as capture:
                 owner._ensure_voice_diagnostic_attempt()
-                hotkey._trace('failure', capture_foreground=True)
                 capture.assert_not_called()
             self.assertEqual(owner._voice_attempt_id, '')
             self.assertEqual(owner._voice_shortcut.ui_confirmation, 'unknown')

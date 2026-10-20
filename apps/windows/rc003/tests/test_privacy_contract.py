@@ -67,9 +67,12 @@ _ELEVATION_MARKER_EXEMPT_FILENAMES = frozenset(
     {
         "hid_elevation_windows.py",
         "hid_source_injector.py",
-        "chromecast_pipe_windows.py",
         "vb_cable_bundle.py",
-        "voice_program_manager.py",
+        # Runs the bundled, SHA-256-pinned official Interception installer with
+        # Windows' own "runas"/UAC verb, only from an explicit user click in
+        # the button editor - never on startup, never silently, and only after
+        # the installer binary's hash matches the pinned constant.
+        "interception_driver_install.py",
     }
 )
 
@@ -134,20 +137,6 @@ class NoElevationOrAutoDriverTests(unittest.TestCase):
         for forbidden in ('RequireAdministrator', 'winreg.SetValueEx', 'schtasks', 'shell=True'):
             self.assertNotIn(forbidden, text)
 
-    def test_chromecast_elevation_uses_only_this_distribution_and_fixed_worker(self):
-        text = (_PACKAGE_ROOT / "chromecast_pipe_windows.py").read_text(encoding="utf-8")
-        tree = ast.parse(text)
-        launch = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "launch_worker")
-        self.assertEqual([arg.arg for arg in launch.args.args], ["identity", "parent"])
-        self.assertIn('info.verb, info.file = "runas", sys.executable', text)
-        self.assertIn('command += [WORKER_FLAG, str(parent.pid), str(parent.born), identity.entity, identity.generation, identity.token]', text)
-        self.assertNotIn("RequireAdministrator", text)
-        for name in ("sogou_normal_submit_test.py", "sogou_stop_probe.py"):
-            script = (_SOURCE_ROOT.parent / "scripts" / name).read_text(encoding="utf-8")
-            self.assertIn("IsUserAnAdmin", script)
-            for marker in ("runas", "ShellExecute", "RequireAdministrator", "winreg.SetValueEx"):
-                self.assertNotIn(marker, script)
-
     def test_no_admin_elevation_requested_in_source(self):
         offenders = []
         for path in _PY_FILES:
@@ -173,14 +162,26 @@ class NoElevationOrAutoDriverTests(unittest.TestCase):
         self.assertNotIn("RequireAdministrator", text)
         self.assertIn('os.startfile(path, "runas"', text)
 
-    def test_voice_program_elevation_is_scoped_to_the_selected_third_party_path(self):
-        path = _PACKAGE_ROOT / "voice_program_manager.py"
+    def test_interception_driver_install_elevation_is_scoped_to_the_pinned_installer(self):
+        # Proves the exemption above is not a blank check: the file must
+        # actually contain the elevation verb, must never reference an Inno
+        # Setup admin manifest or a self-elevation API, and must launch only
+        # the SHA-256-pinned bundled installer under an explicit /install or
+        # /uninstall argument - never this application's own executable or an
+        # arbitrary caller-supplied command.  cmd.exe is only the console-output
+        # redirect around that same pinned installer, with the same fixed argument.
+        path = _PACKAGE_ROOT / "interception_driver_install.py"
         text = path.read_text(encoding="utf-8")
-        self.assertIn('operation = "runas" if request_elevation else "open"', text)
-        self.assertIn("os.startfile(path, operation", text)
-        self.assertNotIn("sys.executable", text)
-        self.assertIn("winreg.QueryValueEx", text)
-        self.assertNotIn("winreg.SetValueEx", text)
+        self.assertIn('"runas"', text)
+        self.assertIn("ShellExecuteExW", text)
+        self.assertIn("INSTALLER_SHA256", text)
+        self.assertIn('INSTALL_ARGUMENT = "/install"', text)
+        self.assertIn('UNINSTALL_ARGUMENT = "/uninstall"', text)
+        self.assertIn('info.lpVerb = "runas"', text)
+        self.assertIn("cmd.exe", text)
+        self.assertIn("_launch(path, argument, log_path)", text)
+        self.assertNotIn("RequireAdministrator", text)
+        self.assertNotIn("PrivilegesRequired=admin", text)
 
     def test_hid_elevation_is_scoped_to_a_fixed_helper_and_task(self):
         path = _PACKAGE_ROOT / "hid_elevation_windows.py"
@@ -292,7 +293,7 @@ class ConfigPrivacyKeysNotHardcodedElsewhereTests(unittest.TestCase):
             if path.name == "config.py":
                 continue
             text = path.read_text(encoding="utf-8")
-            if path.name == "chromecast_gadget_windows.py":
+            if path.name == "gadget_windows.py":
                 # Frida's loopback listen address is not a saved device identity.
                 text = text.replace('"address": "127.0.0.1"', "", 1)
             for key in (
@@ -354,7 +355,7 @@ class UserControlledAutoStartTests(unittest.TestCase):
             "userstartup",
             "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
         )
-        allowed = {"startup_windows.py", "voice_program_manager.py"}
+        allowed = {"startup_windows.py"}
         for path in _PY_FILES:
             text = path.read_text(encoding="utf-8")
             for marker in markers:
@@ -368,16 +369,7 @@ class UserControlledAutoStartTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             if "winreg.SetValueEx" in text or "winreg.DeleteValue" in text:
                 writers.append(path.name)
-        self.assertEqual(sorted(writers), ["chromecast_etw_windows.py", "startup_windows.py"])
-        text = (_PACKAGE_ROOT / "chromecast_etw_windows.py").read_text(encoding="utf-8")
-        self.assertIn('_PARAMETERS_KEY = r"SYSTEM\\CurrentControlSet\\Services\\BthPort\\Parameters"', text)
-        self.assertIn('_SENSITIVE_VALUE = "EtwLogSensitiveData"', text)
-        self.assertIn('winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, _PARAMETERS_KEY,', text)
-        self.assertIn('_CAPTURE_SETTINGS = {_SENSITIVE_VALUE: 1, "MaxEtwBytes": 0x400, "EtwDropLargeEvents": 0}', text)
-        self.assertIn('winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)', text)
-        self.assertEqual(text.count("winreg.SetValueEx"), 1)
-        self.assertNotIn("winreg.DeleteValue", text)
-        self.assertNotIn("CurrentVersion\\Run", text)
+        self.assertEqual(sorted(writers), ["startup_windows.py"])
 
 
 if __name__ == "__main__":

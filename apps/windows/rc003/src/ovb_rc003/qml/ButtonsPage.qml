@@ -6,12 +6,32 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Effects
+import QtQuick.Dialogs
 import OvbRc003Settings 1.0
 
 Item {
     id: root
     property var tokens
-    MappingPresetsDialog { id: mappingPresetsDialog; tokens: root.tokens }
+    MappingAppPickerDialog { id: mappingAppPickerDialog; tokens: root.tokens }
+    // The application bar mirrors Logi Options+: the first chip is always the
+    // global layout, the rest are the saved applications, then a "+" chip.
+    readonly property var mappingChips: {
+        const chips = [{ id: "", name: qsTr("全局"), icon: "" }]
+        const apps = SettingsController.mappingAppProfiles
+        for (let i = 0; i < apps.length; ++i)
+            chips.push({ id: apps[i].id, name: apps[i].name, icon: apps[i].icon })
+        return chips
+    }
+    // The chip that is currently in effect, i.e. the layout the bridge is
+    // really using. The store marks it even when the user is editing another
+    // chip, so the bar can keep showing which application is live.
+    readonly property string appliedMappingChipId: {
+        const rows = SettingsController.mappingPresets
+        for (let i = 0; i < rows.length; ++i)
+            if (rows[i].applied)
+                return rows[i].automatic ? "" : rows[i].id
+        return ""
+    }
     readonly property var leftButtonIds: SettingsController.isRc003Device
         ? ["power", "up", "left", "back", "home", "menu"]
         : ["up", "left", "down", "back", "home", "youtube", "power"]
@@ -22,8 +42,10 @@ Item {
     property bool connectorRepaintQueued: false
     property var backTabTarget: null
     property var tabTarget: null
-    readonly property var firstFocusItem: rc003DeviceButton
-    readonly property var lastFocusItem: restoreMappingDefaultsButton
+    property string interceptionDriverMessage: ""
+    property string mappingMessage: ""
+    readonly property var firstFocusItem: addMappingAppButton
+    readonly property var lastFocusItem: uninstallInterceptionDriverButton
     readonly property bool hasPendingEditorDraft:
         actionEditor.visible && actionEditor.draftDirty
 
@@ -113,7 +135,7 @@ Item {
             hotspot.width / 2,
             hotspot.height / 2
         )
-        // Chromecast connectors stop at the marker edge;
+        // Connectors stop at the marker edge;
         // so neither the photo silhouette nor the line obscures the key symbol.
         const endX = center.x + (SettingsController.isRc003Device || hotspot.buttonId === "ok" ? 0
             : (leftSide ? -1 : 1) * hotspot.width / 2)
@@ -225,6 +247,147 @@ Item {
             wrapMode: Text.WordWrap
             text: qsTr("这会把当前遥控器的 %1 个按键恢复为内置映射，并立即自动保存。另一台的设置不变。")
                 .arg(SettingsController.isRc003Device ? 13 : 15)
+        }
+    }
+
+    // Deleting an application layout is destructive and one stray click on the
+    // chip's "×" used to remove it instantly, so ask first.
+    Dialog {
+        id: removeMappingAppConfirmDialog
+        objectName: "removeMappingAppConfirmDialog"
+        title: qsTr("移除应用程序？")
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(430, root.width - 28)
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        property string pendingProfileId: ""
+        property string pendingProfileName: ""
+        onAccepted: {
+            const result = SettingsController.removeMappingAppProfile(
+                removeMappingAppConfirmDialog.pendingProfileId)
+            root.mappingMessage = result.message
+        }
+
+        contentItem: ColumnLayout {
+            spacing: root.tokens.spacingLarge
+            UiLabel {
+                tokens: root.tokens
+                kind: bodyKind
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                text: qsTr("这会删除“%1”的按键布局，删除后无法撤销。全局布局和其他应用程序不受影响。")
+                    .arg(removeMappingAppConfirmDialog.pendingProfileName)
+            }
+        }
+    }
+
+    // "整体配置": one file holding the global layout plus every application
+    // layout, so a whole setup can be moved to another machine. Per-application
+    // switching itself lives on the application bar above the button list.
+    Dialog {
+        id: mappingBundleDialog
+        objectName: "mappingBundleDialog"
+        title: qsTr("整体配置")
+        modal: true
+        anchors.centerIn: parent
+        width: Math.min(430, root.width - 28)
+        standardButtons: Dialog.NoButton
+        property string message: ""
+        readonly property bool editable: !SettingsController.configurationReadOnly
+
+        onAboutToShow: message = ""
+
+        contentItem: ColumnLayout {
+            spacing: root.tokens.spacingLarge
+            UiLabel {
+                objectName: "mappingBundleHelp"
+                tokens: root.tokens
+                kind: noteKind
+                Layout.fillWidth: true
+                text: qsTr("“导出全部”会把全局按键和每个应用程序的按键存进同一个 JSON 文件；“导入全部”用它整体替换当前配置。应用程序的切换在按键页顶部的应用条上。")
+                wrapMode: Text.WordWrap
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: root.tokens.spacingSmall
+                CompactButton {
+                    objectName: "exportMappingBundleButton"
+                    tokens: root.tokens
+                    compactMinimumWidth: tokens.buttonWidth4Chars
+                    enabled: mappingBundleDialog.editable
+                    text: qsTr("导出全部")
+                    Accessible.name: qsTr("导出全部配置")
+                    onClicked: exportBundleDialog.open()
+                }
+                CompactButton {
+                    objectName: "importMappingBundleButton"
+                    tokens: root.tokens
+                    compactMinimumWidth: tokens.buttonWidth4Chars
+                    enabled: mappingBundleDialog.editable
+                    text: qsTr("导入全部")
+                    Accessible.name: qsTr("导入全部配置")
+                    onClicked: importBundleDialog.open()
+                }
+                Item { Layout.fillWidth: true }
+            }
+            UiLabel {
+                objectName: "mappingBundleMessage"
+                tokens: root.tokens
+                kind: noteKind
+                Layout.fillWidth: true
+                visible: text.length > 0
+                text: mappingBundleDialog.message
+                textFormat: Text.PlainText
+                wrapMode: Text.WrapAnywhere
+            }
+        }
+
+        FileDialog {
+            id: exportBundleDialog
+            objectName: "mappingBundleExportDialog"
+            title: qsTr("导出全部配置")
+            fileMode: FileDialog.SaveFile
+            defaultSuffix: "json"
+            nameFilters: [qsTr("整体配置 (*.json)")]
+            onAccepted: {
+                const result = SettingsController.exportMappingBundle(
+                    selectedFile.toString())
+                mappingBundleDialog.message = result.message
+            }
+        }
+
+        FileDialog {
+            id: importBundleDialog
+            objectName: "mappingBundleImportDialog"
+            title: qsTr("导入全部配置")
+            fileMode: FileDialog.OpenFile
+            nameFilters: [qsTr("整体配置 (*.json)")]
+            onAccepted: {
+                const result = SettingsController.importMappingBundle(
+                    selectedFile.toString())
+                mappingBundleDialog.message = result.message
+            }
+        }
+    }
+
+    Dialog {
+        id: interceptionInstallConfirmDialog
+        objectName: "interceptionInstallConfirmDialog"
+        title: qsTr("安装驱动？")
+        modal: true
+        anchors.centerIn: parent
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onAccepted: {
+            const result = SettingsController.installInterceptionDriver()
+            root.interceptionDriverMessage = result.message
+        }
+
+        UiLabel {
+            tokens: root.tokens
+            kind: bodyKind
+            width: 340
+            wrapMode: Text.WordWrap
+            text: qsTr("安装需要管理员权限，装完必须重启电脑才生效。软件只会启动随包附带的官方安装程序，绝不会静默安装。确定现在安装吗？")
         }
     }
 
@@ -662,6 +825,73 @@ Item {
         }
     }
 
+    component InjectModeCombo: ComboBox {
+        id: injectCombo
+        property var tokens
+
+        function syncFromMode(mode) {
+            currentIndex = -1
+            for (let i = 0; i < model.length; ++i) {
+                if (String(model[i].value) === String(mode)) {
+                    currentIndex = i
+                    break
+                }
+            }
+        }
+
+        editable: false
+        implicitHeight: tokens.controlHeight
+        leftPadding: 7
+        rightPadding: 22
+        font.family: tokens.fontFamily
+        font.pixelSize: tokens.fontSizeControl
+        displayText: currentIndex >= 0 && currentIndex < model.length
+            ? String(model[currentIndex].label) : ""
+
+        indicator: DropDownIndicator {
+            x: injectCombo.width - width - 7
+            y: (injectCombo.height - height) / 2
+            indicatorColor: injectCombo.enabled
+                ? tokens.textSecondary : tokens.disabledText
+        }
+
+        background: Rectangle {
+            radius: tokens.cornerRadiusControl
+            color: tokens.fieldBackground
+            border.width: tokens.hairlineWidth
+            border.color: injectCombo.activeFocus ? tokens.accent : tokens.border
+        }
+
+        delegate: ItemDelegate {
+            id: injectOptionDelegate
+            readonly property var option: modelData
+            readonly property bool unavailable: option && option.available === false
+            objectName: injectCombo.objectName + "_option_" + index
+            width: ListView.view ? ListView.view.width : injectCombo.width
+            height: tokens.controlHeight
+            leftPadding: 7
+            rightPadding: 7
+            highlighted: injectCombo.highlightedIndex === index
+            contentItem: Label {
+                text: injectOptionDelegate.option
+                    ? String(injectOptionDelegate.option.label) : ""
+                color: injectOptionDelegate.unavailable
+                    ? tokens.disabledText : tokens.textPrimary
+                font.family: tokens.fontFamily
+                font.pixelSize: tokens.fontSizeControl
+                font.weight: index === injectCombo.currentIndex
+                    ? Font.DemiBold : Font.Normal
+                verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
+            }
+            background: Rectangle {
+                color: injectOptionDelegate.highlighted
+                    ? tokens.accentSoft : tokens.surface
+            }
+            Accessible.name: contentItem.text
+        }
+    }
+
     Dialog {
         id: actionEditor
         objectName: "actionEditorDialog"
@@ -726,12 +956,14 @@ Item {
         property string primaryNote: ""
         property string doubleNote: ""
         property string longNote: ""
+        property string injectMode: "sendinput"
         property string originalPrimaryText: ""
         property string originalDoubleText: "未设置"
         property string originalLongText: "未设置"
         property string originalPrimaryNote: ""
         property string originalDoubleNote: ""
         property string originalLongNote: ""
+        property string originalInjectMode: "sendinput"
         property bool syncing: false
         property bool validationRequested: false
         onPrimaryTextChanged: validationRequested = false
@@ -739,20 +971,51 @@ Item {
         onLongTextChanged: validationRequested = false
         readonly property string normalizedPrimaryText: primaryText.trim()
         readonly property bool primaryIsVoice:
-            normalizedPrimaryText === "按住说话"
+            SettingsController.isVoiceActionText(normalizedPrimaryText)
             || normalizedPrimaryText.indexOf("已停用：旧语音配置") === 0
+        property string injectModeBlockReason: ""
         readonly property string primaryValidationError: rowIndex >= 0
             ? SettingsController.buttonActionValidationMessage(
-                buttonId, "single_click", primaryText
+                buttonId, "single_click", primaryText, injectMode
             ) : ""
         readonly property string doubleValidationError: rowIndex >= 0
             ? SettingsController.buttonActionValidationMessage(
-                buttonId, "double_click", doubleText
+                buttonId, "double_click", doubleText, injectMode
             ) : ""
         readonly property string longValidationError: rowIndex >= 0
             ? SettingsController.buttonActionValidationMessage(
-                buttonId, "long_press", longText
+                buttonId, "long_press", longText, injectMode
             ) : ""
+
+        function interceptionBlockReason() {
+            if (rowIndex < 0)
+                return ""
+            const texts = [
+                ["single_click", primaryText],
+                ["double_click", doubleText],
+                ["long_press", longText]
+            ]
+            for (let i = 0; i < texts.length; ++i) {
+                const message = SettingsController.buttonActionValidationMessage(
+                    buttonId, texts[i][0], texts[i][1], "interception"
+                )
+                if (message.length > 0)
+                    return message
+            }
+            return ""
+        }
+        readonly property string injectModeHintText: {
+            if (injectModeBlockReason.length > 0)
+                return injectModeBlockReason
+            if (injectMode === "interception") {
+                const reason = interceptionBlockReason()
+                if (reason.length > 0)
+                    return reason
+            }
+            if (!SettingsController.interceptionAvailable)
+                return SettingsController.interceptionUnavailableHint
+            return ""
+        }
         readonly property string validationError:
             primaryValidationError.length > 0 ? primaryValidationError
             : doubleValidationError.length > 0 ? doubleValidationError
@@ -764,12 +1027,14 @@ Item {
             || primaryNote !== originalPrimaryNote
             || doubleNote !== originalDoubleNote
             || longNote !== originalLongNote
+            || injectMode !== originalInjectMode
 
         function openForRow(rowIndexValue, buttonIdValue, buttonNameValue,
                             primaryValue, doubleValue, longValue,
                             primaryNoteValue, doubleNoteValue, longNoteValue) {
             syncing = true
             validationRequested = false
+            injectModeBlockReason = ""
             rowIndex = rowIndexValue
             buttonId = buttonIdValue
             buttonName = buttonNameValue
@@ -779,15 +1044,18 @@ Item {
             primaryNote = primaryNoteValue
             doubleNote = doubleNoteValue
             longNote = longNoteValue
+            injectMode = SettingsController.buttonInjectMode(buttonIdValue)
             originalPrimaryText = primaryValue
             originalDoubleText = doubleValue
             originalLongText = longValue
             originalPrimaryNote = primaryNoteValue
             originalDoubleNote = doubleNoteValue
             originalLongNote = longNoteValue
+            originalInjectMode = injectMode
             primaryCombo.setEditorValue(primaryValue)
             doubleCombo.setEditorValue(doubleValue)
             longCombo.setEditorValue(longValue)
+            injectModeCombo.syncFromMode(injectMode)
             primaryNoteField.text = primaryNoteValue
             doubleNoteField.text = doubleNoteValue
             longNoteField.text = longNoteValue
@@ -833,6 +1101,7 @@ Item {
             ButtonMappingModel.setDisplayNoteAt(
                 rowIndex, "long_press", longNote
             )
+            SettingsController.setButtonInjectMode(buttonId, injectMode)
             close()
             return true
         }
@@ -886,8 +1155,8 @@ Item {
                         tokens: root.tokens
                         active: primaryGestureTitleHover.hovered
                         text: actionEditor.buttonId === "mic"
-                            ? qsTr("话筒键可选按住说话、普通动作、快捷键或 Quicker URI；滚轮点按一格，按住连滚并提速；启动应用需已安装")
-                            : qsTr("可选普通动作、快捷键或 Quicker URI；滚轮点按一格，按住连滚并提速；启动应用需已安装")
+                            ? qsTr("按键可选语音一/二/三（按住说话）、普通动作、快捷键或 Quicker URI；滚轮点按一格，按住连滚并提速；启动应用需已安装")
+                            : qsTr("按键可选语音一/二/三、普通动作、快捷键或 Quicker URI；滚轮点按一格，按住连滚并提速；启动应用需已安装")
                     }
                 }
                 RowLayout {
@@ -1081,6 +1350,67 @@ Item {
                     }
                     Accessible.name: qsTr("长按备注名称")
                 }
+
+                UiLabel {
+                    id: injectModeTitle
+                    objectName: "actionEditorInjectModeTitle"
+                    tokens: root.tokens
+                    kind: bodyKind
+                    text: qsTr("注入方式")
+                    font.pixelSize: tokens.fontSizeControl
+                    font.weight: Font.Medium
+                    Layout.fillHeight: true
+                    verticalAlignment: Text.AlignVCenter
+                    HoverHandler { id: injectModeTitleHover }
+                    CompactToolTip {
+                        tokens: root.tokens
+                        active: injectModeTitleHover.hovered
+                        text: qsTr("该按键所有动作使用的注入后端；Interception 需要安装驱动，未安装时不可用。元素导航、打开应用等非普通按键动作只支持 SendInput")
+                    }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: tokens.spacingSmall
+
+                    InjectModeCombo {
+                        id: injectModeCombo
+                        objectName: "actionEditorInjectModeCombo"
+                        tokens: root.tokens
+                        Layout.fillWidth: true
+                        model: SettingsController.injectModeOptions
+                        Accessible.name: actionEditor.buttonName + qsTr("注入方式")
+                        onActivated: {
+                            const option = model[index]
+                            if (!option || option.available === false) {
+                                injectModeCombo.syncFromMode(actionEditor.injectMode)
+                                return
+                            }
+                            const value = String(option.value)
+                            const blockReason = value === "interception"
+                                ? actionEditor.interceptionBlockReason() : ""
+                            if (blockReason.length > 0) {
+                                actionEditor.injectModeBlockReason = blockReason
+                                injectModeCombo.syncFromMode(actionEditor.injectMode)
+                                return
+                            }
+                            actionEditor.injectModeBlockReason = ""
+                            actionEditor.injectMode = value
+                        }
+                    }
+                }
+                UiLabel {
+                    id: injectModeHint
+                    objectName: "actionEditorInjectModeHint"
+                    tokens: root.tokens
+                    kind: noteKind
+                    Layout.preferredWidth: 126
+                    Layout.minimumWidth: 126
+                    Layout.maximumWidth: 126
+                    visible: actionEditor.injectModeHintText.length > 0
+                    text: actionEditor.injectModeHintText
+                    wrapMode: Text.WordWrap
+                }
+
             }
 
             UiLabel {
@@ -1135,37 +1465,203 @@ Item {
                 objectName: "mappingViewSwitcher"
                 tokens: root.tokens
                 Layout.fillWidth: true
-                Layout.preferredHeight: 36
                 horizontalPadding: 3
                 verticalPadding: 3
                 radius: tokens.cornerRadiusSmall
+                contentSpacing: 3
 
-                RowLayout {
+                // One chip per layout: "全局" first, then every saved
+                // application, then "+" to add another one. Clicking a chip
+                // points the button list below at that layout.
+                Flickable {
+                    id: mappingChipView
+                    objectName: "mappingChipView"
                     Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    spacing: 3
+                    Layout.preferredHeight: 28
+                    contentWidth: mappingChipRow.implicitWidth
+                    contentHeight: height
+                    clip: true
+                    flickableDirection: Flickable.HorizontalFlick
+                    boundsBehavior: Flickable.StopAtBounds
+                    ScrollBar.horizontal: ScrollBar {
+                        objectName: "mappingChipScrollBar"
+                        policy: ScrollBar.AsNeeded
+                    }
 
-                    CompactButton {
-                        id: rc003DeviceButton
-                        objectName: "rc003DeviceButton"
-                        tokens: root.tokens
-                        Layout.fillWidth: true
-                        Layout.preferredWidth: 1
-                        text: SettingsController.deviceOptions[0]
-                        highlighted: SettingsController.isRc003Device
-                        subduedText: !highlighted
-                        KeyNavigation.backtab: root.backTabTarget
+                    Row {
+                        id: mappingChipRow
+                        height: mappingChipView.height
+                        spacing: 4
+
+                        Repeater {
+                            model: root.mappingChips
+                            delegate: Rectangle {
+                                id: mappingChip
+                                required property var modelData
+                                required property int index
+                                readonly property bool isGlobal: modelData.id === ""
+                                readonly property bool active:
+                                    SettingsController.mappingEditTarget === modelData.id
+                                readonly property bool inEffect:
+                                    root.appliedMappingChipId === modelData.id
+
+                                objectName: isGlobal ? "mappingChip_global"
+                                                     : "mappingChip_" + (index - 1)
+                                width: chipContent.implicitWidth + 16
+                                height: 28
+                                radius: root.tokens.cornerRadiusControl
+                                color: active ? root.tokens.accent
+                                    : chipHover.hovered ? root.tokens.buttonHover
+                                        : root.tokens.surfaceMuted
+                                border.width: active ? 0 : root.tokens.hairlineWidth
+                                border.color: root.tokens.border
+                                Accessible.name: modelData.name
+
+                                HoverHandler { id: chipHover }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: SettingsController.selectMappingEditTarget(
+                                        mappingChip.modelData.id)
+                                }
+                                RowLayout {
+                                    id: chipContent
+                                    anchors.fill: parent
+                                    anchors.leftMargin: 8
+                                    anchors.rightMargin: 8
+                                    spacing: 6
+
+                                    Item {
+                                        Layout.preferredWidth: 16
+                                        Layout.preferredHeight: 16
+                                        Layout.alignment: Qt.AlignVCenter
+                                        Image {
+                                            anchors.fill: parent
+                                            visible: mappingChip.modelData.icon.length > 0
+                                            source: mappingChip.modelData.icon
+                                            sourceSize.width: 16
+                                            sourceSize.height: 16
+                                            fillMode: Image.PreserveAspectFit
+                                            smooth: true
+                                        }
+                                        IconGlyph {
+                                            anchors.centerIn: parent
+                                            visible: mappingChip.modelData.icon.length === 0
+                                                && mappingChip.isGlobal
+                                            tokens: root.tokens
+                                            glyphSize: 14
+                                            glyph: "\uE774"
+                                            color: mappingChip.active
+                                                ? root.tokens.accentText
+                                                : root.tokens.textPrimary
+                                        }
+                                        Label {
+                                            anchors.centerIn: parent
+                                            visible: mappingChip.modelData.icon.length === 0
+                                                && !mappingChip.isGlobal
+                                            text: mappingChip.modelData.name.length > 0
+                                                ? mappingChip.modelData.name.charAt(0) : "?"
+                                            font.family: root.tokens.fontFamily
+                                            font.pixelSize: root.tokens.fontSizeControl
+                                            color: mappingChip.active
+                                                ? root.tokens.accentText
+                                                : root.tokens.textSecondary
+                                        }
+                                    }
+                                    Item {
+                                        objectName: mappingChip.isGlobal
+                                            ? "mappingChipInEffect_global"
+                                            : "mappingChipInEffect_" + (mappingChip.index - 1)
+                                        visible: mappingChip.inEffect
+                                        Layout.preferredWidth: visible ? 12 : 0
+                                        Layout.preferredHeight: 12
+                                        Layout.alignment: Qt.AlignVCenter
+                                        IconGlyph {
+                                            anchors.centerIn: parent
+                                            tokens: root.tokens
+                                            glyphSize: 11
+                                            glyph: "\uE73E"
+                                            color: mappingChip.active
+                                                ? root.tokens.accentText
+                                                : root.tokens.accent
+                                        }
+                                    }
+                                    Label {
+                                        Layout.alignment: Qt.AlignVCenter
+                                        text: mappingChip.modelData.name
+                                        font.family: root.tokens.fontFamily
+                                        font.pixelSize: root.tokens.fontSizeControl
+                                        color: mappingChip.active
+                                            ? root.tokens.accentText
+                                            : root.tokens.textPrimary
+                                        elide: Text.ElideRight
+                                    }
+                                    Item {
+                                        visible: !mappingChip.isGlobal
+                                        Layout.preferredWidth: visible ? 14 : 0
+                                        Layout.preferredHeight: 14
+                                        Layout.alignment: Qt.AlignVCenter
+                                        IconGlyph {
+                                            anchors.centerIn: parent
+                                            tokens: root.tokens
+                                            glyphSize: 11
+                                            glyph: "\uE711"
+                                            color: removeChipHover.hovered
+                                                ? root.tokens.errorColor
+                                                : mappingChip.active
+                                                    ? root.tokens.accentText
+                                                    : root.tokens.textSecondary
+                                        }
+                                        HoverHandler { id: removeChipHover }
+                                        MouseArea {
+                                            objectName: mappingChip.isGlobal ? ""
+                                                : "removeMappingAppButton_" + (mappingChip.index - 1)
+                                            anchors.fill: parent
+                                            enabled: !SettingsController.configurationReadOnly
+                                            Accessible.name: qsTr("移除")
+                                                + mappingChip.modelData.name
+                                            onClicked: {
+                                                // Removing the chip rebuilds
+                                                // this repeater and tears the
+                                                // delegate down, so capture the
+                                                // target before showing the
+                                                // confirmation.
+                                                removeMappingAppConfirmDialog.pendingProfileId =
+                                                    mappingChip.modelData.id
+                                                removeMappingAppConfirmDialog.pendingProfileName =
+                                                    mappingChip.modelData.name
+                                                removeMappingAppConfirmDialog.open()
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        CompactButton {
+                            id: addMappingAppButton
+                            objectName: "addMappingAppButton"
+                            tokens: root.tokens
+                            width: 28
+                            height: 28
+                            compactMinimumWidth: 0
+                            text: "+"
+                            enabled: !SettingsController.configurationReadOnly
+                            Accessible.name: qsTr("添加应用程序")
+                            onClicked: mappingAppPickerDialog.open()
+                            KeyNavigation.backtab: root.backTabTarget
+                            KeyNavigation.tab: root.tabTarget
+                        }
                     }
-                    CompactButton {
-                        id: futureDeviceButton
-                        objectName: "futureDeviceButton"
-                        tokens: root.tokens
-                        Layout.fillWidth: true
-                        Layout.preferredWidth: 1
-                        text: SettingsController.deviceOptions[1]
-                        highlighted: !SettingsController.isRc003Device
-                        subduedText: !highlighted
-                    }
+                }
+
+                UiLabel {
+                    objectName: "mappingMessage"
+                    tokens: root.tokens
+                    kind: noteKind
+                    Layout.fillWidth: true
+                    visible: text.length > 0
+                    text: root.mappingMessage
+                    elide: Text.ElideRight
                 }
             }
 
@@ -1278,15 +1774,14 @@ Item {
                             Layout.preferredHeight: visible ? implicitHeight : 0
                             buttonName: root.shortButtonName(buttonId)
                             keyLabelWidth: root.mappingKeyLabelWidth
-                            singleText: !SettingsController.isRc003Device && buttonId === "mic"
-                                ? SettingsController.remoteRecordingModeText : actionText
+                            singleText: actionText
                             doubleText: doubleClickText
                             longText: longPressText
                             singleNoteText: singleNote
                             doubleNoteText: doubleNote
                             longNoteText: longNote
                             selected: isSelected
-                            voiceAction: actionText.trim() === "按住说话"
+                            voiceAction: SettingsController.isVoiceActionText(actionText.trim())
                                 || actionText.indexOf("已停用：旧语音配置") === 0
                             onXChanged: root.scheduleConnectorRepaint()
                             onYChanged: root.scheduleConnectorRepaint()
@@ -1499,15 +1994,14 @@ Item {
                             Layout.preferredHeight: visible ? implicitHeight : 0
                             buttonName: root.shortButtonName(buttonId)
                             keyLabelWidth: root.mappingKeyLabelWidth
-                            singleText: !SettingsController.isRc003Device && buttonId === "mic"
-                                ? SettingsController.remoteRecordingModeText : actionText
+                            singleText: actionText
                             doubleText: doubleClickText
                             longText: longPressText
                             singleNoteText: singleNote
                             doubleNoteText: doubleNote
                             longNoteText: longNote
                             selected: isSelected
-                            voiceAction: actionText.trim() === "按住说话"
+                            voiceAction: SettingsController.isVoiceActionText(actionText.trim())
                                 || actionText.indexOf("已停用：旧语音配置") === 0
                             onXChanged: root.scheduleConnectorRepaint()
                             onYChanged: root.scheduleConnectorRepaint()
@@ -1565,7 +2059,6 @@ Item {
                             : SettingsController.keyDetectionText + qsTr("；检测时不启动录音")
                         elide: Text.ElideRight
                     }
-                    Item { Layout.fillWidth: true }
                     CompactButton {
                         id: restoreMappingDefaultsButton
                         objectName: "restoreMappingDefaultsButton"
@@ -1573,16 +2066,78 @@ Item {
                         compactMinimumWidth: tokens.buttonWidth6Chars
                         text: qsTr("恢复内置默认")
                         onClicked: restoreMappingDefaultsDialog.open()
-                        KeyNavigation.tab: manageMappingPresetsButton
+                        KeyNavigation.tab: manageMappingBundleButton
                     }
                     CompactButton {
-                        id: manageMappingPresetsButton
-                        objectName: "manageMappingPresetsButton"
+                        id: manageMappingBundleButton
+                        objectName: "manageMappingBundleButton"
                         tokens: root.tokens
                         compactMinimumWidth: tokens.buttonWidth6Chars
-                        text: qsTr("管理按键配置")
+                        text: qsTr("整体配置")
+                        Accessible.name: qsTr("整体配置导入导出")
                         enabled: !SettingsController.settingsSaveBusy && !SettingsController.keyDetectionActive
-                        onClicked: mappingPresetsDialog.open()
+                        onClicked: mappingBundleDialog.open()
+                        KeyNavigation.tab: installInterceptionDriverButton
+                    }
+                    UiLabel {
+                        id: interceptionDriverTitle
+                        objectName: "actionEditorInterceptionDriverTitle"
+                        tokens: root.tokens
+                        kind: bodyKind
+                        text: qsTr("驱动")
+                        font.pixelSize: tokens.fontSizeControl
+                        font.weight: Font.Medium
+                        Layout.fillHeight: true
+                        verticalAlignment: Text.AlignVCenter
+                        HoverHandler { id: interceptionDriverTitleHover }
+                        CompactToolTip {
+                            tokens: root.tokens
+                            active: interceptionDriverTitleHover.hovered
+                            text: qsTr("Interception 需要一次性安装内核驱动（管理员权限，安装后需重启电脑）；此处的按钮只启动随包的官方安装程序，绝不会静默安装")
+                        }
+                    }
+                    UiLabel {
+                        objectName: "actionEditorInterceptionDriverMessage"
+                        tokens: root.tokens
+                        kind: noteKind
+                        Layout.fillWidth: true
+                        visible: text.length > 0
+                        text: SettingsController.interceptionInstallerAvailable
+                            ? root.interceptionDriverMessage
+                            : SettingsController.interceptionInstallerUnavailableReason
+                        elide: Text.ElideRight
+                        HoverHandler { id: interceptionDriverMessageHover }
+                        CompactToolTip {
+                            tokens: root.tokens
+                            active: interceptionDriverMessageHover.hovered && text.length > 0
+                            text: SettingsController.interceptionInstallerAvailable
+                                ? root.interceptionDriverMessage
+                                : SettingsController.interceptionInstallerUnavailableReason
+                        }
+                    }
+                    CompactButton {
+                        id: installInterceptionDriverButton
+                        objectName: "actionEditorInterceptionInstallButton"
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth4Chars
+                        enabled: SettingsController.interceptionInstallerAvailable
+                        text: qsTr("安装驱动")
+                        Accessible.name: qsTr("安装 Interception 驱动")
+                        onClicked: interceptionInstallConfirmDialog.open()
+                        KeyNavigation.tab: uninstallInterceptionDriverButton
+                    }
+                    CompactButton {
+                        id: uninstallInterceptionDriverButton
+                        objectName: "actionEditorInterceptionUninstallButton"
+                        tokens: root.tokens
+                        compactMinimumWidth: tokens.buttonWidth4Chars
+                        enabled: SettingsController.interceptionInstallerAvailable
+                        text: qsTr("卸载驱动")
+                        Accessible.name: qsTr("卸载 Interception 驱动")
+                        onClicked: {
+                            const result = SettingsController.uninstallInterceptionDriver()
+                            root.interceptionDriverMessage = result.message
+                        }
                         KeyNavigation.tab: root.tabTarget
                     }
                 }

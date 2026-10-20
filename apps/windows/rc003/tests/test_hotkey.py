@@ -98,19 +98,6 @@ class HotkeySpecTests(unittest.TestCase):
                             win32_keys.resolve_vk_codes((*expected.modifiers, expected.key)),
                         )
 
-    def test_default_voice_hotkey_uses_the_hold_to_talk_key(self):
-        self.assertEqual(hotkey.DEFAULT_VOICE_HOTKEY.serialize(), "ralt")
-
-    def test_voice_hotkey_presets_are_owned_by_the_trigger_mode_model(self):
-        self.assertEqual(
-            key_mapping.voice_hotkey_for_trigger_mode(key_mapping.VoiceTriggerMode.TOGGLE),
-            "ralt+space",
-        )
-        self.assertEqual(
-            key_mapping.voice_hotkey_for_trigger_mode(key_mapping.VoiceTriggerMode.HOLD),
-            "ralt",
-        )
-
     def test_three_key_chord_still_round_trips_as_a_custom_shortcut(self):
         spec = hotkey.HotkeySpec.parse("ctrl+alt+f8")
         self.assertEqual(spec.modifiers, ("ctrl", "alt"))
