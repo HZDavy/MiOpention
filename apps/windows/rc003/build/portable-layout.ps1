@@ -245,27 +245,22 @@ function Assert-RC003PortableZip {
         $stagingRoot = (Resolve-Path -LiteralPath $StagingDirectory).Path.TrimEnd(
             $pathSeparators
         )
+        # Enumerate by relative name instead of slicing FullName by the
+        # staging-root length: Resolve-Path can hand back an 8.3 short form
+        # (RUNNER~1) while Get-ChildItem reports canonical long FullNames, so
+        # any length-based prefix cut silently eats characters out of the
+        # relative path on a runner whose TEMP is reached through a short name.
         $stagingFiles = @(
-            Get-ChildItem -LiteralPath $stagingRoot -Force -File -Recurse | ForEach-Object {
-                # Resolve-Path canonicalizes 8.3 short names (RUNNER~1), while
-                # Get-ChildItem echoes whatever spelling it was given; cutting
-                # the prefix by length would then slice into the relative path
-                # and produce a bogus ZIP entry name. Fall back to the
-                # canonical file path whenever the two spellings disagree.
-                $filePath = $_.FullName
-                if (-not $filePath.StartsWith(
-                    $stagingRoot,
-                    [System.StringComparison]::OrdinalIgnoreCase
-                )) {
-                    $filePath = (Resolve-Path -LiteralPath $filePath).Path
-                }
-                $relativePath = $filePath.Substring($stagingRoot.Length).TrimStart(
-                    $pathSeparators
-                ).Replace([System.IO.Path]::DirectorySeparatorChar, [char]47)
+            foreach ($relativePath in @(
+                Get-ChildItem -LiteralPath $stagingRoot -Force -File -Recurse -Name
+            )) {
+                $fullName = Join-Path $stagingRoot $relativePath
                 [pscustomobject]@{
-                    EntryName = "$TopLevelName/$relativePath"
-                    FullName = $_.FullName
-                    Length = $_.Length
+                    EntryName = "$TopLevelName/" + $relativePath.Replace(
+                        [System.IO.Path]::DirectorySeparatorChar, [char]47
+                    )
+                    FullName = $fullName
+                    Length = (Get-Item -LiteralPath $fullName).Length
                 }
             }
         )
