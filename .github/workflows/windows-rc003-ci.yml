@@ -157,6 +157,12 @@ jobs:
           ./build/fetch-frida-gadget.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Fetch and verify Interception driver pack
+        shell: pwsh
+        run: |
+          ./build/fetch-interception.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Capture checked build inputs
         shell: pwsh
         run: |
