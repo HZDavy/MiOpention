@@ -479,6 +479,48 @@ class PhysicalModifierTrackingTests(unittest.TestCase):
         trace.emit.assert_called_once()
         self.assertEqual(trace.emit.call_args.args, ("input_physical_state_reconciled",))
 
+    def test_generic_alt_reconciles_only_a_stale_right_alt_owner(self):
+        physicalizer._set_physical_tracker_active(True, _query=lambda _vk: False)
+        physicalizer.record_physical_key_event(
+            self._event(physicalizer.VK_RMENU), physicalizer.WM_KEYDOWN
+        )
+        self._age_right_alt_owner()
+        query = mock.Mock(return_value=False)
+
+        self.assertFalse(
+            physicalizer.physical_key_is_down_before_injection(
+                physicalizer.VK_MENU, _query=query
+            )
+        )
+
+        query.assert_any_call(physicalizer.VK_LMENU)
+        query.assert_any_call(physicalizer.VK_RMENU)
+        self.assertFalse(physicalizer.physical_key_is_down(physicalizer.VK_RMENU))
+
+    def test_generic_alt_keeps_left_alt_and_fresh_right_alt_fail_closed(self):
+        physicalizer._set_physical_tracker_active(True, _query=lambda _vk: False)
+        left_alt = self._event(physicalizer.VK_LMENU)
+        physicalizer.record_physical_key_event(left_alt, physicalizer.WM_KEYDOWN)
+        left_query = mock.Mock(return_value=False)
+        self.assertTrue(
+            physicalizer.physical_key_is_down_before_injection(
+                physicalizer.VK_MENU, _query=left_query
+            )
+        )
+        left_query.assert_not_called()
+
+        physicalizer.record_physical_key_event(left_alt, physicalizer.WM_KEYUP)
+        physicalizer.record_physical_key_event(
+            self._event(physicalizer.VK_RMENU), physicalizer.WM_KEYDOWN
+        )
+        right_query = mock.Mock(return_value=False)
+        self.assertTrue(
+            physicalizer.physical_key_is_down_before_injection(
+                physicalizer.VK_MENU, _query=right_query
+            )
+        )
+        right_query.assert_not_called()
+
     def test_delayed_down_gets_its_freshness_time_when_installed(self):
         physicalizer._set_physical_tracker_active(True, _query=lambda _vk: False)
         real_lock = physicalizer._PHYSICAL_KEY_STATE_LOCK

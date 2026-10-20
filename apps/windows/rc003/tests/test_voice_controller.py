@@ -1,17 +1,16 @@
 import unittest
 
-from ovb_rc003.key_mapping import VoiceTriggerMode
 from ovb_rc003.voice_controller import VoiceController, VoiceHostAction
 
 
 class HoldModeTests(unittest.TestCase):
-    def test_default_controller_is_hold_to_talk(self):
+    def test_controller_has_no_trigger_mode_configuration(self):
         controller = VoiceController()
-        self.assertEqual(controller.trigger_mode, VoiceTriggerMode.HOLD)
+        self.assertFalse(hasattr(controller, "trigger_mode"))
 
-    def test_toggle_mode_is_rejected(self):
-        with self.assertRaises(ValueError):
-            VoiceController(VoiceTriggerMode.TOGGLE)
+    def test_controller_accepts_no_constructor_argument(self):
+        with self.assertRaises(TypeError):
+            VoiceController("toggle")
 
     def test_press_holds_key_down(self):
         controller = VoiceController()

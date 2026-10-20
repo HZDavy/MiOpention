@@ -146,17 +146,6 @@ class WinRTModules:
     bluetooth_cache_mode: Any
 
 
-@dataclass(frozen=True)
-class _CandidateDeviceHandle:
-    """Thread-safe snapshot of the one WinRT field a probe needs."""
-
-    id: str
-
-
-_candidate_probe_threads_lock = threading.Lock()
-_candidate_probe_threads: dict[str, threading.Thread] = {}
-
-
 def _import_winrt() -> WinRTModules:
     try:
         from winrt.windows.devices.bluetooth import (
@@ -335,75 +324,20 @@ async def _candidate_has_voice_service_with_hard_timeout(
     winrt: Optional[WinRTModules],
     timeout: float,
 ) -> Optional[bool]:
-    """Probe without letting an uncancellable WinRT call hang the bridge.
+    """Own the real native query in a terminable process, not a parked thread.
 
-    A stale paired record can leave a Windows Bluetooth operation stuck even
-    after asyncio requests cancellation. Run that operation on a daemon
-    thread with its own event loop so the bridge can abandon it at the real
-    deadline. Only the device ID string crosses the thread boundary.
+    Injected WinRT projections are in-memory test doubles; real production
+    callers never provide one and always use the process ownership boundary.
     """
-
-    device_id = str(candidate.handle.id)
-    worker_candidate = identity.RC003Candidate(
-        name=candidate.name,
-        hardware_match=candidate.hardware_match,
-        handle=_CandidateDeviceHandle(device_id),
-    )
-    loop = asyncio.get_running_loop()
-    result_future = loop.create_future()
-
-    with _candidate_probe_threads_lock:
-        existing = _candidate_probe_threads.get(device_id)
-        if existing is not None and existing.is_alive():
+    if winrt is not None:
+        try:
+            return await asyncio.wait_for(
+                _candidate_has_voice_service(candidate, winrt),
+                timeout=max(0.001, float(timeout)))
+        except TimeoutError:
             return None
-
-        def worker() -> None:
-            try:
-                modules = winrt or _import_winrt()
-                result = bool(
-                    asyncio.run(
-                        _candidate_has_voice_service(worker_candidate, modules)
-                    )
-                )
-            except BaseException as exc:  # noqa: BLE001 - sanitized below
-                _logger.info(
-                    "ATVV candidate probe worker failed: error_type=%s",
-                    type(exc).__name__,
-                )
-                result = False
-            finally:
-                with _candidate_probe_threads_lock:
-                    current = _candidate_probe_threads.get(device_id)
-                    if current is threading.current_thread():
-                        _candidate_probe_threads.pop(device_id, None)
-
-            def publish_result() -> None:
-                if not result_future.done():
-                    result_future.set_result(result)
-
-            try:
-                loop.call_soon_threadsafe(publish_result)
-            except RuntimeError:
-                # The owning loop may already be closed during process exit.
-                pass
-
-        thread = threading.Thread(
-            target=worker,
-            name="rc003-candidate-probe",
-            daemon=True,
-        )
-        _candidate_probe_threads[device_id] = thread
-        thread.start()
-
-    try:
-        return bool(
-            await asyncio.wait_for(
-                result_future,
-                timeout=max(0.001, float(timeout)),
-            )
-        )
-    except TimeoutError:
-        return None
+    from . import ble_candidate_probe_process
+    return await ble_candidate_probe_process.probe(str(candidate.handle.id), timeout=timeout)
 
 
 async def select_connectable_candidate(
@@ -418,10 +352,13 @@ async def select_connectable_candidate(
 ) -> identity.RC003Candidate:
     """Resolve the selected RC003 without probing other physical remotes.
 
-    Production callers pass selected_key: missing or ambiguous matches fail
-    closed. The optional-key path remains for standalone discovery diagnostics;
-    it probes ATVV only for multiple profile matches and accepts exactly one
-    reachable candidate. Neither path guesses by enumeration order.
+    Production callers pass selected_key and first restrict candidates to that
+    identity. Windows can expose multiple BLE records for the same ContainerId;
+    probe those records and accept exactly one reachable ATVV service. A single
+    record keeps the normal connection fast path. Missing identities, no usable
+    record or multiple usable records still fail closed. The optional-key path
+    remains for standalone discovery diagnostics. Neither path guesses by
+    enumeration order or falls back outside the requested selection.
     """
 
     qualifying = identity.qualifying_candidates(candidates)
@@ -430,7 +367,6 @@ async def select_connectable_candidate(
         if not remote_selection.valid_key(selected_key):
             raise identity.NoCandidateFoundError("no selected remote")
         qualifying = [candidate for candidate in qualifying if candidate.device_key == selected_key]
-        return identity.select_single_candidate(qualifying)
     if len(qualifying) <= 1:
         return identity.select_single_candidate(qualifying)
 
@@ -542,6 +478,13 @@ class RC003BleSession:
         self._worker_thread: Optional[threading.Thread] = None
         self._worker_stop = threading.Event()
         self.dropped_event_count = 0
+        # Forensics: raw AUDIO-characteristic notification arrivals for the
+        # current session, independent of whether the decoder/forwarding path
+        # keeps the samples. Logged on AUDIO_STOP so a "frames=0 result=empty"
+        # summary can be attributed to the device (no bytes arrived) or to the
+        # host (bytes arrived but were dropped downstream).
+        self._raw_audio_notifications = 0
+        self._raw_audio_bytes = 0
         # Gates the thread-safe mic command writes while teardown is active.
         self._closing = False
         # Every thread-safe mic command task is tracked so close() can
@@ -916,8 +859,18 @@ class RC003BleSession:
                 continue  # stale event from a previous/torn-down session
             try:
                 if kind == "control":
+                    if payload and payload[0] == proto.OPCODE_AUDIO_START:
+                        # New stream: raw arrival counters describe this
+                        # session only.
+                        self._raw_audio_notifications = 0
+                        self._raw_audio_bytes = 0
                     if payload and payload[0] == proto.OPCODE_AUDIO_STOP:
                         self._drain_audio_before_stop(generation, sequence)
+                        _logger.info(
+                            "ATVV raw audio received: notifications=%d bytes=%d",
+                            self._raw_audio_notifications,
+                            self._raw_audio_bytes,
+                        )
                     self._process_control(payload)
                 elif kind == "audio":
                     self._process_audio(payload, sequence)
@@ -986,6 +939,8 @@ class RC003BleSession:
             self._on_control_event(event)
 
     def _process_audio(self, payload: bytes, sequence: Optional[int] = None) -> None:
+        self._raw_audio_notifications += 1
+        self._raw_audio_bytes += len(payload)
         if self._on_pcm_frame_with_sequence is not None and sequence is not None:
             for samples, origin in self._session.handle_audio_with_origin(
                 payload,

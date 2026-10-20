@@ -46,12 +46,14 @@ for Raw Input, HID tap, and the voice-key physicalizer.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
 import sys
 import threading
 import time
+import uuid
 from typing import List, Optional, Tuple
 
 from . import __version__
@@ -62,71 +64,46 @@ from . import (
     voice_audio_session,
     voice_shortcut_session,
     action_executor,
+    app_profiles,
     ble_transport_winrt,
     bridge_launcher,
     bridge_runtime_status,
     bridge_tray_windows,
     button_combo,
     button_gesture,
-    chromecast_host_activity,
-    chromecast_runtime,
     config,
     connection_supervisor,
     diagnostic_trace,
-    doubao_rpc,
     element_navigation_control_windows,
     element_navigation_runtime,
     frida_compat,
     hid_identity,
     hotkey,
+    injection_backend,
     key_detection_bridge,
     key_mapping,
+    local_microphone_windows,
     logging_setup,
+    preset_switch_windows,
     raw_input_windows,
-    rc003_doubao_session,
     remote_selection,
     voice_key_physicalizer_windows,
     voice_controller,
+    voice_gesture,
     voice_interaction_diagnostics_windows,
     voice_playback_session_windows,
-    voice_program_manager,
-    wetype_control_windows,
     win32_input,
     win32_keys,
 )
 from .atvv_session import AudioStarted, AudioStopped, CapsReceived, MicButtonPressed, PcmStats
 
 
-from .voice_shortcut_session import (
-    _VOICE_HOTKEY_RELEASE_RETRY_INITIAL_SECONDS,
-    _VOICE_HOTKEY_RELEASE_RETRY_MAX_SECONDS,
-    _VOICE_HOTKEY_BACKEND_MARKED,
-    _VOICE_HOTKEY_BACKEND_WETYPE,
-    _VOICE_HOTKEY_BACKEND_DOUBAO,
-    _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS
-)
+from .voice_shortcut_session import _VOICE_HOTKEY_BACKEND_MARKED
 
 
 class CleanupIncompleteError(RuntimeError):
     """Raised when an owned BLE/audio or process-input resource stays live."""
 
-
-_BUTTON_ACTION_KEY_TOKENS = {
-    key_mapping.ActionKind.ESCAPE: ("escape",),
-    key_mapping.ActionKind.RETURN: ("enter",),
-    key_mapping.ActionKind.ARROW_UP: ("up",),
-    key_mapping.ActionKind.ARROW_DOWN: ("down",),
-    key_mapping.ActionKind.ARROW_LEFT: ("left",),
-    key_mapping.ActionKind.ARROW_RIGHT: ("right",),
-    key_mapping.ActionKind.DELETE_BACKWARD: ("backspace",),
-    key_mapping.ActionKind.SHOW_DESKTOP: ("win", "m"),
-    key_mapping.ActionKind.CONTEXT_MENU: ("apps",),
-    key_mapping.ActionKind.APP_SWITCHER: ("ctrl", "alt", "tab"),
-    key_mapping.ActionKind.SYSTEM_VOLUME_UP: ("volume_up",),
-    key_mapping.ActionKind.SYSTEM_VOLUME_DOWN: ("volume_down",),
-    key_mapping.ActionKind.SYSTEM_VOLUME_MUTE: ("volume_mute",),
-    key_mapping.ActionKind.PLAY_PAUSE: ("media_play_pause",),
-}
 
 _BUTTON_ACTION_MOUSE_BUTTONS = {
     key_mapping.ActionKind.MOUSE_LEFT_CLICK: "left",
@@ -135,6 +112,10 @@ _BUTTON_ACTION_MOUSE_BUTTONS = {
     key_mapping.ActionKind.MOUSE_X1_CLICK: "x1",
     key_mapping.ActionKind.MOUSE_X2_CLICK: "x2",
 }
+
+# Injected keys never trigger Windows' own keyboard auto-repeat, so a held
+# remote button is re-sent by the app at the machine's real keyboard repeat
+# rate (see ``win32_input.keyboard_repeat_interval``).
 
 # Semantic tap mappings only. RC003 physical-edge correlation is separate.
 _BUTTON_ACTION_NAVIGATION_VKS = {
@@ -158,6 +139,24 @@ _BUTTON_NAVIGATION_SINGLE_KEYS = {
     ("pagedown",): 0x22,
     ("page_down",): 0x22,
 }
+
+# Direction, backspace and volume keys keep the original "连击" behaviour under
+# SendInput: a hold replays the whole click (down+up) at the machine's keyboard
+# repeat rate, because SendInput cannot emulate the sustained key press a real
+# Windows hold produces.  The Interception driver does emulate that hold, so the
+# same buttons stay sustained there (see ``_begin_button_key_hold``).
+_SENDINPUT_CLICK_REPEAT_KINDS = frozenset(
+    {
+        key_mapping.ActionKind.ARROW_UP,
+        key_mapping.ActionKind.ARROW_DOWN,
+        key_mapping.ActionKind.ARROW_LEFT,
+        key_mapping.ActionKind.ARROW_RIGHT,
+        key_mapping.ActionKind.DELETE_BACKWARD,
+        key_mapping.ActionKind.SYSTEM_VOLUME_UP,
+        key_mapping.ActionKind.SYSTEM_VOLUME_DOWN,
+        key_mapping.ActionKind.SYSTEM_VOLUME_MUTE,
+    }
+)
 
 _RAW_FALLBACK_KEY_TOKENS = {
     "mic": "f5",
@@ -183,25 +182,31 @@ _ORDINARY_MIC_SOURCE_STALE_SECONDS = 2.0
 _ORDINARY_MIC_MAX_SECONDS = 10.0
 _KEY_DETECTION_SUPPRESSION_MAX_SECONDS = 2.0
 _RUNTIME_STATUS_HEARTBEAT_SECONDS = 5.0
+_PRESET_SWITCH_POLL_SECONDS = 1.0
 _VOICE_HOLD_SAFETY_SECONDS = 120.0
+# 短按补偿的第二次按键必须和真人双击一样留出间隔。驱动级注入下，如果
+# 松开与补发只隔几毫秒，输入法面板还没真正创建，第二次按键会被当成
+# 重复事件吞掉。
+_VOICE_SHORT_PRESS_DISMISS_DELAY_SECONDS = 0.09
+_VOICE_SHORT_PRESS_DISMISS_TAP_HOLD_SECONDS = 0.03
 _VOICE_KEY_PHYSICALIZER_RETRY_SECONDS = 1.0
 _VOICE_KEY_PHYSICALIZER_DEGRADED_RETRY_WINDOW_SECONDS = 10.0
+_VOICE_KEY_PHYSICALIZER_FAILED_RETRY_SECONDS = 30.0
 _RAW_INPUT_RETRY_INITIAL_SECONDS = 1.0
 _RAW_INPUT_RETRY_MAX_SECONDS = 30.0
 _BUTTON_INPUT_RELEASE_RETRY_INITIAL_SECONDS = 0.1
 _BUTTON_INPUT_RELEASE_RETRY_MAX_SECONDS = 2.0
-_DOUBAO_HOST_READY_TIMEOUT_SECONDS = 3.0
-_DOUBAO_HOST_READY_POLL_SECONDS = 0.05
-_DOUBAO_PROCESS_READY_TIMEOUT_SECONDS = 2.0
-_DOUBAO_ATTEMPT_JOIN_TIMEOUT_SECONDS = 3.5
 _DIRECTION_BUTTON_IDS = frozenset({"up", "down", "left", "right"})
 
 
 def _runtime_voice_hotkey_text(config_data: dict) -> str:
-    configured = str(config_data.get("voice_hotkey", "")).strip()
-    return configured or key_mapping.voice_hotkey_for_trigger_mode(
-        key_mapping.VoiceTriggerMode.HOLD
-    )
+    """Configured hold-to-talk shortcut, or "" when the user has not recorded one.
+
+    RC003 no longer fabricates a wake shortcut: an empty value means the voice
+    buttons stay inert until the user records 语音一/语音二 in settings.
+    """
+
+    return str(config_data.get("voice_hotkey", "")).strip()
 
 
 def open_configured_application(action: key_mapping.ButtonAction) -> bool:
@@ -211,7 +216,7 @@ def open_configured_application(action: key_mapping.ButtonAction) -> bool:
 
 
 class RC003App:
-    def __init__(self, *, launch_voice_program_on_start: bool = True) -> None:
+    def __init__(self) -> None:
         self._config_root = config.config_root()
         self._config_path = config.config_path(self._config_root)
         self._config = config.load_config(self._config_path)
@@ -231,25 +236,60 @@ class RC003App:
             self._bindings,
         )
         self._bindings_mtime_ns = self._settings_file_mtime_ns(self._bindings_path)
+        # Saved application profiles own their own file. This process switches
+        # the live mapping for two reasons only: a saved profile's switch hotkey
+        # (persistent, mirroring the settings window) and foreground-process
+        # scope (an overlay that is cleared on the next settings reload, when
+        # input becomes idle, or when the process stops owning the foreground).
+        # Process scope never rewrites key_bindings.json: the resolved overlay
+        # only lives in memory, while the active profile is recorded in
+        # app_profiles.json so the settings window can highlight it.
+        self._preset_store = app_profiles.AppProfileStore(self._config_root)
+        self._presets_mtime_ns = self._settings_file_mtime_ns(self._preset_store.path)
+        self._preset_override_id: Optional[str] = None
+        # The untouched mapping an active overlay was resolved from, so moving
+        # straight from one application to another re-resolves from the global
+        # layout instead of stacking two overlays on top of each other.
+        self._preset_base_bindings: Optional[dict] = None
+        # The marker last written for the settings window, compared in memory so
+        # a steady-state poll never touches the disk.
+        try:
+            self._preset_applied_id: Optional[str] = self._preset_store.applied_id()
+        except Exception:  # noqa: BLE001 - an unreadable library displays as empty
+            self._preset_applied_id = None
+        self._preset_manual_foreground: Optional[str] = None
+        self._preset_switch_foreground = ""
+        self._preset_switch_task: Optional[asyncio.Task] = None
+        self._preset_hotkey_listener: Optional[
+            preset_switch_windows.PresetSwitchListener
+        ] = None
+        # Read once: the machine's keyboard auto-repeat rate drives how fast a
+        # held remote button is re-sent, since injected keys never repeat.
+        self._keyboard_repeat_interval_seconds = (
+            win32_input.keyboard_repeat_interval()
+        )
         self._button_mapping_lock = threading.RLock()
         self._button_gestures = button_gesture.ButtonGestureDispatcher(
             is_action_configured=self._is_button_action_configured,
-            is_repeatable=self._is_button_repeatable,
             on_trigger=self._on_button_trigger,
             repeat_interval_for=self._button_repeat_interval,
             on_idle=self._apply_pending_settings_if_idle,
             on_diagnostic=self._on_button_gesture_diagnostic,
+            is_default_hold=self._is_default_hold_button,
+            is_sustained=self._is_mouse_hold_button,
+            on_hold_start=self._on_button_hold_start,
+            on_hold_repeat=self._on_button_hold_repeat,
+            on_hold_end=self._on_button_hold_end,
         )
         self._button_combos = button_combo.ButtonComboRecognizer()
         self._logger: logging.Logger = logging_setup.get_logger(self._config_root)
+        self._last_raw_input_lookup_diagnostic = None
         self._diagnostic_trace = diagnostic_trace.DiagnosticTrace(
             self._config_root,
             enabled=bool(self._config.get("diagnostic_trace_enabled", False)),
         )
         win32_input.set_diagnostic_trace(self._diagnostic_trace)
         voice_key_physicalizer_windows.set_diagnostic_trace(self._diagnostic_trace)
-        wetype_control_windows.set_diagnostic_trace(self._diagnostic_trace)
-        doubao_rpc.set_diagnostic_trace(self._diagnostic_trace)
         element_navigation_runtime.set_diagnostic_trace(self._diagnostic_trace)
         self._record_device_diagnostic_context()
         self._voice_attempt_id: Optional[str] = None
@@ -277,30 +317,8 @@ class RC003App:
             self._runtime_identity.runtime_kind,
             self._runtime_identity.package_name,
         )
-        if launch_voice_program_on_start and (
-            selected_profile != remote_selection.CHROMECAST_PROFILE
-            or self._config.get("voice_program", {}).get("provider")
-            == voice_program_manager.VOICE_PROGRAM_SOGOU
-        ):
-            try:
-                voice_program_result = (
-                    voice_program_manager.launch_configured_at_bridge_start(self._config)
-                )
-            except Exception:
-                self._logger.exception(
-                    "voice program: optional bridge-start launch failed unexpectedly"
-                )
-            else:
-                if voice_program_result.code not in {"not_requested", "disabled"}:
-                    self._logger.info(
-                        "voice program: provider=%s launch_result=%s",
-                        voice_program_result.provider_id,
-                        voice_program_result.code,
-                    )
-        else:
-            self._logger.info(
-                "voice program: startup launch skipped during diagnostics recovery"
-            )
+        # RC003 never wakes an input method: its voice keys only replay the
+        # shortcut the user recorded.
         if self._removed_voice_bindings:
             self._logger.warning(
                 "legacy voice mappings disabled until user reselects actions: %s",
@@ -310,12 +328,8 @@ class RC003App:
             hotkey_text=_runtime_voice_hotkey_text(self._config),
             logger=self._logger, trace=self._diagnostic_trace,
             services=voice_shortcut_session.ShortcutServices(
-                configured_backend=lambda: self._configured_voice_hotkey_backend(),
-                prepare_doubao=lambda tokens: self._prepare_doubao_voice_physicalizer(tokens),
+                configured_backend=lambda: _VOICE_HOTKEY_BACKEND_MARKED,
                 resume_tracking=lambda: self._resume_degraded_voice_key_physicalizer_recovery(),
-                active_doubao_attempt=lambda: self._active_doubao_attempt_locked(),
-                doubao_session=lambda: self._doubao_session,
-                cleanup_doubao=lambda attempt, **kw: self._run_active_doubao_cleanup(attempt, **kw),
                 set_result=lambda *args, **kw: self._set_runtime_voice_result(*args, **kw),
                 current_state=self._current_voice_runtime_state,
                 request_cleanup=lambda: self._supervisor.request_reconnect(),
@@ -332,19 +346,17 @@ class RC003App:
         self._voice_focus_provider = ""
         self._voice_focus_submit_method = ""
         self._voice_text_observation = "unknown"
-        self._doubao_session = rc003_doubao_session.DoubaoSessionCoordinator()
-        self._doubao_capture_watch_factory = lambda target_pid: (
-            chromecast_host_activity.CaptureWatch(
-                reader=lambda: chromecast_host_activity.read_doubao_capture_for_pid(
-                    target_pid
-                ),
-                fast_start=True,
-            )
-        )
-        self._voice_pcm_min_arrival_sequence: Optional[int] = None
         self._button_action_lock = threading.RLock()
         self._button_key_release_pending: Optional[Tuple[str, ...]] = None
         self._button_mouse_release_pending: Optional[str] = None
+        self._button_mouse_holds: Dict[str, set[object]] = {}
+        # Key holds owned by a sustained gesture: owner -> (tokens, backend).
+        self._button_key_holds: Dict[object, Tuple[Tuple[str, ...], object]] = {}
+        # Sustained holds consumed by element navigation: owner -> action.
+        # Element navigation taps itself, so repeats re-run the action instead
+        # of injecting a sustained key-down.
+        self._button_tap_hold_actions: Dict[object, key_mapping.ButtonAction] = {}
+        self._button_hold_release_pending: set[str] = set()
         self._button_input_release_retry_timer: Optional[object] = None
         self._button_input_release_retry_token: Optional[object] = None
         self._button_input_release_retry_delay = (
@@ -356,9 +368,10 @@ class RC003App:
         # threads. Serialize the voice state machine so one physical press
         # cannot race into two host shortcut deliveries.
         self._logger.info(
-            "startup: voice settings active: trigger_mode=%s hotkey=%s",
-            self._voice_shortcut.controller.trigger_mode.value,
-            self._voice_shortcut.hotkey.serialize(),
+            "startup: voice settings active: hotkey=%s",
+            self._voice_shortcut.hotkey.serialize()
+            if self._voice_shortcut.hotkey is not None
+            else "",
         )
         # One RC003 microphone press is reported independently by HID, the
         # ATVV mic opcode, and sometimes AUDIO_STARTED first. Keep all reports
@@ -368,11 +381,31 @@ class RC003App:
         self._voice_mic_gesture_audio_stopped = False
         self._voice_mic_gesture_physical_seen = False
         self._voice_mic_gesture_hid_released = False
+        self._voice_ignore_audio_start_until_physical_down = False
         self._voice_mic_gesture_direct_hid_seen = False
         self._voice_mic_gesture_sources_down: set[str] = set()
+        self._voice_shortcut_physical_sources_down: set[str] = set()
+        # The physical microphone follows its actual key-down/key-up edges.
+        # Promoted voice buttons retain tap/hold behavior per voice slot.
+        self._voice_gesture = voice_gesture.VoiceGestureLatch()
+        self._extra_voice_gestures: dict[int, voice_gesture.VoiceGestureLatch] = {}
+        # Non-microphone buttons bound to a voice slot replay the slot's host
+        # shortcut only; this tracks which slot currently owns that hold.
+        self._extra_voice_slot_active: Optional[int] = None
+        self._extra_voice_slot_close_pending: Optional[int] = None
         self._voice_hold_watchdog_timer: Optional[object] = None
         self._voice_hold_watchdog_token: Optional[object] = None
         self._voice_hold_watchdog_timer_factory = threading.Timer
+        # 短按补偿的第二次按键按双击节奏延迟下发，这里的定时器与 token
+        # 用来保证只有最新一次短按的补发能落地。
+        self._voice_short_press_dismiss_timer: Optional[object] = None
+        self._voice_short_press_dismiss_token: Optional[object] = None
+        self._voice_short_press_release_timer: Optional[object] = None
+        # True while the compensating second tap is physically held down.
+        self._voice_short_press_dismiss_hold_outstanding = False
+        self._voice_short_press_dismiss_timer_factory = threading.Timer
+        # 模式2 的本机麦克风采集；只在语音会话开着的时候运行。
+        self._local_voice_capture: Optional[object] = None
         self._ordinary_mic_lock = threading.Lock()
         self._ordinary_mic_sources_down: set[str] = set()
         self._ordinary_mic_late_sources_down: set[str] = set()
@@ -469,45 +502,6 @@ class RC003App:
             loop=self._event_loop,
         )
 
-        # Construct shared-service bindings after their state is initialized.
-        self._chromecast_runtime = chromecast_runtime.ChromecastRuntime(
-            chromecast_runtime.RuntimeServices(
-                selected_key=lambda: self._selected_remote_key,
-                logger=self._logger,
-                create_voice_host=self._create_chromecast_voice_host,
-                set_input_state=lambda **kw: self._set_runtime_input_state(**kw),
-                publish_status=lambda state: self._publish_runtime_status(state),
-                start_input=lambda: self._start_input_channels(),
-                stop_input=lambda: self._stop_input_channels(),
-                disable_input=lambda: setattr(self, "_accept_input_events", False),
-                cancel_mappings=self._cancel_chromecast_mappings,
-                release_inputs=self._release_chromecast_inputs,
-                route_edge=self._route_chromecast_edge,
-            )
-        )
-
-    def _create_chromecast_voice_host(self):
-        from .chromecast_voice_host import VoiceHost, VoiceHostServices
-        return VoiceHost(VoiceHostServices(
-            audio=self._voice_audio,
-            shortcut=self._voice_shortcut,
-            settings=lambda: self._config,
-            config_root=self._config_root,
-            logger=self._logger,
-            configured_backend=lambda: self._configured_voice_hotkey_backend(),
-            voice_mapping_enabled=lambda: self._voice_mode_for_primary_button(
-                "mic", self._primary_button_action("mic")) is not None,
-            ensure_key_tracking=lambda *args: self._ensure_voice_key_physicalizer_for_hotkey(*args),
-            reload_settings=lambda: self._reload_settings_if_changed(),
-            apply_pending_settings=lambda: self._apply_pending_voice_settings_if_idle_locked(),
-            begin_diagnostic=lambda *args, **kw: self._ensure_voice_diagnostic_attempt(*args, **kw),
-            finish_diagnostic=lambda *args, **kw: self._finish_voice_diagnostic_attempt(*args, **kw),
-            set_active=lambda active: self._set_runtime_voice_active(active),
-            set_result=lambda *args, **kw: self._set_runtime_voice_result(*args, **kw),
-            wait_sogou=lambda: self._wait_for_sogou_voice_process(),
-            disable_forwarding=lambda: setattr(self, "_voice_pcm_forwarding_enabled", False),
-        ))
-
     def _current_voice_runtime_state(self):
         with self._runtime_status_lock:
             return self._runtime_voice_state
@@ -518,26 +512,6 @@ class RC003App:
         if voice_active:
             self._set_runtime_voice_result(bridge_runtime_status.VOICE_RUNTIME_RECEIVING_AUDIO)
 
-    def _cancel_chromecast_mappings(self):
-        with self._input_arbitration_lock:
-            self._accept_input_events = False
-            self._button_combos.reset()
-            self._button_gestures.reset()
-
-    def _release_chromecast_inputs(self):
-        with self._button_action_lock:
-            self._button_input_release_retry_stopping = True
-            self._cancel_button_input_release_retry_locked(reset_delay=False)
-            return self._release_pending_button_inputs()
-
-    def _route_chromecast_edge(self, edge):
-        if edge.action == "cancel":
-            with self._input_arbitration_lock:
-                self._cancel_input_gestures_for_buttons({edge.button}, reason="chromecast_cancel",
-                                                       block_until_release=False)
-        else:
-            self._on_button_event(edge.button, edge.action == "down", event_source="chromecast")
-
     # -- lifecycle: driven by ConnectionSupervisor -------------------------
 
     async def run_forever(self) -> None:
@@ -545,15 +519,13 @@ class RC003App:
             self._runtime_status_heartbeat()
         )
         try:
-            if self._remote_profile == remote_selection.CHROMECAST_PROFILE:
-                await self._chromecast_runtime.run()
-                return
             self._start_input_channels()
+            self._start_preset_switching()
             await self._supervisor.run_forever()
         finally:
             try:
-                if self._remote_profile != remote_selection.CHROMECAST_PROFILE:
-                    self._stop_input_channels()
+                await self._stop_preset_switching()
+                self._stop_input_channels()
             finally:
                 element_navigation_runtime.clear_diagnostic_trace(self._diagnostic_trace)
                 self._diagnostic_trace.close()
@@ -561,25 +533,11 @@ class RC003App:
                 await asyncio.gather(heartbeat, return_exceptions=True)
 
     async def stop(self) -> None:
-        if self._remote_profile == remote_selection.CHROMECAST_PROFILE:
-            await self._chromecast_runtime.stop()
-            return
         await self._supervisor.stop()
 
     def request_connection_retry_now(self) -> None:
-        if self._remote_profile == remote_selection.CHROMECAST_PROFILE:
-            return  # No unsolicited, repeated UAC prompts or cross-device retry.
         self._logger.info("manual reconnect requested; waking retry backoff")
         self._supervisor.request_retry_now()
-
-    def _press_wetype_voice_keys(self, tokens):
-        win32_input.send_wetype_voice_key_combo_down(tokens)
-
-    def _release_wetype_voice_keys(self, tokens):
-        win32_input.send_wetype_voice_key_combo_up(tokens)
-
-
-
 
     async def _runtime_status_heartbeat(self) -> None:
         while True:
@@ -669,13 +627,9 @@ class RC003App:
         *,
         provider: Optional[str] = None,
     ) -> None:
-        resolved_provider = provider
-        if resolved_provider is None:
-            resolved_provider = str(
-                voice_program_manager.normalize_voice_program_settings(
-                    self._config.get("voice_program")
-                )["provider"]
-            )
+        # RC003 no longer selects an input method: the recorded shortcut is the
+        # only thing replayed, so there is no provider identity to publish.
+        resolved_provider = str(provider) if provider else ""
         with self._runtime_status_lock:
             previous_state = getattr(self, '_runtime_voice_state', 'not_tested')
             previous_provider = getattr(self, '_runtime_voice_provider', '')
@@ -690,6 +644,10 @@ class RC003App:
                               bridge_runtime_status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED}):
             self._logger.warning("Voice runtime failed: state=%s provider=%s", state, resolved_provider,
                                  extra={"failure_key": f"voice:{resolved_provider}:{state}"})
+        if (state == bridge_runtime_status.VOICE_RUNTIME_HOST_UNCONFIRMED
+                and (previous_state, previous_provider) != (str(state), str(resolved_provider))):
+            self._logger.info("Voice runtime unconfirmed: state=%s provider=%s; audio received, host capture unknown",
+                              state, resolved_provider)
         if trace is not None and (previous_state, previous_provider) != (str(state), str(resolved_provider)):
             try:
                 trace.emit('voice_runtime_state', state=str(state), previous_state=previous_state,
@@ -831,9 +789,6 @@ class RC003App:
             self._voice_key_physicalizer_stopping = False
         with self._raw_input_lifecycle_lock:
             self._raw_input_stopping = False
-        if self._remote_profile == remote_selection.CHROMECAST_PROFILE:
-            self._start_hid_listener()
-            return
         self._start_voice_key_physicalizer()
         self._start_hid_listener()
         self._start_hid_report_tap()
@@ -989,7 +944,11 @@ class RC003App:
             except BaseException:
                 pass
 
-    def _schedule_voice_key_physicalizer_recovery_locked(self) -> None:
+    def _schedule_voice_key_physicalizer_recovery_locked(
+        self,
+        *,
+        delay: float = _VOICE_KEY_PHYSICALIZER_RETRY_SECONDS,
+    ) -> None:
         if (
             self._voice_key_physicalizer_stopping
             or not self._accept_input_events
@@ -1001,7 +960,7 @@ class RC003App:
         expected_generation = self._voice_key_physicalizer_generation
         try:
             timer = self._voice_key_physicalizer_timer_factory(
-                _VOICE_KEY_PHYSICALIZER_RETRY_SECONDS,
+                delay,
                 lambda token=token,
                 expected_physicalizer=expected_physicalizer,
                 expected_generation=expected_generation: (
@@ -1068,7 +1027,6 @@ class RC003App:
                 cleanup_blocks_recovery = bool(
                     self._voice_shortcut.pending_tokens is not None
                     or self._voice_shortcut.controller.active
-                    or self._doubao_session.busy
                 )
             if cleanup_blocks_recovery:
                 with self._voice_key_physicalizer_lifecycle_lock:
@@ -1097,7 +1055,11 @@ class RC003App:
                 )
                 self._logger.error(
                     "voice key physicalizer recovery blocked: owned voice "
-                    "shortcut cleanup is still unresolved"
+                    "shortcut cleanup is still unresolved; retrying in %.1fs",
+                    _VOICE_KEY_PHYSICALIZER_FAILED_RETRY_SECONDS,
+                )
+                self._schedule_voice_key_physicalizer_recovery_locked(
+                    delay=_VOICE_KEY_PHYSICALIZER_FAILED_RETRY_SECONDS
                 )
                 return
 
@@ -1130,6 +1092,14 @@ class RC003App:
             if not stop_succeeded:
                 self._set_runtime_input_state(
                     voice_key_physicalizer_state="failed"
+                )
+                self._logger.error(
+                    "voice key physicalizer recovery could not retire the "
+                    "degraded owner; retrying in %.1fs",
+                    _VOICE_KEY_PHYSICALIZER_FAILED_RETRY_SECONDS,
+                )
+                self._schedule_voice_key_physicalizer_recovery_locked(
+                    delay=_VOICE_KEY_PHYSICALIZER_FAILED_RETRY_SECONDS
                 )
                 return
             self._set_runtime_input_state(
@@ -1169,6 +1139,9 @@ class RC003App:
                 time.monotonic()
                 + _VOICE_KEY_PHYSICALIZER_DEGRADED_RETRY_WINDOW_SECONDS
             )
+            # Cleanup is now authoritative: drop any slow fallback retry and
+            # retry promptly instead of waiting out the failed-state backoff.
+            self._cancel_voice_key_physicalizer_retry_locked()
             self._schedule_voice_key_physicalizer_recovery_locked()
 
 
@@ -1272,18 +1245,6 @@ class RC003App:
                     self._raw_input_retry_timer = None
                     if self._raw_input_stopping or not self._accept_input_events:
                         return
-                    if (self._remote_profile == remote_selection.CHROMECAST_PROFILE
-                            and self._chromecast_runtime.voice_host is not None
-                            and not self._chromecast_runtime.voice_host.closed):
-                        # Preserve physical ownership until the voice owner has
-                        # released its keys. A tracker restart clears snapshots.
-                        self._chromecast_runtime.voice_host.cancel_recording()
-                        self._schedule_raw_input_recovery_locked()
-                        return
-                    if (self._remote_profile == remote_selection.CHROMECAST_PROFILE
-                            and not self._release_pending_button_keys()):
-                        self._schedule_raw_input_recovery_locked()
-                        return
                     listener = self._hid_listener
                     if listener is not None:
                         # Invalidate every callback before stop() can emit
@@ -1326,12 +1287,34 @@ class RC003App:
             self._start_hid_listener_owned(recovering=recovering)
 
     def _set_raw_listener_state(self, state: str) -> None:
-        # Chromecast's device status belongs to its receiver, not the auxiliary
-        # keyboard tracker. Do not replace chromecast_ready on tracker recovery.
-        if self._remote_profile == remote_selection.CHROMECAST_PROFILE:
-            self._logger.info("keyboard safety tracking state=%s", state)
-        else:
-            self._set_runtime_input_state(raw_input_state=state)
+        self._set_runtime_input_state(raw_input_state=state)
+
+    def _record_raw_input_lookup(self, generation, outcome, enumeration, selection) -> None:
+        # The producers supply only fixed labels/counts/codes, never device paths.
+        fields = dict(outcome=outcome, enumeration=enumeration, selection=selection,
+                      selected_ref=self._selected_remote_key[:12]
+                      if remote_selection.valid_key(self._selected_remote_key) else "")
+        signature = json.dumps(fields, sort_keys=True, ensure_ascii=True)
+        if signature == self._last_raw_input_lookup_diagnostic:
+            return
+        fields.update(generation=generation, app_pid=os.getpid())
+        extra = {}
+        if outcome in {"no_device", "unavailable", "ambiguous"}:
+            extra = dict(failure_key="hid_discovery:raw_input", failure_id=uuid.uuid4().hex)
+            fields.update(extra)
+        recorded = False
+        try:
+            self._logger.info("HID diagnostic: %s", json.dumps(
+                dict(event="hid_raw_input_lookup", **fields), ensure_ascii=True), extra=extra)
+            recorded = True
+        except Exception:
+            pass
+        try:
+            recorded = self._diagnostic_trace.emit("hid_raw_input_lookup", **fields) or recorded
+        except Exception:
+            pass
+        if recorded:
+            self._last_raw_input_lookup_diagnostic = signature
 
     def _start_hid_listener_owned(self, *, recovering: bool = False) -> None:
         """Best-effort: buttons fail closed independently of BLE/voice.
@@ -1371,13 +1354,16 @@ class RC003App:
                 self._raw_input_lost_generation = -1
 
         self._set_raw_listener_state("recovering" if recovering else "starting")
-        keyboard_only = self._remote_profile == remote_selection.CHROMECAST_PROFILE
+        enumeration, selection = {}, {}
+        lookup_outcome = "lookup_interrupted"
         try:
             device_path = None
-            if not keyboard_only:
-                paths = raw_input_windows.enumerate_matching_device_paths()
-                device_path = remote_selection.selected_raw_path(paths, self._selected_remote_key)
+            paths = raw_input_windows.enumerate_matching_device_paths(diagnostic=enumeration)
+            device_path = remote_selection.selected_raw_path(
+                paths, self._selected_remote_key, diagnostic=selection)
+            lookup_outcome = "path_selected"
         except raw_input_windows.RawInputUnavailableError as exc:
+            lookup_outcome = "unavailable"
             self._set_runtime_input_state(raw_input_state="unavailable")
             self._logger.info("startup: Raw Input unavailable; buttons disabled: %s", exc)
             with self._raw_input_lifecycle_lock:
@@ -1385,6 +1371,7 @@ class RC003App:
                     self._schedule_raw_input_recovery_locked()
             return
         except hid_identity.NoDevicePathFoundError:
+            lookup_outcome = "no_device"
             self._set_runtime_input_state(raw_input_state="no_device")
             self._logger.info("startup: no RC003 HID device path found; buttons unavailable")
             with self._raw_input_lifecycle_lock:
@@ -1392,6 +1379,7 @@ class RC003App:
                     self._schedule_raw_input_recovery_locked()
             return
         except hid_identity.AmbiguousDevicePathError as exc:
+            lookup_outcome = "ambiguous"
             self._set_runtime_input_state(raw_input_state="ambiguous")
             self._logger.info(
                 "startup: buttons failing closed, ambiguous HID device paths: %s", exc
@@ -1400,6 +1388,8 @@ class RC003App:
                 if self._raw_input_generation == generation:
                     self._schedule_raw_input_recovery_locked()
             return
+        finally:
+            self._record_raw_input_lookup(generation, lookup_outcome, enumeration, selection)
 
         listener = raw_input_windows.RawInputButtonListener(
             self._on_raw_button_event
@@ -1412,14 +1402,13 @@ class RC003App:
             ):
                 return
             self._hid_listener = listener
-        if not keyboard_only:
-            self._sync_physical_bindings_to_listener()
+        self._sync_physical_bindings_to_listener()
         set_sourced_button_event_callback = getattr(
             listener,
             "set_sourced_button_event_callback",
             None,
         )
-        if not keyboard_only and callable(set_sourced_button_event_callback):
+        if callable(set_sourced_button_event_callback):
             set_sourced_button_event_callback(
                 lambda button_id, is_pressed, source, windows_button_id: (
                     self._on_raw_button_event(
@@ -1437,7 +1426,7 @@ class RC003App:
             "set_raw_event_callback",
             None,
         )
-        if not keyboard_only and callable(set_raw_event_callback):
+        if callable(set_raw_event_callback):
             set_raw_event_callback(
                 lambda event: self._on_raw_physical_event(
                     event,
@@ -1456,7 +1445,7 @@ class RC003App:
             "set_device_removed_callback",
             None,
         )
-        if not keyboard_only and callable(set_device_removed_callback):
+        if callable(set_device_removed_callback):
             set_device_removed_callback(
                 lambda: self._on_raw_input_device_removed(
                     _listener=listener,
@@ -1468,7 +1457,7 @@ class RC003App:
             "set_input_corruption_callback",
             None,
         )
-        if not keyboard_only and callable(set_input_corruption_callback):
+        if callable(set_input_corruption_callback):
             set_input_corruption_callback(
                 lambda reason: self._on_raw_input_corruption(
                     reason,
@@ -1632,11 +1621,10 @@ class RC003App:
                 self._reset_key_detection_mic_gesture_locked()
             with self._voice_shortcut.lock:
                 self._voice_mic_gesture_sources_down.clear()
+                self._voice_shortcut_physical_sources_down.clear()
                 self._voice_mic_gesture_hid_released = True
                 if self._voice_shortcut.controller.active:
                     self._release_hold_voice_on_physical_release_locked(reason)
-                elif self._doubao_session.busy:
-                    self._doubao_session.cancel_current()
                 if (
                     self._voice_mic_gesture_active
                     and not self._voice_audio_stream_active
@@ -1689,8 +1677,6 @@ class RC003App:
                 self._voice_mic_gesture_hid_released = True
                 if self._voice_shortcut.controller.active:
                     self._release_hold_voice_on_physical_release_locked(reason)
-                elif self._doubao_session.busy:
-                    self._doubao_session.cancel_current()
                 if (
                     self._voice_mic_gesture_active
                     and not self._voice_audio_stream_active
@@ -1715,7 +1701,6 @@ class RC003App:
                 and self._voice_audio_stream_active
                 and (
                     self._voice_shortcut.controller.active
-                    or self._doubao_session.busy
                     or self._voice_shortcut.pending_tokens is not None
                 )
             )
@@ -2257,20 +2242,13 @@ class RC003App:
                 self._raw_input_lost_generation = resolved_generation
                 self._schedule_raw_input_recovery_locked()
             self._set_raw_listener_state("unhealthy")
-            if self._remote_profile == remote_selection.CHROMECAST_PROFILE:
-                host = self._chromecast_runtime.voice_host
-                if host is not None:
-                    host.cancel_recording()
             with self._voice_shortcut.lock:
-                tokens = tuple(self._voice_shortcut.hotkey.modifiers) + (
-                    self._voice_shortcut.hotkey.key,
-                )
+                tokens = self._voice_shortcut.recorded_tokens()
                 active_hold = (
                     self._voice_shortcut.controller.active
                     or self._voice_shortcut.pending_tokens is not None
                 )
-                if (self._remote_profile != remote_selection.CHROMECAST_PROFILE
-                        and active_hold and not win32_input.can_begin_tracked_hold(tokens)):
+                if active_hold and not win32_input.can_begin_tracked_hold(tokens):
                     self._force_voice_hold_release_locked(
                         "physical keyboard tracking lost"
                     )
@@ -2308,38 +2286,11 @@ class RC003App:
         self._set_runtime_input_state(
             voice_key_physicalizer_state="recovering"
         )
-        if self._remote_profile == remote_selection.CHROMECAST_PROFILE:
-            host = self._chromecast_runtime.voice_host
-            if host is not None:
-                wait_for_release = getattr(
-                    host,
-                    "cancel_recording_and_wait",
-                    None,
-                )
-                if callable(wait_for_release):
-                    wait_for_release(2.5)
-                else:
-                    host.cancel_recording()
-            with self._voice_key_physicalizer_lifecycle_lock:
-                if (
-                    self._voice_key_physicalizer is resolved_physicalizer
-                    and self._voice_key_physicalizer_generation
-                    == resolved_generation
-                    and not self._voice_key_physicalizer_stopping
-                ):
-                    self._schedule_voice_key_physicalizer_recovery_locked()
-            self._logger.warning(
-                "voice key physicalizer stopped unexpectedly; "
-                "Chromecast voice cancelled and recovery scheduled"
-            )
-            return
         raw_tracking_available = (
             raw_input_windows.physical_keyboard_tracking_available()
         )
         with self._voice_shortcut.lock:
-            tokens = tuple(self._voice_shortcut.hotkey.modifiers) + (
-                self._voice_shortcut.hotkey.key,
-            )
+            tokens = self._voice_shortcut.recorded_tokens()
             try:
                 uses_right_alt = (
                     win32_keys.VK_CODES["ralt"]
@@ -2355,14 +2306,7 @@ class RC003App:
                 active_hold
                 and (
                     not raw_tracking_available
-                    or (
-                        uses_right_alt
-                        and self._configured_voice_hotkey_backend()
-                        in {
-                            _VOICE_HOTKEY_BACKEND_MARKED,
-                            _VOICE_HOTKEY_BACKEND_DOUBAO,
-                        }
-                    )
+                    or uses_right_alt
                 )
             ):
                 self._force_voice_hold_release_locked(
@@ -2720,15 +2664,6 @@ class RC003App:
         with self._voice_shortcut.lock:
             self._voice_shortcut.retry_stopping = True
             self._voice_shortcut.cancel_release_retry(reset_delay=False)
-            self._doubao_session.cancel_current()
-
-        doubao_attempt_settled = self._doubao_session.wait_current(
-            _DOUBAO_ATTEMPT_JOIN_TIMEOUT_SECONDS
-        )
-        if not doubao_attempt_settled:
-            failures.append(
-                "Doubao startup attempt did not settle; input owners retained"
-            )
 
         # Input loss is cancellation, not a click. Clear gesture timers before
         # listener shutdown emits forced releases, and release any Windows key
@@ -2848,20 +2783,7 @@ class RC003App:
         self._button_gestures.reset()
 
         physicalizer_state = "stopped"
-        if keyboard_release_complete and doubao_attempt_settled:
-            try:
-                self._voice_shortcut.doubao_physicalizer.stop()
-            except Exception:
-                keyboard_release_complete = False
-                physicalizer_state = "failed"
-                self._logger.exception(
-                    "cleanup: stopping Doubao voice physicalizer failed"
-                )
-                failures.append(
-                    "Doubao voice physicalizer did not stop; owner retained"
-                )
-
-        if keyboard_release_complete and doubao_attempt_settled:
+        if keyboard_release_complete:
             with self._voice_key_physicalizer_operation_lock:
                 with self._voice_key_physicalizer_lifecycle_lock:
                     physicalizer = self._voice_key_physicalizer
@@ -2907,64 +2829,24 @@ class RC003App:
         failures: List[str] = []
         with self._voice_shortcut.lock:
             self._accept_ble_events = False
-            attempt = self._doubao_session.cancel_current()
-            active_attempt = self._active_doubao_attempt_locked()
-            cleanup_attempt = active_attempt
-            if (
-                cleanup_attempt is None
-                and attempt is not None
-                and (
-                    attempt.has_cleanup_debt("hotkey")
-                    or attempt.has_cleanup_debt("playback")
-                )
-            ):
-                cleanup_attempt = attempt
-            if cleanup_attempt is not None:
-                self._voice_shortcut.controller.reset()
-                self._voice_pcm_forwarding_enabled = False
-                self._voice_pcm_min_arrival_sequence = None
-                self._request_active_doubao_cleanup_locked(
-                    cleanup_attempt,
-                    reason="connection cleanup",
-                )
-
-        doubao_settled = await asyncio.to_thread(
-            self._doubao_session.wait_current,
-            _DOUBAO_ATTEMPT_JOIN_TIMEOUT_SECONDS,
-        )
 
         try:
             with self._voice_shortcut.lock:
-                doubao_cleanup_running = bool(
-                    attempt is not None and attempt.cleanup_worker_running
-                )
                 self._voice_audio_start_fallback_pending = False
                 self._voice_raw_input_trigger_pending = False
                 self._voice_audio_stream_active = False
                 self._voice_audio_stop_processed = False
                 self._voice_pcm_forwarding_enabled = False
-                self._voice_pcm_min_arrival_sequence = None
-                if not doubao_cleanup_running:
-                    flush_result = self._voice_audio.flush("cleanup")
-                    if not flush_result.completed:
-                        failures.append(
-                            "audio playback queue did not flush; owner retained"
-                        )
+                self._stop_local_voice_capture_locked()
+                flush_result = self._voice_audio.flush("cleanup")
+                if not flush_result.completed:
+                    failures.append(
+                        "audio playback queue did not flush; owner retained"
+                    )
                 self._unsolicited_mic_close_pending = False
                 self._finish_voice_mic_gesture()
                 if self._voice_shortcut.pending_tokens is not None:
-                    doubao_release_owned = bool(
-                        attempt is not None
-                        and attempt.has_cleanup_debt("hotkey")
-                        and self._voice_shortcut.pending_backend
-                        == _VOICE_HOTKEY_BACKEND_DOUBAO
-                    )
-                    if doubao_release_owned:
-                        self._request_active_doubao_cleanup_locked(
-                            attempt,
-                            reason="connection cleanup",
-                        )
-                    elif self._voice_shortcut.release_pending():
+                    if self._voice_shortcut.release_pending():
                         self._voice_shortcut.controller.cancel_pending()
                     else:
                         failures.append(
@@ -3010,31 +2892,17 @@ class RC003App:
                 failures.append("BLE session did not fully close; owner retained")
                 # self._ble_session is intentionally NOT cleared here either.
 
-        doubao_cleanup_running = bool(
-            attempt is not None and attempt.cleanup_worker_running
-        )
-        playback_writer_stopped = not doubao_cleanup_running
-        if doubao_cleanup_running:
-            failures.append(
-                "Doubao asynchronous cleanup still owns audio resources"
-            )
-        elif self._voice_audio.writer is not None:
+        playback_writer_stopped = True
+        if self._voice_audio.writer is not None:
             playback_writer_stopped = self._voice_audio.stop_writer()
-            if playback_writer_stopped:
-                if attempt is not None:
-                    attempt.resolve_cleanup_debt("playback")
-            else:
+            if not playback_writer_stopped:
                 failures.append(
                     "audio playback writer did not stop; owner retained"
                 )
 
         if self._voice_audio.sink is not None and playback_writer_stopped:
-            playback = self._voice_audio.sink
             try:
                 self._voice_audio.close_sink()
-                if attempt is not None:
-                    if attempt.release_resource("endpoint", playback):
-                        attempt.resolve_cleanup_debt("endpoint")
             except Exception:
                 self._logger.exception("cleanup: closing audio playback failed")
                 failures.append("audio playback did not fully close; owner retained")
@@ -3043,15 +2911,6 @@ class RC003App:
                 # hide an incompletely closed resource and let a reconnect
                 # open a second sink over it (XRBM-019 review round 1 P1
                 # #5).
-
-        if attempt is not None and not attempt.settled.is_set():
-            failures.append(
-                "Doubao attempt cleanup remains unsettled; owner retained"
-            )
-        elif not doubao_settled and attempt is not None:
-            self._logger.info(
-                "Doubao attempt settled during independent cleanup"
-            )
 
         if not failures:
             with self._voice_shortcut.lock:
@@ -3120,136 +2979,156 @@ class RC003App:
         result = []
         for button_id in button_bindings:
             action = self._primary_button_action(button_id)
-            if button_id == "mic" and key_mapping.is_supported_voice_action(action):
+            if key_mapping.is_supported_voice_action(action):
                 result.append(button_id)
         return result
 
-    def _voice_mode_for_primary_button(
+    def _is_voice_primary_button(
         self,
         button_id: str,
         action: Optional[key_mapping.ButtonAction] = None,
-    ) -> Optional[key_mapping.VoiceTriggerMode]:
-        action = action or self._primary_button_action(button_id)
-        if button_id != "mic" or not key_mapping.is_supported_voice_action(action):
-            return None
-        return key_mapping.VoiceTriggerMode.HOLD
-
-    def _voice_hotkey_text_for_mode(
-        self, mode: key_mapping.VoiceTriggerMode
-    ) -> str:
-        mode_hotkeys = self._config.get("voice_hotkeys", {})
-        if isinstance(mode_hotkeys, dict):
-            candidate = str(mode_hotkeys.get(mode.value, "")).strip()
-            if candidate:
-                return candidate
-        if self._config.get("voice_trigger_mode") == mode.value:
-            candidate = str(self._config.get("voice_hotkey", "")).strip()
-            if candidate:
-                return candidate
-        return key_mapping.voice_hotkey_for_trigger_mode(mode)
-
-    def _configured_voice_hotkey_backend(self) -> str:
-        settings = voice_program_manager.normalize_voice_program_settings(
-            self._config.get("voice_program")
-        )
-        if settings["provider"] == voice_program_manager.VOICE_PROGRAM_WETYPE:
-            return _VOICE_HOTKEY_BACKEND_WETYPE
-        if settings["provider"] == voice_program_manager.VOICE_PROGRAM_DOUBAO_IME:
-            return _VOICE_HOTKEY_BACKEND_DOUBAO
-        return _VOICE_HOTKEY_BACKEND_MARKED
-
-    def _ensure_voice_key_physicalizer_for_hotkey(
-        self,
-        tokens: Tuple[str, ...],
-        backend: str,
     ) -> bool:
-        """Start the process-level right-Alt tracker only when it is needed."""
+        action = action or self._primary_button_action(button_id)
+        return key_mapping.is_supported_voice_action(action)
 
-        if backend not in {
-            _VOICE_HOTKEY_BACKEND_MARKED,
-            _VOICE_HOTKEY_BACKEND_DOUBAO,
-        }:
-            return True
-        try:
-            uses_right_alt = (
-                win32_keys.VK_CODES["ralt"]
-                in win32_keys.resolve_vk_codes(tokens)
-            )
-        except win32_keys.UnknownKeyTokenError:
+    def voice_slot_for_button(
+        self,
+        button_id: str,
+        action: Optional[key_mapping.ButtonAction] = None,
+    ) -> Optional[int]:
+        action = action or self._primary_button_action(button_id)
+        return key_mapping.voice_slot_for_action(action)
+
+    def _voice_slot_inject_mode(self, slot: Optional[int]) -> Optional[str]:
+        """Return the inject backend the button bound to ``slot`` selected.
+
+        RC003 voice slots replay the shortcut recorded for them, but the button
+        that triggers the slot still owns its own per-button injection backend,
+        exactly like any other key.
+        """
+
+        if slot is None:
+            return None
+        for button_id in self._configured_voice_buttons():
+            action = self._primary_button_action(button_id)
+            if key_mapping.voice_slot_for_action(action) == slot:
+                return injection_backend.normalize_inject_mode(action.inject_mode)
+        return None
+
+    def _voice_slot_uses_interception(self, slot: Optional[int]) -> bool:
+        """Whether ``slot`` is delivered by an available Interception driver."""
+
+        return (
+            self._voice_slot_inject_mode(slot)
+            == injection_backend.INJECT_MODE_INTERCEPTION
+            and injection_backend.interception_available()
+        )
+
+    def _voice_hotkey_text_for_slot(self, slot: int) -> str:
+        """Resolve one voice slot's hold shortcut from the saved config.
+
+        RC003 ignores the voice-program selection entirely: the slot only ever
+        replays the shortcut the user recorded for it, so an unset slot resolves
+        to an empty string and the mapping is skipped instead of firing a
+        leftover provider default (``ralt``).
+        """
+
+        return config.voice_slot_hotkey(self._config, slot)
+
+    def _voice_input_source(self) -> str:
+        return config.voice_input_source(self._config)
+
+    def _uses_local_voice_microphone(self) -> bool:
+        """模式2: the audio comes from a microphone plugged into this PC."""
+
+        return self._voice_input_source() == config.VOICE_INPUT_SOURCE_LOCAL
+
+    def _start_local_voice_capture_locked(self) -> bool:
+        """模式2：会话开始时打开本机麦克风。
+
+        本机麦克风是常开的，所以短按锁存期间音频不会断——这正是模式1
+        拿不到的东西。
+        """
+
+        if not self._uses_local_voice_microphone():
             return False
-        if not uses_right_alt:
+        existing = self._local_voice_capture
+        if existing is not None and getattr(existing, "running", False):
             return True
-        with self._voice_key_physicalizer_lifecycle_lock:
-            ready = self._voice_key_physicalizer_ready
-            physicalizer = self._voice_key_physicalizer
-            accepts_new_down = bool(
-                physicalizer is not None
-                and getattr(physicalizer, "accepts_new_down", True)
+        device = config.voice_local_input_device(self._config)
+        if not device:
+            self._logger.warning(
+                "local voice microphone not started: no recording device selected"
             )
-            if ready and not accepts_new_down:
-                self._voice_key_physicalizer_ready = False
-                ready = False
-                if not self._voice_key_physicalizer_degraded_retry_deadline:
-                    self._voice_key_physicalizer_degraded_retry_deadline = (
-                        time.monotonic()
-                        + _VOICE_KEY_PHYSICALIZER_DEGRADED_RETRY_WINDOW_SECONDS
-                    )
-                self._schedule_voice_key_physicalizer_recovery_locked()
-        if not ready:
-            self._start_voice_key_physicalizer()
-        with self._voice_key_physicalizer_lifecycle_lock:
-            physicalizer = self._voice_key_physicalizer
-            return bool(
-                self._voice_key_physicalizer_ready
-                and physicalizer is not None
-                and getattr(physicalizer, "accepts_new_down", True)
+            self._set_runtime_voice_result(
+                bridge_runtime_status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED
+            )
+            return False
+        capture = local_microphone_windows.LocalMicrophoneCapture(
+            device_name=device,
+            on_frame=self._on_pcm_frame,
+            logger=self._logger,
+        )
+        if not capture.start():
+            self._local_voice_capture = None
+            self._set_runtime_voice_result(
+                bridge_runtime_status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED
+            )
+            return False
+        self._local_voice_capture = capture
+        return True
+
+    def _stop_local_voice_capture_locked(self) -> None:
+        capture = self._local_voice_capture
+        self._local_voice_capture = None
+        if capture is None:
+            return
+        try:
+            capture.stop()
+        except BaseException as exc:  # noqa: BLE001 - 关闭失败不再重试
+            self._logger.warning(
+                "local voice microphone stop failed: error_type=%s",
+                type(exc).__name__,
             )
 
     def _prepare_voice_mapping_locked(
         self,
         button_id: str,
         action: key_mapping.ButtonAction,
+        *,
+        allow_latched_stream_takeover: bool = False,
     ) -> bool:
-        issue = voice_program_manager.voice_configuration_issue(self._config.get("voice_program"))
-        if issue:
-            self._logger.warning("voice mapping ignored: %s", issue)
-            return False
-        if (
-            self._config.get("voice_program", {}).get("provider")
-            == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
-            and not config.voice_hotkey_for_provider(
-                self._config, voice_program_manager.VOICE_PROGRAM_CHATTERFLY
-            )
-        ):
-            self._logger.warning("voice mapping ignored: Chatterfly shortcut is not configured")
-            return False
         if not self._direct_hid_interception_ready:
             self._logger.warning(
                 "voice mapping ignored: RC003 HID interception is not ready"
             )
             return False
-        if self._voice_mode_for_primary_button(button_id, action) is None:
+        if not self._is_voice_primary_button(button_id, action):
             self._logger.warning(
-                "voice mapping ignored: only the physical microphone button "
-                "supports hold-to-talk; button=%s configured=%s",
+                "voice mapping ignored: button is not bound to a voice slot; "
+                "button=%s configured=%s",
                 button_id,
                 self._configured_voice_buttons(),
             )
             return False
-        mode = key_mapping.VoiceTriggerMode.HOLD
-        backend = self._configured_voice_hotkey_backend()
-        if backend == _VOICE_HOTKEY_BACKEND_WETYPE:
-            return True
+        slot = key_mapping.voice_slot_for_action(action)
+        if slot is None:
+            self._logger.warning(
+                "voice mapping ignored: button is not bound to a voice slot; "
+                "button=%s configured=%s",
+                button_id,
+                self._configured_voice_buttons(),
+            )
+            return False
         try:
             voice_hotkey = hotkey.HotkeySpec.parse(
-                self._voice_hotkey_text_for_mode(mode)
+                self._voice_hotkey_text_for_slot(slot)
             )
             tokens = tuple(voice_hotkey.modifiers) + (voice_hotkey.key,)
             resolved_vk_codes = win32_keys.resolve_vk_codes(tokens)
         except (hotkey.HotkeyParseError, win32_keys.UnknownKeyTokenError) as exc:
             self._logger.warning(
-                "voice mapping ignored: invalid %s shortcut: %s",
-                mode.value,
+                "voice mapping ignored: invalid voice shortcut: %s",
                 exc,
             )
             return False
@@ -3261,27 +3140,373 @@ class RC003App:
             )
             return False
         if (
-            backend
-            in {_VOICE_HOTKEY_BACKEND_MARKED, _VOICE_HOTKEY_BACKEND_DOUBAO}
-            and win32_keys.VK_CODES["ralt"] in resolved_vk_codes
+            win32_keys.VK_CODES["ralt"] in resolved_vk_codes
             and not self._voice_key_physicalizer_ready
+            and not self._voice_slot_uses_interception(slot)
         ):
+            # The Interception driver injects below the low-level hook, so the
+            # stroke carries no LLKHF_INJECTED flag and never needs the
+            # physicalizer marker; requiring one would block the slot outright.
             self._logger.warning(
-                "voice mapping ignored: marked right-Alt physicalizer is unavailable"
+                "voice mapping ignored: required voice key physicalizer is unavailable"
             )
             return False
-        requested = (mode, voice_hotkey.serialize())
-        current = (self._voice_shortcut.controller.trigger_mode, self._voice_shortcut.hotkey.serialize())
+        requested = voice_hotkey.serialize()
+        current = (
+            self._voice_shortcut.hotkey.serialize()
+            if self._voice_shortcut.hotkey is not None
+            else ""
+        )
         if requested != current:
-            if not self._voice_settings_idle_locked():
+            if not self._voice_settings_idle_locked() and not (
+                allow_latched_stream_takeover
+                and self._latched_voice_stream_only_locked()
+            ):
                 self._logger.info(
-                    "voice mapping change deferred: active session owns %s/%s",
-                    current[0].value,
-                    current[1],
+                    "voice mapping change deferred: active session owns hotkey=%s",
+                    current,
                 )
                 return False
-            self._apply_voice_settings_locked(mode, voice_hotkey)
+            self._apply_voice_settings_locked(
+                voice_hotkey, update_config=slot == 1
+            )
         return True
+
+    def _press_voice_shortcut_edge_locked(self, voice_slot: Optional[int]) -> bool:
+        action = self._voice_shortcut.controller.on_mic_button_pressed()
+        delivered = self._voice_shortcut.apply(
+            action,
+            voice_slot=voice_slot,
+            inject_mode=self._voice_slot_inject_mode(voice_slot),
+        )
+        if not delivered:
+            self._voice_shortcut.controller.cancel_pending()
+            return False
+        if not self._arm_voice_hold_watchdog_locked():
+            self._force_voice_hold_release_locked(
+                "voice shortcut edge safety timer unavailable"
+            )
+            return False
+        return True
+
+    def _dismiss_short_voice_press_locked(self, reason: str) -> None:
+        """模式1 短按补偿：松手后补发一次相同快捷键，相当于自动双击。
+
+        模式1 按下即注入，短按已经让输入法完整看到一次按压；这个可选项在松手
+        后再补一次按下/松开，让输入法把刚弹出的面板关掉。补发按真人双击的节奏
+        发出：驱动级注入下，如果松开和补发只隔几毫秒，输入法面板还没真正创建，
+        第二次按键会被当成重复事件吞掉，看起来就像补偿没生效。只用于模式1 的
+        短按，长按和模式2 都不会走到这里。调用方持有 ``_voice_shortcut.lock``。
+        """
+
+        if self._uses_local_voice_microphone():
+            return
+        if not config.voice_short_press_dismiss(self._config):
+            return
+        voice_slot = key_mapping.voice_slot_for_action(
+            self._primary_button_action("mic")
+        )
+        token = object()
+        self._cancel_voice_short_press_dismiss_locked()
+        self._voice_short_press_dismiss_token = token
+        try:
+            timer = self._voice_short_press_dismiss_timer_factory(
+                _VOICE_SHORT_PRESS_DISMISS_DELAY_SECONDS,
+                lambda token=token, voice_slot=voice_slot, reason=reason: (
+                    self._voice_short_press_dismiss_delay_elapsed(
+                        token, voice_slot, reason
+                    )
+                ),
+            )
+            if isinstance(timer, threading.Thread):
+                timer.daemon = True
+            self._voice_short_press_dismiss_timer = timer
+            timer.start()
+        except BaseException as exc:  # noqa: BLE001 - compensation is best effort
+            if self._voice_short_press_dismiss_token is token:
+                self._cancel_voice_short_press_dismiss_locked()
+            self._logger.warning(
+                "voice short press dismiss timer failed: error_type=%s reason=%s",
+                type(exc).__name__,
+                reason,
+            )
+
+    def _cancel_voice_short_press_dismiss_locked(self) -> None:
+        timer = self._voice_short_press_dismiss_timer
+        self._voice_short_press_dismiss_timer = None
+        self._voice_short_press_dismiss_token = None
+        if timer is not None:
+            cancel = getattr(timer, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except BaseException:  # noqa: BLE001 - token is already invalid
+                    pass
+
+    def _voice_short_press_dismiss_delay_elapsed(
+        self,
+        token: object,
+        voice_slot: Optional[int],
+        reason: str,
+    ) -> None:
+        """双击间隔走完：复核状态后补发第二次按下。"""
+
+        with self._voice_shortcut.lock:
+            if token is not self._voice_short_press_dismiss_token:
+                return
+            self._voice_short_press_dismiss_token = None
+            self._voice_short_press_dismiss_timer = None
+            if not self._short_press_dismiss_still_wanted_locked():
+                return
+            inject_mode = self._voice_slot_inject_mode(voice_slot)
+            if not self._press_voice_shortcut_edge_locked(voice_slot):
+                return
+            self._voice_short_press_dismiss_hold_outstanding = True
+            self._arm_voice_short_press_dismiss_release_locked(inject_mode, reason)
+
+    def _short_press_dismiss_still_wanted_locked(self) -> bool:
+        if self._uses_local_voice_microphone():
+            return False
+        if not config.voice_short_press_dismiss(self._config):
+            return False
+        if self._voice_shortcut.controller.active:
+            return False
+        if (
+            self._voice_shortcut_physical_sources_down
+            or self._voice_mic_gesture_sources_down
+        ):
+            return False
+        return True
+
+    def _arm_voice_short_press_dismiss_release_locked(
+        self,
+        inject_mode: Optional[str],
+        reason: str,
+    ) -> None:
+        """保持一小段按下时间再松开，避免驱动级注入的补发被当成抖动。
+
+        松开定时器单独存放：延迟补发会被下一次短按取消，但已经按下的补发
+        必须无条件松开，绝不能把宿主快捷键留在按住状态。
+        """
+
+        try:
+            timer = self._voice_short_press_dismiss_timer_factory(
+                _VOICE_SHORT_PRESS_DISMISS_TAP_HOLD_SECONDS,
+                lambda: self._voice_short_press_dismiss_release_elapsed(
+                    inject_mode, reason
+                ),
+            )
+            if isinstance(timer, threading.Thread):
+                timer.daemon = True
+            self._voice_short_press_release_timer = timer
+            timer.start()
+        except BaseException as exc:  # noqa: BLE001 - never leave the key held
+            self._logger.warning(
+                "voice short press dismiss hold timer failed: error_type=%s",
+                type(exc).__name__,
+            )
+            self._voice_short_press_dismiss_release_elapsed(inject_mode, reason)
+
+    def _voice_short_press_dismiss_release_elapsed(
+        self,
+        inject_mode: Optional[str],
+        reason: str,
+    ) -> None:
+        with self._voice_shortcut.lock:
+            self._voice_short_press_release_timer = None
+            if not self._voice_short_press_dismiss_hold_outstanding:
+                # 用户已经重新按住话筒：这一次的松开由用户自己的按下接管。
+                return
+            self._voice_short_press_dismiss_hold_outstanding = False
+            if self._release_voice_shortcut_edge_locked(
+                "short press dismiss second tap",
+                inject_mode=inject_mode,
+            ):
+                self._logger.info(
+                    "voice short press dismissed with a second tap on %s", reason
+                )
+
+    def _handle_extra_voice_key_edge(
+        self,
+        button_id: str,
+        action: key_mapping.ButtonAction,
+        is_pressed: bool,
+    ) -> None:
+        """Run the full voice pipeline for a voice slot on a non-microphone key.
+
+        Extra voice slots (语音二/语音三) bound to a remote button have to open
+        the RC003 device microphone themselves: unlike the physical mic button
+        the device does not start streaming on its own for these keys, so the
+        host requests MIC_OPEN and enables PCM forwarding in addition to
+        replaying the slot's configured host shortcut. The press/release
+        behaviour therefore matches the physical mic button, which is what lets
+        a single remote drive several external voice programs.
+        """
+
+        slot = key_mapping.voice_slot_for_action(action)
+        if slot is None:
+            return
+        if not self._uses_local_voice_microphone():
+            # 模式1 只认遥控器话筒键：其它按键上的语音槽不生效，界面也会
+            # 提示用户改用模式2。
+            self._logger.info(
+                "extra voice key ignored in remote-microphone mode: "
+                "button=%s slot=%s",
+                button_id,
+                slot,
+            )
+            return
+        gesture = self._extra_voice_gestures.get(slot)
+        if gesture is None:
+            gesture = voice_gesture.VoiceGestureLatch()
+            self._extra_voice_gestures[slot] = gesture
+        with self._voice_shortcut.lock:
+            if is_pressed:
+                self._voice_shortcut_physical_sources_down.add(button_id)
+            else:
+                self._voice_shortcut_physical_sources_down.discard(button_id)
+            if self._extra_voice_slot_close_pending == slot:
+                if not is_pressed:
+                    self._voice_shortcut_physical_sources_down.discard(button_id)
+                    self._extra_voice_slot_close_pending = None
+                    self._release_voice_shortcut_edge_locked(
+                        "extra voice key second tap release"
+                    )
+                return
+            if gesture.latched:
+                if is_pressed:
+                    if gesture.on_press() == voice_gesture.VoiceGestureDecision.CLOSE:
+                        self._extra_voice_slot_close_pending = slot
+                        self._press_voice_shortcut_edge_locked(slot)
+                        self._voice_pcm_forwarding_enabled = False
+                        self._set_runtime_voice_active(False)
+                        self._stop_local_voice_capture_locked()
+                        if (
+                            self._ble_session is not None
+                            and not self._uses_local_voice_microphone()
+                        ):
+                            self._ble_session.send_mic_close_threadsafe()
+                        self._logger.info(
+                            "extra voice key tap latch released: button=%s slot=%s",
+                            button_id,
+                            slot,
+                        )
+                elif self._extra_voice_slot_active == slot:
+                    self._extra_voice_slot_active = None
+                    self._release_voice_shortcut_edge_locked(
+                        "extra voice key second tap release"
+                    )
+                return
+            if is_pressed:
+                if self._extra_voice_slot_active == slot:
+                    return
+                if self._extra_voice_slot_active is not None:
+                    self._logger.info(
+                        "extra voice key ignored: another extra slot is active; "
+                        "button=%s slot=%s active_slot=%s",
+                        button_id,
+                        slot,
+                        self._extra_voice_slot_active,
+                    )
+                    return
+                if self._voice_shortcut.controller.active:
+                    self._logger.info(
+                        "extra voice key ignored: hold session already active; "
+                        "button=%s slot=%s",
+                        button_id,
+                        slot,
+                    )
+                    return
+                if not self._prepare_voice_mapping_locked(
+                    button_id,
+                    action,
+                    # A latched mic tap keeps the device stream open without
+                    # holding any host shortcut, so this deliberate extra-key
+                    # press may still take the mapping over.
+                    allow_latched_stream_takeover=True,
+                ):
+                    return
+                self._voice_ignore_audio_start_until_physical_down = False
+                if not self._handle_mic_button_pressed(
+                    # A latched mic tap already keeps the device stream open;
+                    # asking for another MIC_OPEN would restart it under the
+                    # latched session.
+                    send_device_open=not self._voice_gesture.latched,
+                    voice_slot=slot,
+                ):
+                    self._logger.info(
+                        "extra voice key ignored: voice pipeline failed to open "
+                        "the microphone; button=%s slot=%s",
+                        button_id,
+                        slot,
+                    )
+                    return
+                self._extra_voice_slot_active = slot
+                gesture.on_press()
+                self._logger.info(
+                    "extra voice key pressed: button=%s slot=%s", button_id, slot
+                )
+                return
+            if self._extra_voice_slot_active != slot:
+                return
+            decision = gesture.on_release()
+            released = self._release_voice_shortcut_edge_locked(
+                "extra voice key release"
+            )
+            if decision == voice_gesture.VoiceGestureDecision.LATCH:
+                self._extra_voice_slot_active = None
+                # A tap keeps the microphone open until the same key is tapped
+                # again. The host shortcut already got one complete
+                # press/release pair, so the input method saw a real short
+                # press; the device stream has to stay - or come back - open
+                # underneath it. Without this the tap latch looked latched but
+                # forwarded nothing, because the device had already dropped its
+                # short stream while the key was still down.
+                self._voice_pcm_forwarding_enabled = True
+                self._set_runtime_voice_active(True)
+                self._set_runtime_voice_result(
+                    bridge_runtime_status.VOICE_RUNTIME_ACTIVE
+                )
+                if not self._voice_audio_stream_active and not self._uses_local_voice_microphone():
+                    try:
+                        if self._ble_session is not None:
+                            self._ble_session.send_mic_open_threadsafe()
+                    except BaseException as exc:  # noqa: BLE001 - never trap input
+                        self._logger.warning(
+                            "extra voice tap latch MIC_OPEN failed: "
+                            "error_type=%s",
+                            type(exc).__name__,
+                        )
+                self._logger.info(
+                    "extra voice key tap latched: button=%s slot=%s",
+                    button_id,
+                    slot,
+                )
+                return
+            self._extra_voice_slot_active = None
+            if self._voice_gesture.latched:
+                # A latched mic tap still owns the open microphone, so this
+                # extra shortcut must not close the stream under it.
+                self._voice_pcm_forwarding_enabled = True
+                self._set_runtime_voice_active(True)
+                self._logger.info(
+                    "extra voice key released with mic latch open: button=%s slot=%s",
+                    button_id,
+                    slot,
+                )
+                return
+            self._voice_pcm_forwarding_enabled = False
+            self._set_runtime_voice_active(False)
+            self._stop_local_voice_capture_locked()
+            if (
+                released
+                and self._ble_session is not None
+                and not self._uses_local_voice_microphone()
+            ):
+                self._ble_session.send_mic_close_threadsafe()
+            self._logger.info(
+                "extra voice key released: button=%s slot=%s", button_id, slot
+            )
 
     def _begin_voice_mic_gesture(
         self, source: str, *, physical_down: bool = False
@@ -3310,10 +3535,16 @@ class RC003App:
         self._voice_mic_gesture_sources_down = {source} if physical_down else set()
         return True
 
-    def _finish_voice_mic_gesture(self) -> None:
-        """Release the current cross-source mic gesture latch."""
+    def _finish_voice_mic_gesture(self, *, reset_gesture: bool = True) -> None:
+        """Release the current cross-source mic gesture latch.
+
+        ``reset_gesture=False`` keeps a just-latched tap alive across the
+        physical release so the next tap can close the session.
+        """
 
         self._cancel_voice_hold_watchdog_locked()
+        if reset_gesture:
+            self._voice_gesture.reset()
         self._voice_mic_gesture_active = False
         self._voice_mic_gesture_audio_started = False
         self._voice_mic_gesture_audio_stopped = False
@@ -3373,30 +3604,18 @@ class RC003App:
             self._accept_ble_events = False
             self._ble_callback_generation += 1
         self._voice_pcm_forwarding_enabled = False
-        self._voice_pcm_min_arrival_sequence = None
         self._voice_audio_stream_active = False
         self._voice_audio_stop_processed = True
         self._voice_raw_input_trigger_pending = False
         self._voice_audio_start_fallback_pending = False
+        self._stop_local_voice_capture_locked()
         self._voice_mic_gesture_sources_down.clear()
+        self._voice_shortcut_physical_sources_down.clear()
         self._voice_mic_gesture_hid_released = True
 
-        doubao_attempt = self._active_doubao_attempt_locked()
         action = self._voice_shortcut.controller.reset()
         released = True
-        doubao_cleanup_requested = False
-        if doubao_attempt is not None:
-            released = self._request_active_doubao_cleanup_locked(
-                doubao_attempt,
-                reason=reason,
-            )
-            doubao_cleanup_requested = released
-            if released:
-                self._set_runtime_voice_result(
-                    bridge_runtime_status.VOICE_RUNTIME_FINISHING,
-                    provider=voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
-                )
-        elif action is not None:
+        if action is not None:
             released = self._voice_shortcut.apply(action)
             if not released:
                 self._voice_shortcut.controller.restore_pending(action)
@@ -3404,9 +3623,11 @@ class RC003App:
             released = self._voice_shortcut.release_pending()
 
         self._finish_voice_mic_gesture()
-        if released and doubao_cleanup_requested:
-            self._set_runtime_voice_active(False)
-        elif released:
+        self._extra_voice_slot_active = None
+        self._extra_voice_slot_close_pending = None
+        for gesture in self._extra_voice_gestures.values():
+            gesture.reset()
+        if released:
             self._set_runtime_voice_active(False)
             self._log_voice_submission_observation()
             self._finish_voice_diagnostic_attempt(
@@ -3453,7 +3674,6 @@ class RC003App:
 
         if not (
             self._voice_mic_gesture_active
-            and self._voice_mic_gesture_audio_stopped
             and not self._voice_shortcut.controller.active
             and self._voice_mic_gesture_hid_released
         ):
@@ -3468,13 +3688,67 @@ class RC003App:
         )
         return True
 
+    def _release_voice_shortcut_edge_locked(
+        self,
+        reason: str,
+        *,
+        inject_mode: Optional[str] = None,
+    ) -> bool:
+        action = self._voice_shortcut.controller.on_mic_button_released()
+        if action is None:
+            self._cancel_voice_hold_watchdog_locked()
+            return True
+        if self._voice_shortcut.apply(action, inject_mode=inject_mode):
+            self._cancel_voice_hold_watchdog_locked()
+            self._logger.info("voice shortcut edge released on %s", reason)
+            return True
+        self._voice_shortcut.controller.restore_pending(action)
+        self._set_runtime_voice_result(
+            bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED
+        )
+        self._logger.info(
+            "voice shortcut edge release failed on %s; state retained, requesting reconnect",
+            reason,
+        )
+        self._supervisor.request_reconnect()
+        return False
+
+    def _close_latched_voice_session_locked(self, reason: str) -> None:
+        """End a latched tap session from a second physical mic tap.
+
+        The caller holds ``_voice_trigger_lock``. The second tap still replays
+        its own host edge so the input method sees a fresh press, then PCM
+        forwarding stops, the device microphone is closed and the latch is
+        dropped so the following tap starts a clean session.
+        """
+
+        voice_slot = key_mapping.voice_slot_for_action(
+            self._primary_button_action("mic")
+        )
+        self._press_voice_shortcut_edge_locked(voice_slot)
+        self._voice_pcm_forwarding_enabled = False
+        self._set_runtime_voice_active(False)
+        self._stop_local_voice_capture_locked()
+        try:
+            if self._ble_session is not None:
+                self._ble_session.send_mic_close_threadsafe()
+        except BaseException as exc:  # noqa: BLE001 - never trap input
+            self._logger.warning(
+                "voice tap latch MIC_CLOSE failed: error_type=%s",
+                type(exc).__name__,
+            )
+        self._voice_mic_gesture_sources_down.clear()
+        self._finish_voice_mic_gesture()
+        if self._voice_shortcut.controller.active:
+            self._arm_voice_hold_watchdog_locked()
+        self._logger.info("voice mic tap latch released by %s", reason)
+
     def _release_hold_voice_on_physical_release_locked(
         self,
         reason: str,
     ) -> bool:
         """Release HOLD shortcuts without depending solely on AUDIO_STOP."""
 
-        self._doubao_session.cancel_current()
         action = self._voice_shortcut.controller.on_mic_button_released()
         if action is None:
             self._cancel_voice_hold_watchdog_locked()
@@ -3482,20 +3756,6 @@ class RC003App:
         self._voice_raw_input_trigger_pending = False
         self._voice_audio_start_fallback_pending = False
         self._voice_pcm_forwarding_enabled = False
-        self._voice_pcm_min_arrival_sequence = None
-        doubao_attempt = self._active_doubao_attempt_locked()
-        if doubao_attempt is not None:
-            accepted = self._request_active_doubao_cleanup_locked(
-                doubao_attempt,
-                reason=reason,
-            )
-            if accepted:
-                self._cancel_voice_hold_watchdog_locked()
-                self._set_runtime_voice_result(
-                    bridge_runtime_status.VOICE_RUNTIME_FINISHING,
-                    provider=voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
-                )
-            return accepted
         if self._voice_shortcut.apply(action):
             self._cancel_voice_hold_watchdog_locked()
             self._logger.info("voice hold hotkey released on %s", reason)
@@ -3523,194 +3783,6 @@ class RC003App:
         )
         self._supervisor.request_reconnect()
         return False
-
-    def _active_doubao_attempt_locked(
-        self,
-    ) -> Optional[rc003_doubao_session.DoubaoAttempt]:
-        attempt = self._doubao_session.current
-        if (
-            self._remote_profile == remote_selection.RC003_PROFILE
-            and attempt is not None
-            and attempt.is_active()
-        ):
-            return attempt
-        return None
-
-    def _request_active_doubao_cleanup_locked(
-        self,
-        attempt: rc003_doubao_session.DoubaoAttempt,
-        *,
-        reason: str,
-    ) -> bool:
-        if attempt.has_cleanup_debt("active_session"):
-            attempt.replace_cleanup_debt(
-                "active_session",
-                "hotkey",
-                "playback",
-            )
-        self._voice_shortcut.pending_tokens = attempt.snapshot.tokens
-        self._voice_shortcut.pending_backend = _VOICE_HOTKEY_BACKEND_DOUBAO
-        self._voice_shortcut.active_backend = _VOICE_HOTKEY_BACKEND_DOUBAO
-        started = self._doubao_session.request_cleanup(
-            attempt,
-            lambda owned: self._run_active_doubao_cleanup(owned, reason=reason),
-        )
-        if not started and not attempt.cleanup_worker_running:
-            self._voice_shortcut.schedule_release_retry()
-            self._supervisor.request_reconnect()
-        return started or attempt.cleanup_worker_running
-
-    def _run_active_doubao_cleanup(
-        self,
-        attempt: rc003_doubao_session.DoubaoAttempt,
-        *,
-        reason: str,
-    ) -> None:
-        debts = attempt.cleanup_debt_snapshot()
-        generation = self._voice_shortcut.control_generation(
-            _VOICE_HOTKEY_BACKEND_DOUBAO
-        )
-        if "playback" in debts:
-            writer = self._voice_audio.writer
-            if writer is None:
-                attempt.resolve_cleanup_debt("playback")
-            else:
-                try:
-                    result = writer.flush()
-                except Exception:
-                    result = None
-                    self._logger.exception(
-                        "Doubao playback flush raised during %s",
-                        reason,
-                    )
-                if result is not None and result.completed:
-                    attempt.resolve_cleanup_debt("playback")
-                else:
-                    self._logger.error(
-                        "Doubao playback flush failed during %s: %s",
-                        reason,
-                        (
-                            result.error
-                            if result is not None and result.error
-                            else "unknown error"
-                        ),
-                    )
-                    self._supervisor.request_reconnect()
-
-        released = True
-        if "hotkey" in debts:
-            try:
-                expected_markers = len(
-                    tuple(
-                        dict.fromkeys(
-                            win32_keys.resolve_vk_codes(attempt.snapshot.tokens)
-                        )
-                    )
-                )
-            except win32_keys.UnknownKeyTokenError:
-                expected_markers = 0
-            self._voice_shortcut.doubao_physicalizer.expect_markers("up", expected_markers)
-            trace_context = {
-                **self._diagnostic_trace.current_context(),
-                "action": voice_controller.VoiceHostAction.KEY_UP.value,
-            }
-            self._diagnostic_trace.emit(
-                "voice_hotkey_requested",
-                **trace_context,
-                backend=_VOICE_HOTKEY_BACKEND_DOUBAO,
-                tokens=list(attempt.snapshot.tokens),
-                source="rc003_doubao_session",
-            )
-            try:
-                released = bool(self._voice_shortcut.doubao_control.stop())
-            except Exception:
-                released = False
-                self._logger.exception(
-                    "Doubao asynchronous voice release failed"
-                )
-            self._diagnostic_trace.emit(
-                "voice_hotkey_result",
-                **trace_context,
-                backend=_VOICE_HOTKEY_BACKEND_DOUBAO,
-                delivered=bool(released),
-                generation=int(generation) if generation is not None else -1,
-                cleanup_pending=bool(
-                    self._voice_shortcut.control_flag(
-                        "cleanup_pending", _VOICE_HOTKEY_BACKEND_DOUBAO
-                    )
-                ),
-            )
-
-        with self._voice_shortcut.lock:
-            if released and "hotkey" in debts:
-                if (
-                    self._voice_shortcut.pending_tokens
-                    == attempt.snapshot.tokens
-                    and self._voice_shortcut.pending_backend
-                    == _VOICE_HOTKEY_BACKEND_DOUBAO
-                ):
-                    self._voice_shortcut.pending_tokens = None
-                    self._voice_shortcut.pending_backend = None
-                    self._voice_shortcut.active_backend = None
-                self._voice_shortcut.cancel_release_retry()
-                attempt.resolve_cleanup_debt("hotkey")
-            elif not released:
-                self._voice_shortcut.schedule_release_retry()
-                self._supervisor.request_reconnect()
-
-            cleanup_succeeded = not (
-                attempt.has_cleanup_debt("hotkey")
-                or attempt.has_cleanup_debt("playback")
-            )
-
-        if generation is not None:
-            self._voice_shortcut.on_cleanup(
-                generation,
-                cleanup_succeeded,
-                _VOICE_HOTKEY_BACKEND_DOUBAO,
-            )
-
-        with self._voice_shortcut.lock:
-            if cleanup_succeeded:
-                self._set_runtime_voice_active(False)
-                if not self._voice_audio_stream_active:
-                    stats = self._voice_audio.stats.summary()
-                    self._voice_shortcut.record_audio_result(int(stats["frames"]))
-                    self._finish_voice_mic_gesture()
-                    self._finish_doubao_diagnostic_after_cleanup_locked(
-                        reason="asynchronous_release_complete",
-                    )
-                self._apply_pending_voice_settings_if_idle_locked()
-        if cleanup_succeeded:
-            self._resume_degraded_voice_key_physicalizer_recovery()
-
-    def _finish_doubao_diagnostic_after_cleanup_locked(
-        self,
-        *,
-        reason: str,
-    ) -> None:
-        if self._voice_attempt_id is None:
-            return
-        stats = self._voice_audio.stats.summary()
-        observation = self._log_voice_submission_observation()
-        text_changed = bool(
-            observation is not None
-            and observation.text_delta is not None
-            and observation.text_delta > 0
-        )
-        if text_changed:
-            result = "text_changed"
-        elif self._voice_shortcut.ui_confirmation == "confirmed" and stats["frames"] > 0:
-            result = "host_confirmed_audio_ok"
-        else:
-            result = "unknown"
-        self._finish_voice_diagnostic_attempt(
-            result,
-            frames=int(stats["frames"]),
-            samples=int(stats["samples"]),
-            audio_signal=bool(stats["frames"] > 0),
-            reason=reason,
-        )
 
     def _reset_key_detection_mic_gesture_locked(self) -> None:
         self._key_detection_mic_gesture_active = False
@@ -3841,18 +3913,35 @@ class RC003App:
             return -1
 
     def _voice_settings_idle_locked(self) -> bool:
-        chromecast_host = self._chromecast_runtime.voice_host
         return not (
             self._voice_shortcut.controller.active
-            or self._doubao_session.busy
             or self._voice_mic_gesture_active
             or self._voice_audio_stream_active
             or self._ordinary_mic_gesture_active
             or self._voice_shortcut.pending_tokens is not None
-            or (
-                chromecast_host is not None
-                and getattr(chromecast_host, "_settings_claimed", False)
-            )
+        )
+
+    def _latched_voice_stream_only_locked(self) -> bool:
+        """True when the only live voice state is a latched, unowned device stream.
+
+        A short-tap latch keeps the device microphone streaming after the host
+        shortcut has been released, so ``_voice_settings_idle_locked`` reports
+        busy even though no shortcut is held. A deliberate host key press may
+        still repurpose the mapping in that state; an incoming device stream may
+        not, which is why the takeover is opt-in per call site.
+
+        A held physical source always implies an owned shortcut
+        (``controller.active``) or a live mic gesture, so those two checks
+        already cover it; the caller's own just-pressed extra key is therefore
+        not treated as an owner here.
+        """
+
+        return (
+            self._voice_audio_stream_active
+            and not self._voice_shortcut.controller.active
+            and not self._voice_mic_gesture_active
+            and not self._ordinary_mic_gesture_active
+            and self._voice_shortcut.pending_tokens is None
         )
 
     def _ordinary_button_mappings_idle(self) -> bool:
@@ -3863,18 +3952,16 @@ class RC003App:
 
     def _apply_voice_settings_locked(
         self,
-        trigger_mode: key_mapping.VoiceTriggerMode,
         voice_hotkey: hotkey.HotkeySpec,
+        *,
+        update_config: bool = True,
     ) -> None:
-        if trigger_mode != key_mapping.VoiceTriggerMode.HOLD:
-            raise ValueError("RC003 voice settings support hold-to-talk only")
         self._voice_shortcut.controller = voice_controller.VoiceController()
         self._voice_shortcut.hotkey = voice_hotkey
-        self._config["voice_trigger_mode"] = trigger_mode.value
-        self._config["voice_hotkey"] = voice_hotkey.serialize()
+        if update_config:
+            self._config["voice_hotkey"] = voice_hotkey.serialize()
         self._logger.info(
-            "settings voice configuration applied: trigger_mode=%s hotkey=%s",
-            trigger_mode.value,
+            "settings voice configuration applied: hotkey=%s",
             voice_hotkey.serialize(),
         )
 
@@ -3885,9 +3972,9 @@ class RC003App:
             self._config = self._pending_config
             self._pending_config = None
         if self._pending_voice_settings is not None:
-            trigger_mode, voice_hotkey = self._pending_voice_settings
+            voice_hotkey = self._pending_voice_settings
             self._pending_voice_settings = None
-            self._apply_voice_settings_locked(trigger_mode, voice_hotkey)
+            self._apply_voice_settings_locked(voice_hotkey)
         if (
             self._pending_bindings is not None
         ):
@@ -3896,6 +3983,8 @@ class RC003App:
                     self._button_combos.reset()
                     self._bindings = self._pending_bindings
                     self._pending_bindings = None
+                    self._preset_override_id = None
+                    self._preset_base_bindings = None
                     self._sync_physical_bindings_to_listener()
                     self._removed_voice_bindings = dict(
                         self._bindings.get(
@@ -3931,9 +4020,17 @@ class RC003App:
                 refreshed_config,
                 refreshed_bindings,
             )
-            trigger_mode = key_mapping.VoiceTriggerMode.HOLD
             refreshed_hotkey_text = _runtime_voice_hotkey_text(refreshed_config)
-            voice_hotkey = hotkey.HotkeySpec.parse(refreshed_hotkey_text)
+            # An unrecorded voice shortcut is a valid state: it must not abort
+            # the whole reload, which would also drop refreshed button mappings.
+            voice_hotkey = (
+                hotkey.HotkeySpec.parse(refreshed_hotkey_text)
+                if refreshed_hotkey_text
+                else None
+            )
+            refreshed_hotkey_serialized = (
+                voice_hotkey.serialize() if voice_hotkey is not None else ""
+            )
         except Exception as exc:  # noqa: BLE001 - keep the last valid settings
             self._logger.warning("settings reload skipped: %s", exc)
             with self._voice_shortcut.lock:
@@ -3947,20 +4044,26 @@ class RC003App:
         self._record_device_diagnostic_context()
         with self._voice_shortcut.lock:
             with self._button_mapping_lock:
-                refreshed_settings = (trigger_mode, voice_hotkey.serialize())
+                refreshed_settings = refreshed_hotkey_serialized
                 current_settings = (
-                    self._voice_shortcut.controller.trigger_mode,
-                    self._voice_shortcut.hotkey.serialize(),
+                    self._voice_shortcut.hotkey.serialize()
+                    if self._voice_shortcut.hotkey is not None
+                    else ""
                 )
                 if self._voice_settings_idle_locked():
                     self._config = refreshed_config
                     self._pending_config = None
                     self._pending_voice_settings = None
-                    if refreshed_settings != current_settings:
-                        self._apply_voice_settings_locked(trigger_mode, voice_hotkey)
+                    if (
+                        voice_hotkey is not None
+                        and refreshed_settings != current_settings
+                    ):
+                        self._apply_voice_settings_locked(voice_hotkey)
                     if self._ordinary_button_mappings_idle():
                         self._button_combos.reset()
                         self._bindings = refreshed_bindings
+                        self._preset_override_id = None
+                        self._preset_base_bindings = None
                         self._sync_physical_bindings_to_listener()
                         self._removed_voice_bindings = removed_voice_bindings
                         self._pending_bindings = None
@@ -3972,7 +4075,9 @@ class RC003App:
                 else:
                     self._pending_config = refreshed_config
                     self._pending_bindings = refreshed_bindings
-                    self._pending_voice_settings = (trigger_mode, voice_hotkey)
+                    self._pending_voice_settings = (
+                        voice_hotkey if voice_hotkey is not None else None
+                    )
                     self._logger.info(
                         "settings reload deferred until active voice session is idle"
                     )
@@ -3993,6 +4098,279 @@ class RC003App:
         """Apply saved settings promptly from the bridge event-loop thread."""
 
         self._event_loop.call_soon_threadsafe(self._reload_settings_if_changed)
+
+    # -- saved mapping presets: hotkey + foreground-process switching --------
+
+    def _start_preset_switching(self) -> None:
+        if self._preset_switch_task is None or self._preset_switch_task.done():
+            self._preset_switch_task = self._event_loop.create_task(
+                self._preset_switch_loop()
+            )
+
+    async def _stop_preset_switching(self) -> None:
+        task = self._preset_switch_task
+        self._preset_switch_task = None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._stop_preset_hotkey_listener()
+        with self._button_mapping_lock:
+            self._reset_preset_override_locked()
+
+    async def _preset_switch_loop(self) -> None:
+        while True:
+            try:
+                await self._poll_preset_switch()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - one bad poll must not end the loop
+                self._logger.exception("preset switch poll failed")
+            await asyncio.sleep(_PRESET_SWITCH_POLL_SECONDS)
+
+    async def _poll_preset_switch(self) -> None:
+        if not self._accept_input_events:
+            return
+        self._refresh_preset_hotkey_targets_if_changed()
+        process_targets = await asyncio.to_thread(self._preset_app_targets)
+        foreground = await asyncio.to_thread(self._preset_foreground_basename)
+        if foreground != self._preset_switch_foreground:
+            self._preset_switch_foreground = foreground
+            # A manual switch holds only while the foreground process is
+            # unchanged; moving to another window resumes process-scope again.
+            self._preset_manual_foreground = None
+        if self._preset_manual_foreground is not None:
+            return
+        target = process_targets.get(foreground) if foreground else None
+        if target != self._preset_override_id:
+            if target is None:
+                with self._button_mapping_lock:
+                    self._reset_preset_override_locked()
+            else:
+                self._apply_preset_override(target)
+        # The settings window can only learn about a switch through the shared
+        # profile library, so the marker always follows the overlay actually in
+        # memory - including a swap that a busy gesture postponed.
+        self._remember_applied_profile(
+            self._preset_override_id or app_profiles.GLOBAL_ID
+        )
+
+    def _preset_app_targets(self) -> dict:
+        """Map each app profile's process basename to its identity."""
+
+        try:
+            entries = self._preset_store.list_apps()
+        except Exception:  # noqa: BLE001 - unreadable profiles never break input
+            return {}
+        result: dict = {}
+        for entry in entries:
+            process = entry["process"].strip().casefold()
+            if process:
+                result.setdefault(process, entry["id"])
+        return result
+
+    def _preset_foreground_basename(self) -> str:
+        try:
+            snapshot = voice_interaction_diagnostics_windows.capture_focus_snapshot(
+                include_text_length=False
+            )
+        except Exception:  # noqa: BLE001 - best-effort foreground observation
+            return ""
+        name = getattr(snapshot, "foreground_executable", "") or ""
+        return os.path.basename(name).strip().casefold()
+
+    def _apply_preset_override(self, identity: str) -> None:
+        """Swap the live mapping for a process-scoped preset (in memory only)."""
+
+        try:
+            entry = self._preset_store.get(identity)
+        except Exception:  # noqa: BLE001 - the preset vanished between polls
+            return
+        with self._voice_shortcut.lock:
+            with self._button_mapping_lock:
+                if not self._accept_input_events:
+                    return
+                if not self._voice_settings_idle_locked():
+                    return  # retried on the next poll
+                base = (
+                    self._preset_base_bindings
+                    if self._preset_base_bindings is not None
+                    else self._bindings
+                )
+                try:
+                    replacement = app_profiles.apply_to(
+                        base, entry, self._remote_profile
+                    )
+                except Exception:  # noqa: BLE001 - a bad snapshot is display-only
+                    self._logger.warning(
+                        "preset process override skipped: invalid snapshot"
+                    )
+                    return
+                self._button_combos.reset()
+                self._bindings = replacement
+                # Overlays stack, so the untouched mapping is kept: switching
+                # straight from one app to another must resolve from the global
+                # layout instead of from the previous app's overlay.
+                self._preset_base_bindings = base
+                self._preset_override_id = identity
+                self._sync_physical_bindings_to_listener()
+                self._removed_voice_bindings = dict(
+                    replacement.get(config.RUNTIME_REMOVED_VOICE_BINDINGS_KEY, {})
+                )
+                self._logger.info(
+                    "preset process override applied; foreground=%s",
+                    self._preset_switch_foreground,
+                )
+
+    def _reset_preset_override_locked(self) -> None:
+        if self._preset_override_id is None and self._preset_base_bindings is None:
+            return
+        self._preset_override_id = None
+        base = self._preset_base_bindings
+        self._preset_base_bindings = None
+        if base is None:
+            try:
+                base = config.load_key_bindings(self._bindings_path)
+            except Exception:  # noqa: BLE001 - keep the last live mapping
+                self._logger.warning(
+                    "preset override reset could not reload key bindings"
+                )
+                return
+        self._bindings = base
+        self._removed_voice_bindings = dict(
+            base.get(config.RUNTIME_REMOVED_VOICE_BINDINGS_KEY, {})
+        )
+        self._sync_physical_bindings_to_listener()
+        self._logger.info("preset override cleared; base key bindings restored")
+
+    def _remember_applied_profile(self, identity: str) -> None:
+        """Publish the profile in effect so the settings window can highlight it."""
+
+        if identity == self._preset_applied_id:
+            return
+        try:
+            self._preset_store.mark_applied(identity)
+        except Exception:  # noqa: BLE001 - highlighting never breaks input
+            self._logger.warning("applied profile marker was not saved")
+            return
+        self._preset_applied_id = identity
+
+    def _build_preset_hotkey_targets(self) -> dict:
+        try:
+            entries = self._preset_store.load()
+        except Exception:  # noqa: BLE001 - unreadable presets disable the listener
+            self._logger.warning("saved presets unreadable; switch hotkeys disabled")
+            return {}
+        targets: dict = {}
+        for entry in entries:
+            if not entry["hotkey"]:
+                continue
+            try:
+                codes = win32_keys.resolve_vk_codes(entry["hotkey"].split("+"))
+            except Exception:  # noqa: BLE001 - a stored hotkey is revalidated on save
+                continue
+            # The low-level hook reports handed modifier VKs; collapse both
+            # sides onto the generic vocabulary so stored chords match.
+            chord = frozenset(
+                preset_switch_windows.normalize_vk(code) for code in codes
+            )
+            if chord:
+                targets[chord] = entry["id"]
+        return targets
+
+    def _refresh_preset_hotkey_targets_if_changed(self, *, force: bool = False) -> None:
+        mtime_ns = self._settings_file_mtime_ns(self._preset_store.path)
+        if not force and mtime_ns == self._presets_mtime_ns:
+            return
+        self._presets_mtime_ns = mtime_ns
+        targets = self._build_preset_hotkey_targets()
+        if not targets:
+            self._stop_preset_hotkey_listener()
+            return
+        listener = self._preset_hotkey_listener
+        if listener is None:
+            listener = preset_switch_windows.PresetSwitchListener(
+                on_switch=self._on_preset_hotkey,
+                logger=self._logger,
+            )
+            self._preset_hotkey_listener = listener
+        try:
+            listener.set_targets(targets)
+        except Exception:  # noqa: BLE001 - keep the last working targets
+            self._logger.exception("preset switch target update failed")
+            return
+        if not listener.is_running:
+            try:
+                listener.start()
+            except preset_switch_windows.PresetSwitchUnavailableError as exc:
+                self._logger.warning("preset switch hotkeys unavailable: %s", exc)
+            except Exception:  # noqa: BLE001 - never fail input startup
+                self._logger.exception("preset switch listener failed to start")
+
+    def _stop_preset_hotkey_listener(self) -> None:
+        listener = self._preset_hotkey_listener
+        self._preset_hotkey_listener = None
+        if listener is None:
+            return
+        try:
+            listener.stop()
+        except Exception:  # noqa: BLE001 - teardown must always be attempted
+            self._logger.exception("preset switch listener did not stop cleanly")
+
+    def _on_preset_hotkey(self, identity: str) -> None:
+        """Hook-thread callback: marshal the switch onto the event loop."""
+
+        loop = self._event_loop
+        if loop is None:
+            return
+        loop.call_soon_threadsafe(self._activate_preset_by_hotkey, identity)
+
+    def _activate_preset_by_hotkey(self, identity: str) -> None:
+        if not self._accept_input_events:
+            return
+        with self._button_mapping_lock:
+            try:
+                entry = self._preset_store.get(identity)
+                base = (
+                    self._preset_base_bindings
+                    if self._preset_base_bindings is not None
+                    else self._bindings
+                )
+                replacement = app_profiles.apply_to(
+                    base, entry, self._remote_profile
+                )
+            except Exception:  # noqa: BLE001 - a stale id is simply ignored
+                self._logger.warning("preset hotkey switch skipped: invalid preset")
+                return
+        try:
+            config.save_key_bindings(self._bindings_path, replacement)
+        except Exception:  # noqa: BLE001 - do not half-apply a failed save
+            self._logger.exception("preset hotkey switch could not be saved")
+            return
+        self._remember_applied_profile(identity)
+        with self._voice_shortcut.lock:
+            with self._button_mapping_lock:
+                # A deliberate hotkey switch supersedes any process override and
+                # is applied persistently, exactly like the settings window.
+                self._preset_override_id = None
+                self._preset_base_bindings = None
+                if self._voice_settings_idle_locked():
+                    self._pending_config = None
+                    self._pending_voice_settings = None
+                if self._ordinary_button_mappings_idle():
+                    self._button_combos.reset()
+                    self._bindings = replacement
+                    self._pending_bindings = None
+                    self._sync_physical_bindings_to_listener()
+                    self._removed_voice_bindings = dict(
+                        replacement.get(config.RUNTIME_REMOVED_VOICE_BINDINGS_KEY, {})
+                    )
+                else:
+                    self._pending_bindings = replacement
+                self._bindings_mtime_ns = self._settings_file_mtime_ns(
+                    self._bindings_path
+                )
+        self._preset_manual_foreground = self._preset_switch_foreground
+        self._logger.info("preset hotkey switch applied; waiting for any held key")
 
     def _handle_ordinary_mic_edge(
         self, event_source: str, is_pressed: bool
@@ -4276,17 +4654,14 @@ class RC003App:
                         button_id,
                     )
                 primary_action = None
-                voice_mode = None
+                is_voice_button = False
             else:
                 primary_action = self._primary_button_action(button_id)
-                voice_mode = self._voice_mode_for_primary_button(
+                is_voice_button = self._is_voice_primary_button(
                     button_id,
                     primary_action,
                 )
-                if (getattr(self, "_remote_profile", "") == remote_selection.CHROMECAST_PROFILE
-                        and key_mapping.is_voice_action(primary_action)):
-                    return  # Voice belongs to the next stage, including remapped ordinary buttons.
-                if button_id == "mic" and voice_mode is None:
+                if button_id == "mic" and not is_voice_button:
                     self._handle_ordinary_mic_edge(event_source, is_pressed)
                     ordinary_mic_handled = True
         if removed_voice_binding:
@@ -4296,9 +4671,30 @@ class RC003App:
             self._apply_pending_settings_if_idle()
             return
 
+        if is_voice_button and button_id != "mic":
+            self._handle_extra_voice_key_edge(button_id, primary_action, is_pressed)
+            self._apply_pending_settings_if_idle()
+            return
+
         if button_id == "mic":
             if not is_pressed:
                 with self._voice_shortcut.lock:
+                    shortcut_source_was_down = (
+                        event_source in self._voice_shortcut_physical_sources_down
+                    )
+                    if shortcut_source_was_down:
+                        self._voice_shortcut_physical_sources_down.discard(
+                            event_source
+                        )
+                        if event_source in {"hid", "hid_tap"}:
+                            self._voice_shortcut_physical_sources_down.clear()
+                        if (
+                            event_source in {"hid", "hid_tap"}
+                            or not self._voice_shortcut_physical_sources_down
+                        ):
+                            self._release_voice_shortcut_edge_locked(
+                                "physical mic release"
+                            )
                     source_was_down = (
                         self._voice_mic_gesture_active
                         and event_source in self._voice_mic_gesture_sources_down
@@ -4315,14 +4711,13 @@ class RC003App:
                     matched_hid_released = event_source in {"hid", "hid_tap"}
                     if matched_hid_released:
                         self._voice_mic_gesture_hid_released = True
+                        self._voice_ignore_audio_start_until_physical_down = True
                     self._voice_mic_gesture_sources_down.discard(event_source)
+                    gesture_decision = None
+                    short_tap = False
                     if (
-                        self._voice_shortcut.controller.trigger_mode
-                        == key_mapping.VoiceTriggerMode.HOLD
-                        and (
-                            matched_hid_released
-                            or not self._voice_mic_gesture_sources_down
-                        )
+                        matched_hid_released
+                        or not self._voice_mic_gesture_sources_down
                     ):
                         if (
                             event_source == "hid_tap"
@@ -4333,33 +4728,128 @@ class RC003App:
                                 "late duplicate sources remain: %s",
                                 sorted(self._voice_mic_gesture_sources_down),
                             )
-                        self._release_hold_voice_on_physical_release_locked(
-                            "physical mic release",
+                        gesture_decision = self._voice_gesture.on_release()
+                        short_tap = (
+                            gesture_decision
+                            is voice_gesture.VoiceGestureDecision.LATCH
                         )
+                        if (
+                            gesture_decision
+                            is voice_gesture.VoiceGestureDecision.LATCH
+                            and not self._uses_local_voice_microphone()
+                        ):
+                            # 模式1 只支持长按：按下时快捷键已经立即下发，
+                            # 松手就立刻结束，绝不锁存（遥控器只在按住期间
+                            # 送音频，锁存会让界面显示录音中却没有声音）。
+                            gesture_decision = (
+                                voice_gesture.VoiceGestureDecision.CLOSE
+                            )
+                        self._voice_raw_input_trigger_pending = False
+                        self._voice_audio_start_fallback_pending = False
+                        if (
+                            gesture_decision
+                            is voice_gesture.VoiceGestureDecision.LATCH
+                        ):
+                            # Tap: the host shortcut already got one complete
+                            # press/release, so the input method sees a real
+                            # short press.  The microphone itself stays open
+                            # until the next tap.
+                            self._voice_ignore_audio_start_until_physical_down = (
+                                False
+                            )
+                            self._voice_pcm_forwarding_enabled = True
+                            self._set_runtime_voice_active(True)
+                            self._set_runtime_voice_result(
+                                bridge_runtime_status.VOICE_RUNTIME_ACTIVE
+                            )
+                            if (
+                                self._voice_mic_gesture_audio_stopped
+                                and not self._uses_local_voice_microphone()
+                            ):
+                                # The device already dropped its stream during
+                                # this press; the latch needs it back open.
+                                # 模式2 不需要：声音来自本机麦克风。
+                                try:
+                                    if self._ble_session is not None:
+                                        self._ble_session.send_mic_open_threadsafe()
+                                except BaseException as exc:  # noqa: BLE001
+                                    self._logger.warning(
+                                        "voice tap latch MIC_OPEN failed: "
+                                        "error_type=%s",
+                                        type(exc).__name__,
+                                    )
+                            self._logger.info(
+                                "voice mic tap latched open until the next tap"
+                            )
+                        else:
+                            self._voice_gesture.reset()
+                            self._voice_pcm_forwarding_enabled = False
+                            self._stop_local_voice_capture_locked()
+                            if not self._voice_audio_stream_active:
+                                self._set_runtime_voice_active(False)
                     if (
                         self._voice_mic_gesture_active
-                        and not self._voice_mic_gesture_sources_down
                         and (
-                            self._voice_mic_gesture_audio_stopped
+                            matched_hid_released
                             or (
-                                not self._voice_mic_gesture_audio_started
+                                not self._voice_mic_gesture_sources_down
+                                and self._voice_mic_gesture_audio_stopped
                             )
                         )
                     ):
-                        self._finish_voice_mic_gesture()
+                        self._finish_voice_mic_gesture(
+                            reset_gesture=(
+                                gesture_decision
+                                is not voice_gesture.VoiceGestureDecision.LATCH
+                            )
+                        )
+                    if short_tap:
+                        self._dismiss_short_voice_press_locked(
+                            "physical mic release"
+                        )
                     self._apply_pending_voice_settings_if_idle_locked()
                 return
             with self._voice_shortcut.lock:
+                self._voice_ignore_audio_start_until_physical_down = False
+                if self._voice_shortcut_physical_sources_down:
+                    self._voice_shortcut_physical_sources_down.add(event_source)
+                    self._begin_voice_mic_gesture(
+                        event_source,
+                        physical_down=True,
+                    )
+                    self._logger.info(
+                        "duplicate voice physical press merged: source=%s",
+                        event_source,
+                    )
+                    return
+                self._voice_shortcut_physical_sources_down.add(event_source)
+                if self._voice_gesture.latched:
+                    self._voice_shortcut_physical_sources_down.add(event_source)
+                    # A second tap ends the latched session.
+                    if (
+                        self._voice_gesture.on_press()
+                        == voice_gesture.VoiceGestureDecision.CLOSE
+                    ):
+                        self._close_latched_voice_session_locked("second tap")
+                    self._apply_pending_voice_settings_if_idle_locked()
+                    return
                 self._rollover_completed_voice_mic_gesture_locked(event_source)
                 if not self._prepare_voice_mapping_locked(
                     button_id,
                     primary_action,
                 ):
                     return
-                if not self._begin_voice_mic_gesture(
+                began = self._begin_voice_mic_gesture(
                     event_source,
                     physical_down=True,
-                ):
+                )
+                # Record the physical edge before any early return: the
+                # tap/hold decision is only made at release, so the gesture has
+                # to be armed even when the device's audio-start event already
+                # opened the session and the HID edge arrives afterwards.
+                # ``on_press`` is idempotent while already holding.
+                gesture_decision = self._voice_gesture.on_press()
+                if not began:
                     self._logger.info(
                         "voice physical trigger ignored: same mic gesture source=%s",
                         event_source,
@@ -4368,6 +4858,11 @@ class RC003App:
                 if self._voice_shortcut.controller.active:
                     self._logger.info(
                         "voice physical trigger ignored: hold session already active"
+                    )
+                    return
+                if gesture_decision != voice_gesture.VoiceGestureDecision.OPEN:
+                    self._logger.info(
+                        "voice physical trigger ignored: gesture not idle"
                     )
                     return
                 # The physical key is the earliest reliable signal. Send the
@@ -4381,7 +4876,7 @@ class RC003App:
                 self._handle_mic_button_pressed(
                     send_device_open=False,
                 )
-                if not self._voice_shortcut.controller.active and not self._doubao_session.busy:
+                if not self._voice_shortcut.controller.active:
                     self._voice_raw_input_trigger_pending = False
             return
 
@@ -4435,6 +4930,191 @@ class RC003App:
         )
         self._apply_button_action(action)
 
+    def _is_default_hold_button(self, button_id: str) -> bool:
+        """Whether a long press of this button should hold its single key.
+
+        Every button that is not explicitly configured with a secondary
+        long-press/double-click action and that is not a mouse-button hold
+        keeps the ordinary press/release edges: the single-click key is
+        pressed down at press time and released only when the physical button
+        is released.  Because injected keys never auto-repeat, the app replays
+        the key-down at the machine's keyboard repeat rate while the button
+        stays down.  There is no per-button exception: arrows, backspace,
+        volume and custom combinations all hold the same way.
+        """
+
+        if self._is_mouse_hold_button(button_id):
+            return False
+        action = key_mapping.button_action_for(
+            self._bindings, button_id, key_mapping.ButtonTrigger.SINGLE_CLICK
+        )
+        return self._button_action_key_tokens(action) is not None
+
+    def _on_button_hold_start(self, button_id: str, token: object) -> None:
+        if self._is_mouse_hold_button(button_id):
+            self._on_button_trigger(
+                button_id,
+                button_gesture.ButtonTrigger.LONG_PRESS,
+                hold_owner=token,
+            )
+            return
+        self._begin_button_key_hold(token, button_id)
+
+    def _on_button_hold_end(self, token: object) -> None:
+        self._end_button_mouse_hold(token)
+        self._end_button_key_hold(token)
+
+    def _is_mouse_hold_button(self, button_id: str) -> bool:
+        return key_mapping.button_action_for(
+            self._bindings, button_id, key_mapping.ButtonTrigger.LONG_PRESS
+        ).kind in key_mapping.MOUSE_HOLD_BUTTONS
+
+    def _begin_button_mouse_hold(self, owner: object, action: key_mapping.ButtonAction) -> None:
+        button = key_mapping.MOUSE_HOLD_BUTTONS[action.kind]
+        with self._button_action_lock:
+            if not self._accept_input_events or not self._release_pending_button_inputs():
+                return
+            owners = self._button_mouse_holds.get(button)
+            if owners:
+                owners.add(owner)
+                return
+            try:
+                win32_input.send_mouse_button_down(button)
+            except win32_input.InputCleanupIncompleteError:
+                self._button_hold_release_pending.add(button)
+                self._schedule_button_input_release_retry_locked()
+                self._logger.exception("mouse hold down has pending cleanup: %s", button)
+            except (win32_input.MouseButtonInUseError, win32_input.Win32InputUnavailableError, OSError):
+                self._logger.info("mouse hold down skipped: %s", button, exc_info=True)
+            else:
+                self._button_mouse_holds[button] = {owner}
+
+    def _end_button_mouse_hold(self, owner: object) -> None:
+        with self._button_action_lock:
+            for button, owners in list(self._button_mouse_holds.items()):
+                owners.discard(owner)
+                if not owners:
+                    del self._button_mouse_holds[button]
+                    self._button_hold_release_pending.add(button)
+            self._release_pending_button_inputs()
+
+    def _begin_button_key_hold(self, owner: object, button_id: str) -> None:
+        """Start the whole-hold behaviour for the button's single-click action.
+
+        Under Interception the single-click key is held down for the whole
+        physical hold and the matching key-up is delivered by
+        ``_end_button_key_hold``, so the target sees one sustained key press.
+        Under SendInput the driver cannot emulate that hold, so direction,
+        backspace and volume buttons keep the original click-repeat behaviour:
+        the first press and every repeat deliver a full tap (down+up).  Element
+        navigation keeps its tap behaviour because it consumes mapped
+        navigation keys itself.
+        """
+
+        action = key_mapping.button_action_for(
+            self._bindings, button_id, key_mapping.ButtonTrigger.SINGLE_CLICK
+        )
+        tokens = self._button_action_key_tokens(action)
+        if tokens is None:
+            return
+        with self._button_action_lock:
+            if not self._accept_input_events:
+                return
+            if not self._release_pending_button_inputs():
+                self._logger.info(
+                    "button hold suppressed: an earlier input release is still pending"
+                )
+                return
+            navigation_vk = _BUTTON_ACTION_NAVIGATION_VKS.get(action.kind)
+            if action.kind == key_mapping.ActionKind.KEY_COMBO:
+                navigation_vk = _BUTTON_NAVIGATION_SINGLE_KEYS.get(tuple(action.keys))
+            if navigation_vk is not None and element_navigation_control_windows.route_mapped_navigation_key(navigation_vk):
+                # Element navigation consumes the mapped key itself and moves
+                # one step per tap.  This call already delivered the first step;
+                # remember the action so each repeat re-runs it, and skip the
+                # injected sustained key-down.
+                self._button_tap_hold_actions[owner] = action
+                return
+            if (
+                action.inject_mode != key_mapping.INJECT_MODE_INTERCEPTION
+                and action.kind in _SENDINPUT_CLICK_REPEAT_KINDS
+            ):
+                # SendInput cannot emulate a Windows key hold, so direction,
+                # backspace and volume buttons keep the original click-repeat
+                # behaviour: this first press delivers one full tap and each
+                # repeat re-runs the same tap through the ordinary action path.
+                self._button_tap_hold_actions[owner] = action
+                self._apply_button_action_locked(action)
+                return
+            backend = injection_backend.backend_for(action.inject_mode)
+            try:
+                backend.key_down(tokens)
+            except injection_backend.InterceptionUnavailableError as exc:
+                self._logger.warning(
+                    "button hold skipped: interception backend unavailable: %s", exc
+                )
+                return
+            except win32_input.Win32InputUnavailableError as exc:
+                self._logger.info("button hold unavailable: %s", exc)
+                return
+            except win32_input.InputCleanupIncompleteError:
+                self._logger.exception("button hold key-down remains incomplete")
+                self._button_key_release_pending = tokens
+                self._schedule_button_input_release_retry_locked()
+                return
+            except OSError as exc:
+                self._logger.exception(
+                    "button hold failed to deliver: error_type=%s",
+                    type(exc).__name__,
+                )
+                return
+            self._button_key_holds[owner] = (tokens, backend)
+
+    def _end_button_key_hold(self, owner: object) -> None:
+        with self._button_action_lock:
+            self._button_tap_hold_actions.pop(owner, None)
+            entry = self._button_key_holds.pop(owner, None)
+            if entry is None:
+                return
+            tokens, backend = entry
+            try:
+                backend.key_up(tokens)
+            except win32_input.InputCleanupIncompleteError:
+                self._logger.exception("button hold key-up remains incomplete")
+                self._button_key_release_pending = tokens
+                self._schedule_button_input_release_retry_locked()
+                return
+            except win32_input.Win32InputUnavailableError:
+                self._logger.info("button hold key-up unavailable")
+                self._button_key_release_pending = tokens
+                self._schedule_button_input_release_retry_locked()
+                return
+            except OSError as exc:
+                # send_key_combo_up raises ordinary OSError only after its own
+                # per-key fallback confirmed every requested key-up.
+                self._logger.exception(
+                    "button hold key-up needed fallback but completed: error_type=%s",
+                    type(exc).__name__,
+                )
+            self._finish_button_input_release_if_complete_locked()
+
+    def _release_pending_mouse_holds_locked(self) -> bool:
+        for button in tuple(self._button_hold_release_pending):
+            try:
+                win32_input.send_mouse_button_up(button)
+            except (win32_input.InputCleanupIncompleteError, win32_input.Win32InputUnavailableError):
+                self._logger.warning("mouse hold release remains pending: %s", button)
+                continue
+            except OSError:
+                # Ordinary OSError means the sender confirmed fallback release.
+                self._logger.info("mouse hold release completed through fallback: %s", button)
+            self._button_hold_release_pending.remove(button)
+        if self._button_hold_release_pending:
+            self._schedule_button_input_release_retry_locked()
+            return False
+        self._finish_button_input_release_if_complete_locked()
+        return True
+
     def _is_button_combo_participant(self, button_id: str) -> bool:
         modifier = key_mapping.button_combo_modifier(self._bindings)
         if modifier is None:
@@ -4455,7 +5135,7 @@ class RC003App:
         if key_mapping.is_voice_action(action):
             return (
                 trigger.value == key_mapping.ButtonTrigger.SINGLE_CLICK.value
-                and self._voice_mode_for_primary_button(button_id, action) is not None
+                and self._is_voice_primary_button(button_id, action)
             )
         if action.kind == key_mapping.ActionKind.KEY_COMBO:
             try:
@@ -4470,33 +5150,58 @@ class RC003App:
             return True
         return True
 
-    def _is_button_repeatable(self, button_id: str) -> bool:
-        action = key_mapping.button_action_for(
-            self._bindings,
-            button_id,
-            key_mapping.ButtonTrigger.SINGLE_CLICK,
-        )
-        if button_id not in {
-            "up",
-            "down",
-            "left",
-            "right",
-            "back",
-            "volume_up",
-            "volume_down",
-        }:
-            return False
-        return key_mapping.action_allows_repeat(action)
+    def _on_button_hold_repeat(self, button_id: str, token: object) -> None:
+        """Replay a held button at the machine's keyboard rate.
+
+        Injected keys never auto-repeat, so a physical hold is simulated by the
+        app.  Interception-held buttons re-send only the key-down until release
+        (the matching key-up is delivered once by ``_end_button_key_hold``),
+        which makes them feel like a physical keyboard hold.  SendInput-held
+        direction, backspace and volume buttons re-run the whole click instead,
+        as does element navigation, which consumes mapped navigation keys
+        itself.
+        """
+
+        with self._button_action_lock:
+            entry = self._button_key_holds.get(token)
+            if entry is not None:
+                tokens, backend = entry
+                try:
+                    backend.key_down(tokens)
+                except injection_backend.InterceptionUnavailableError as exc:
+                    self._logger.warning(
+                        "button hold repeat skipped: interception backend "
+                        "unavailable: %s",
+                        exc,
+                    )
+                except win32_input.Win32InputUnavailableError as exc:
+                    self._logger.info("button hold repeat unavailable: %s", exc)
+                except win32_input.InputCleanupIncompleteError:
+                    self._logger.exception(
+                        "button hold repeat key-down remains incomplete"
+                    )
+                    self._button_key_release_pending = tokens
+                    self._schedule_button_input_release_retry_locked()
+                except OSError as exc:
+                    self._logger.exception(
+                        "button hold repeat failed to deliver: error_type=%s",
+                        type(exc).__name__,
+                    )
+                return
+            action = self._button_tap_hold_actions.get(token)
+        if action is not None:
+            self._apply_button_action(action)
 
     def _button_repeat_interval(self, button_id: str, repeat_count: int) -> float:
-        action = key_mapping.button_action_for(
-            self._bindings,
-            button_id,
-            key_mapping.ButtonTrigger.SINGLE_CLICK,
-        )
-        if button_id == "back":
-            return button_gesture.ButtonGestureDispatcher.BACK_REPEAT_INTERVAL_SECONDS
-        return button_gesture.ButtonGestureDispatcher.REPEAT_INTERVAL_SECONDS
+        """Repeat a held remote button at the machine's keyboard repeat rate.
+
+        SendInput-injected keys never auto-repeat, so a held remote button is
+        re-sent by the app.  Following the user's own keyboard repeat rate
+        keeps arrows, backspace and volume holds as smooth as holding a key on
+        a physical keyboard, without any per-button exceptions.
+        """
+
+        return self._keyboard_repeat_interval_seconds
 
     def _on_button_gesture_diagnostic(
         self, event: str, button_id: str, **fields: object
@@ -4509,7 +5214,8 @@ class RC003App:
         )
 
     def _on_button_trigger(
-        self, button_id: str, trigger: button_gesture.ButtonTrigger
+        self, button_id: str, trigger: button_gesture.ButtonTrigger,
+        *, hold_owner: Optional[object] = None,
     ) -> None:
         # ButtonGestureDispatcher keeps a callback reservation until this
         # function returns, so settings reload cannot replace the mapping we
@@ -4561,7 +5267,11 @@ class RC003App:
                 trigger.value,
             )
             return
-        self._apply_button_action(action)
+        if action.kind in key_mapping.MOUSE_HOLD_BUTTONS:
+            if hold_owner is not None:
+                self._begin_button_mouse_hold(hold_owner, action)
+        else:
+            self._apply_button_action(action)
 
     def _apply_button_action(self, action: key_mapping.ButtonAction) -> None:
         with self._button_action_lock:
@@ -4571,6 +5281,7 @@ class RC003App:
         if (
             self._button_key_release_pending is not None
             or self._button_mouse_release_pending is not None
+            or self._button_hold_release_pending
         ) and not self._release_pending_button_inputs():
             self._logger.info(
                 "button action suppressed: an earlier input release is still pending"
@@ -4591,6 +5302,17 @@ class RC003App:
             if navigation_vk is not None and element_navigation_control_windows.route_mapped_navigation_key(navigation_vk):
                 # Accepted commands must not also be injected through SendInput.
                 pass
+            elif action.inject_mode == key_mapping.INJECT_MODE_INTERCEPTION and (
+                injection_backend.key_tokens_for_action(action) is not None
+                or injection_backend.mouse_button_for_action(action) is not None
+            ):
+                # Only key/mouse actions are Interception-deliverable. Anything
+                # else (element-navigation toggle, Quicker URI, open-app, voice)
+                # must fall through to its own handler instead of being silently
+                # swallowed as "interception_unsupported_action".
+                action_error, action_error_type = self._apply_button_action_interception(
+                    action
+                )
             elif action.kind == key_mapping.ActionKind.KEY_COMBO:
                 win32_input.send_key_combo_tap(action.keys)
             elif action.kind == key_mapping.ActionKind.ESCAPE:
@@ -4622,6 +5344,8 @@ class RC003App:
             elif action.kind == key_mapping.ActionKind.PLAY_PAUSE:
                 win32_input.send_play_pause()
             elif action.kind in _BUTTON_ACTION_MOUSE_BUTTONS:
+                if _BUTTON_ACTION_MOUSE_BUTTONS[action.kind] in self._button_mouse_holds:
+                    return
                 win32_input.send_mouse_button_click(
                     _BUTTON_ACTION_MOUSE_BUTTONS[action.kind]
                 )
@@ -4703,7 +5427,48 @@ class RC003App:
     ) -> Optional[Tuple[str, ...]]:
         if action.kind == key_mapping.ActionKind.KEY_COMBO:
             return tuple(action.keys)
-        return _BUTTON_ACTION_KEY_TOKENS.get(action.kind)
+        return injection_backend.SEMANTIC_ACTION_KEY_TOKENS.get(action.kind)
+
+    def _apply_button_action_interception(
+        self, action: key_mapping.ButtonAction
+    ) -> Tuple[str, str]:
+        """Deliver one action through the Interception driver.
+
+        Returns ``(error, error_type)``; an empty ``error`` means success.
+
+        There is deliberately no fallback to SendInput: the user picked this
+        backend for a target window that ignores synthetic input, so silently
+        downgrading would look like "the button does nothing" all over again.
+        The settings UI greys the option out when the driver is missing.
+        """
+
+        backend = injection_backend.backend_for(
+            key_mapping.INJECT_MODE_INTERCEPTION
+        )
+        try:
+            tokens = injection_backend.key_tokens_for_action(action)
+            if tokens is not None:
+                backend.key_tap(tokens)
+                return "", ""
+            mouse_button = injection_backend.mouse_button_for_action(action)
+            if mouse_button is not None:
+                backend.mouse_click(mouse_button)
+                return "", ""
+        except injection_backend.InterceptionUnavailableError as exc:
+            self._logger.warning(
+                "interception action skipped: backend unavailable: %s", exc
+            )
+            return "interception_unavailable", type(exc).__name__
+        except OSError as exc:
+            self._logger.exception(
+                "interception action failed to deliver: error_type=%s",
+                type(exc).__name__,
+            )
+            return "delivery_failed", type(exc).__name__
+        self._logger.warning(
+            "interception action unsupported: action=%s", action.kind.value
+        )
+        return "interception_unsupported_action", ""
 
     def _cancel_button_input_release_retry_locked(
         self,
@@ -4734,6 +5499,7 @@ class RC003App:
             or (
                 self._button_key_release_pending is None
                 and self._button_mouse_release_pending is None
+                and not self._button_hold_release_pending
             )
         ):
             return
@@ -4781,6 +5547,7 @@ class RC003App:
         if (
             self._button_key_release_pending is None
             and self._button_mouse_release_pending is None
+            and not self._button_hold_release_pending
         ):
             self._cancel_button_input_release_retry_locked()
 
@@ -4842,7 +5609,8 @@ class RC003App:
         with self._button_action_lock:
             key_complete = self._release_pending_button_keys()
             mouse_complete = self._release_pending_button_mouse()
-            return key_complete and mouse_complete
+            hold_complete = self._release_pending_mouse_holds_locked()
+            return key_complete and mouse_complete and hold_complete
 
     # -- ATVV control-channel events (mic button + audio start/stop) ------
 
@@ -4869,8 +5637,13 @@ class RC003App:
         self._reload_settings_if_changed()
         if isinstance(event, CapsReceived):
             self._logger.info(
-                "voice capabilities received: version=0x%04x sample_rate=%s frame_size=%s",
+                "voice capabilities received: version=0x%04x codecs=0x%02x "
+                "interaction=0x%02x selected_codec=0x%02x sample_rate=%s "
+                "frame_size=%s",
                 event.capabilities.version,
+                event.capabilities.codecs,
+                event.capabilities.interaction,
+                event.capabilities.selected_codec,
                 event.capabilities.sample_rate,
                 event.capabilities.frame_size,
             )
@@ -4887,12 +5660,24 @@ class RC003App:
                 return
             if not self._accepts_ble_callback(_ble_generation):
                 return
+            with self._voice_shortcut.lock:
+                extra_voice_session_owns_mic = (
+                    self._extra_voice_slot_active is not None
+                    or self._extra_voice_slot_close_pending is not None
+                    or any(gesture.latched for gesture in self._extra_voice_gestures.values())
+                )
+            if extra_voice_session_owns_mic:
+                self._logger.info(
+                    "ATVV mic trigger merged into active extra voice slot=%s",
+                    self._extra_voice_slot_active,
+                )
+                return
             mic_action = self._primary_button_action("mic")
-            mic_voice_mode = self._voice_mode_for_primary_button(
+            is_mic_voice_button = self._is_voice_primary_button(
                 "mic",
                 mic_action,
             )
-            if mic_voice_mode is None:
+            if not is_mic_voice_button:
                 with self._voice_shortcut.lock:
                     if not self._accepts_ble_callback(_ble_generation):
                         return
@@ -4920,9 +5705,25 @@ class RC003App:
                     self._logger.info(
                         "voice mic trigger ignored: matched current multi-source gesture"
                     )
+                elif self._voice_gesture.latched:
+                    # The physical mic has no HID release edge on this device,
+                    # so a fresh ATVV trigger is the only signal that the user
+                    # tapped again: it ends the latched tap session.
+                    self._logger.info(
+                        "voice mic trigger closes the latched tap session"
+                    )
+                    if (
+                        self._voice_gesture.on_press()
+                        == voice_gesture.VoiceGestureDecision.CLOSE
+                    ):
+                        self._close_latched_voice_session_locked("ATVV mic tap")
                 else:
                     self._logger.info("voice mic trigger received from ATVV control channel")
                     if self._begin_voice_mic_gesture("atvv"):
+                        # Arm the tap/hold decision now: the release has to be
+                        # inferred from the matching audio stop, which is
+                        # measured against this press instant.
+                        self._voice_gesture.on_press()
                         self._handle_mic_button_pressed()
         elif isinstance(event, AudioStarted):
             self._diagnostic_trace.emit(
@@ -4955,16 +5756,93 @@ class RC003App:
                         event.session_id,
                     )
                     return
+                if (
+                    self._voice_ignore_audio_start_until_physical_down
+                    and not self._voice_gesture.latched
+                ):
+                    self._logger.info(
+                        "late voice audio start ignored after physical mic release"
+                    )
+                    # Keep the host idle until a physical down confirms a new
+                    # press. Do not roll back the device stream: that down can
+                    # still enable PCM through the normal voice-open path.
+                    self._voice_audio_stop_processed = False
+                    self._voice_audio.stats.reset()
+                    return
                 self._voice_audio_stream_active = True
                 self._voice_audio_stop_processed = False
                 self._voice_audio.stats.reset()
                 self._voice_audio_start_fallback_pending = False
+                if (
+                    self._voice_gesture.latched
+                    and not self._voice_shortcut.controller.active
+                ):
+                    # A tap latched the microphone open. Resume playback
+                    # without replaying the host shortcut: the input method
+                    # already saw one complete short press.
+                    self._voice_pcm_forwarding_enabled = True
+                    self._set_runtime_voice_active(True)
+                    self._set_runtime_voice_result(
+                        bridge_runtime_status.VOICE_RUNTIME_ACTIVE
+                    )
+                    if self._voice_mic_gesture_active:
+                        self._voice_mic_gesture_audio_started = True
+                        self._voice_mic_gesture_audio_stopped = False
+                    self._logger.info(
+                        "voice audio resumed for latched mic session"
+                    )
+                    return
+                if self._voice_shortcut.controller.active and (
+                    self._voice_mic_gesture_sources_down
+                    or self._voice_shortcut_physical_sources_down
+                ):
+                    # A device stream boundary does not end a physical hold.
+                    # Resume PCM without replaying or releasing the owned chord.
+                    self._voice_pcm_forwarding_enabled = True
+                    self._set_runtime_voice_active(True)
+                    self._set_runtime_voice_result(
+                        bridge_runtime_status.VOICE_RUNTIME_ACTIVE
+                    )
+                    if self._voice_mic_gesture_active:
+                        self._voice_mic_gesture_audio_started = True
+                        self._voice_mic_gesture_audio_stopped = False
+                    self._logger.info("voice audio resumed for physically held shortcut")
+                    return
+                extra_voice_owns_stream = (
+                    self._extra_voice_slot_active is not None
+                    or self._extra_voice_slot_close_pending is not None
+                    or any(
+                        gesture.latched
+                        for gesture in self._extra_voice_gestures.values()
+                    )
+                )
+                if (
+                    extra_voice_owns_stream
+                    and not self._voice_gesture.latched
+                    and not self._voice_mic_gesture_active
+                ):
+                    # The device stream belongs to an extra voice slot (语音二/
+                    # 语音三 bound to a non-microphone key), not to the physical
+                    # mic button. Re-resolving the physical mic's slot here
+                    # compares the wrong shortcut and fails the session closed,
+                    # which is what made those keys appear to never open the
+                    # microphone. Keep the stream and the slot's own shortcut.
+                    self._voice_pcm_forwarding_enabled = True
+                    self._set_runtime_voice_active(True)
+                    self._set_runtime_voice_result(
+                        bridge_runtime_status.VOICE_RUNTIME_ACTIVE
+                    )
+                    self._logger.info(
+                        "voice audio resumed for extra voice slot=%s",
+                        self._extra_voice_slot_active,
+                    )
+                    return
                 mic_action = self._primary_button_action("mic")
-                mic_voice_mode = self._voice_mode_for_primary_button(
+                is_mic_voice_button = self._is_voice_primary_button(
                     "mic",
                     mic_action,
                 )
-                if not self._voice_shortcut.controller.active and mic_voice_mode is None:
+                if not self._voice_shortcut.controller.active and not is_mic_voice_button:
                     self._abort_voice_audio_start_locked(
                         "physical mic has an ordinary mapping"
                     )
@@ -5008,6 +5886,9 @@ class RC003App:
                 elif not self._voice_shortcut.controller.active:
                     self._logger.info("voice audio start used as microphone trigger")
                     if self._begin_voice_mic_gesture("audio_started"):
+                        # Same tap/hold arming as the ATVV trigger: the release
+                        # is inferred from the matching audio stop.
+                        self._voice_gesture.on_press()
                         started = self._handle_mic_button_pressed(
                             send_device_open=False
                         )
@@ -5016,7 +5897,7 @@ class RC003App:
                                 "voice host start failed after audio started"
                             )
                         self._voice_audio_start_fallback_pending = (
-                            self._voice_shortcut.controller.active or self._doubao_session.busy
+                            self._voice_shortcut.controller.active
                         )
         elif isinstance(event, AudioStopped):
             self._diagnostic_trace.emit(
@@ -5043,21 +5924,59 @@ class RC003App:
                     self._logger.info("voice duplicate audio stop ignored")
                     return
                 runtime_voice_was_active = self._runtime_voice_active
-                self._doubao_session.cancel_current()
+                physical_voice_sources_down = bool(
+                    self._voice_mic_gesture_sources_down
+                    or self._voice_shortcut_physical_sources_down
+                )
+                if (
+                    not physical_voice_sources_down
+                    and self._voice_gesture.state
+                    is voice_gesture.VoiceGestureState.HOLDING
+                ):
+                    # The physical mic has no HID release edge on this device:
+                    # the device stream stopping is the release signal. A short
+                    # stream latches the microphone open, a long one closes it,
+                    # mirroring the physical HID tap/hold decision.
+                    if (
+                        self._voice_gesture.on_release()
+                        is voice_gesture.VoiceGestureDecision.LATCH
+                    ):
+                        self._release_voice_shortcut_edge_locked(
+                            "audio stop after short voice press"
+                        )
+                        if self._uses_local_voice_microphone():
+                            self._finish_voice_mic_gesture(reset_gesture=False)
+                        else:
+                            # 模式1 只支持长按：这个短按的快捷键已经完整
+                            # 下发并松开，设备流也停了，直接结束而不锁存。
+                            self._finish_voice_mic_gesture()
+                            self._dismiss_short_voice_press_locked(
+                                "audio stop after short voice press"
+                            )
+                latched_session = (
+                    (
+                        self._voice_gesture.latched
+                        or any(
+                            gesture.latched
+                            for gesture in self._extra_voice_gestures.values()
+                        )
+                    )
+                    and not physical_voice_sources_down
+                    and not self._voice_shortcut.controller.active
+                )
+                if not physical_voice_sources_down and not latched_session:
+                    self._voice_gesture.reset()
                 self._voice_audio_stream_active = False
                 self._voice_audio_stop_processed = True
-                self._voice_pcm_forwarding_enabled = False
-                self._voice_pcm_min_arrival_sequence = None
-                self._set_runtime_voice_active(False)
-                doubao_attempt = self._active_doubao_attempt_locked()
-                defer_doubao_diagnostic = doubao_attempt is not None
-                if doubao_attempt is None:
-                    flush_result = self._voice_audio.flush("audio stop")
-                    if flush_result.error is not None:
-                        self._logger.error(
-                            "voice playback flush completed with failure: %s",
-                            flush_result.error,
-                        )
+                self._voice_pcm_forwarding_enabled = latched_session
+                if not latched_session:
+                    self._set_runtime_voice_active(False)
+                flush_result = self._voice_audio.flush("audio stop")
+                if flush_result.error is not None:
+                    self._logger.error(
+                        "voice playback flush completed with failure: %s",
+                        flush_result.error,
+                    )
                 self._logger.info("voice audio stopped")
                 stats = self._voice_audio.stats.summary()
                 self._diagnostic_trace.emit(
@@ -5105,17 +6024,43 @@ class RC003App:
                 if self._voice_mic_gesture_active:
                     self._voice_mic_gesture_audio_started = False
                     self._voice_mic_gesture_audio_stopped = True
-                action = self._voice_shortcut.controller.on_audio_stopped()
-                if doubao_attempt is not None and action is not None:
-                    action_applied = self._request_active_doubao_cleanup_locked(
-                        doubao_attempt,
-                        reason="audio stop",
+                physical_voice_sources_down = bool(
+                    self._voice_mic_gesture_sources_down
+                    or self._voice_shortcut_physical_sources_down
+                )
+                if latched_session:
+                    # The device dropped its stream, but the latched tap still
+                    # owns an open microphone. Re-open it without touching the
+                    # host shortcut or the gesture state.
+                    self._voice_pcm_forwarding_enabled = True
+                    self._set_runtime_voice_active(True)
+                    self._set_runtime_voice_result(
+                        bridge_runtime_status.VOICE_RUNTIME_ACTIVE
                     )
-                else:
-                    action_applied = (
-                        True if action is None else self._voice_shortcut.apply(action)
+                    try:
+                        if self._ble_session is not None:
+                            self._ble_session.send_mic_open_threadsafe()
+                    except BaseException as exc:  # noqa: BLE001 - never trap input
+                        self._logger.warning(
+                            "voice latched MIC_OPEN failed: error_type=%s",
+                            type(exc).__name__,
+                        )
+                    self._logger.info(
+                        "voice latched mic re-opened after audio stop"
                     )
-                if action is None or action_applied:
+                    self._apply_pending_voice_settings_if_idle_locked()
+                    return
+                action = (
+                    None
+                    if physical_voice_sources_down
+                    else self._voice_shortcut.controller.on_audio_stopped()
+                )
+                action_applied = (
+                    True if action is None else self._voice_shortcut.apply(action)
+                )
+                if action_applied and (
+                    action is not None or not physical_voice_sources_down
+                ):
                     self._cancel_voice_hold_watchdog_locked()
                 if action is not None and not action_applied:
                     # Same rule as _cleanup_once(): on_audio_stopped() already
@@ -5140,15 +6085,10 @@ class RC003App:
                     ):
                         self._finish_voice_mic_gesture()
                 if runtime_voice_was_active:
-                    wetype_result_recorded = self._voice_shortcut.record_audio_result(
-                        int(stats["frames"])
-                    )
                     if action is not None and not action_applied:
                         self._set_runtime_voice_result(
                             bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED
                         )
-                    elif wetype_result_recorded:
-                        pass
                     elif stats["frames"] > 0:
                         self._set_runtime_voice_result(
                             bridge_runtime_status.VOICE_RUNTIME_SUCCESS
@@ -5166,19 +6106,19 @@ class RC003App:
                 if text_changed:
                     attempt_result = "text_changed"
                 elif (
-                    self._voice_shortcut.ui_confirmation == "confirmed"
+                    getattr(self._voice_shortcut, "ui_confirmation", "unknown")
+                    == "confirmed"
                     and stats["frames"] > 0
                 ):
                     attempt_result = "host_confirmed_audio_ok"
                 else:
                     attempt_result = "unknown"
-                if not defer_doubao_diagnostic:
-                    self._finish_voice_diagnostic_attempt(
-                        attempt_result,
-                        frames=int(stats["frames"]),
-                        samples=int(stats["samples"]),
-                        audio_signal=bool(stats["frames"] > 0),
-                    )
+                self._finish_voice_diagnostic_attempt(
+                    attempt_result,
+                    frames=int(stats["frames"]),
+                    samples=int(stats["samples"]),
+                    audio_signal=bool(stats["frames"] > 0),
+                )
                 self._apply_pending_voice_settings_if_idle_locked()
 
     def _record_device_diagnostic_context(self) -> None:
@@ -5193,9 +6133,7 @@ class RC003App:
     def _ensure_voice_diagnostic_attempt(
         self,
         *,
-        provider_shortcut_mode: Optional[str] = None,
         effective_hotkey_tokens: Optional[Tuple[str, ...]] = None,
-        effective_backend: Optional[str] = None,
     ) -> None:
         if self._voice_attempt_id is not None:
             return
@@ -5205,16 +6143,9 @@ class RC003App:
             # Preserve the active-attempt sentinel without collecting diagnostics.
             self._voice_attempt_id = ""
             return
-        backend = effective_backend or self._configured_voice_hotkey_backend()
-        tokens = effective_hotkey_tokens or tuple(
-            (*self._voice_shortcut.hotkey.modifiers, self._voice_shortcut.hotkey.key)
-        )
-        shortcut_mode = str(
-            provider_shortcut_mode or self._voice_shortcut.controller.trigger_mode.value
-        )
-        provider = voice_program_manager.normalize_voice_program_settings(
-            self._config.get("voice_program")
-        )["provider"]
+        backend = _VOICE_HOTKEY_BACKEND_MARKED
+        tokens = effective_hotkey_tokens or self._voice_shortcut.recorded_tokens()
+        shortcut_mode = "hold"
         physicalizer_generation = -1
         physicalizer_installation_epoch = -1
         physicalizer_observed_generation = -1
@@ -5228,14 +6159,7 @@ class RC003App:
             )
         except win32_keys.UnknownKeyTokenError:
             uses_right_alt = False
-        if (
-            uses_right_alt
-            and backend
-            in {
-                _VOICE_HOTKEY_BACKEND_MARKED,
-                _VOICE_HOTKEY_BACKEND_DOUBAO,
-            }
-        ):
+        if uses_right_alt and backend in {_VOICE_HOTKEY_BACKEND_MARKED}:
             with self._voice_key_physicalizer_lifecycle_lock:
                 physicalizer = self._voice_key_physicalizer
                 if physicalizer is not None:
@@ -5256,15 +6180,12 @@ class RC003App:
                     physicalizer_observation = "missing"
         self._voice_attempt_id = self._diagnostic_trace.begin_attempt(
             self._diagnostic_trace.current_gesture("mic"),
-            provider=provider,
+            provider="recorded_hotkey",
         )
         self._diagnostic_trace.emit(
             "voice_attempt_context",
             **self._diagnostic_trace.current_context(),
             backend=str(backend),
-            remote_recording_mode=str(
-                self._config.get("remote_recording_mode", "hold")
-            ),
             provider_shortcut_mode=shortcut_mode,
             hotkey_tokens=list(tokens),
             physicalizer_binding=physicalizer_binding,
@@ -5282,7 +6203,7 @@ class RC003App:
         self, result: str, **fields: object
     ) -> None:
         payload = {
-            "host_ui": self._voice_shortcut.ui_confirmation or "unknown",
+            "host_ui": getattr(self._voice_shortcut, "ui_confirmation", "") or "unknown",
             "text_state": self._voice_text_observation or "unknown",
         }
         payload.update(fields)
@@ -5293,483 +6214,11 @@ class RC003App:
         )
         self._voice_attempt_id = None
 
-    def _doubao_settings_identity(self) -> tuple[object, ...]:
-        return (
-            self._settings_file_mtime_ns(self._config_path),
-            remote_selection.active_key(self._config),
-            self._configured_voice_hotkey_backend(),
-            self._voice_shortcut.hotkey.serialize(),
-            str(self._config.get("output_endpoint_name") or ""),
-            str(self._config.get("output_endpoint_host_api") or ""),
-        )
-
-    def _doubao_attempt_matches_locked(
-        self, attempt: rc003_doubao_session.DoubaoAttempt
-    ) -> bool:
-        snapshot = attempt.snapshot
-        return bool(
-            self._doubao_session.is_current(attempt)
-            and not attempt.cancelled()
-            and self._accept_input_events
-            and self._accept_ble_events
-            and snapshot.ble_generation == self._ble_callback_generation
-            and snapshot.remote_key == self._selected_remote_key
-            and snapshot.settings_identity == self._doubao_settings_identity()
-            and self._configured_voice_hotkey_backend()
-            == _VOICE_HOTKEY_BACKEND_DOUBAO
-            and self._voice_mic_gesture_active
-            and not self._voice_mic_gesture_hid_released
-        )
-
-    def _doubao_attempt_target_healthy(
-        self,
-        attempt: rc003_doubao_session.DoubaoAttempt,
-    ) -> bool:
-        generation, pid = attempt.target_identity()
-        return bool(
-            generation is not None
-            and pid is not None
-            and self._voice_shortcut.doubao_physicalizer.is_active_generation(generation)
-            and self._voice_shortcut.doubao_physicalizer.target_pid == pid
-        )
-
-    def _begin_rc003_doubao_attempt_locked(
-        self, *, send_device_open: bool
-    ) -> bool:
-        if self._remote_profile != remote_selection.RC003_PROFILE:
-            return False
-        if self._doubao_session.busy:
-            self._logger.info(
-                "Doubao voice start ignored: an earlier attempt still owns cleanup"
-            )
-            return False
-        existing_sink = self._voice_audio.sink
-        if existing_sink is not None and not getattr(existing_sink, "ready", True):
-            self._logger.warning(
-                "Doubao voice start rejected: failed playback owner is retained"
-            )
-            self._supervisor.request_reconnect()
-            return False
-        tokens = tuple(self._voice_shortcut.hotkey.modifiers) + (self._voice_shortcut.hotkey.key,)
-        session = self._ble_session
-        arrival_watermark = int(
-            getattr(session, "audio_arrival_watermark", -1)
-        )
-        snapshot = rc003_doubao_session.DoubaoAttemptSnapshot(
-            ble_generation=self._ble_callback_generation,
-            remote_key=self._selected_remote_key,
-            settings_identity=self._doubao_settings_identity(),
-            tokens=tokens,
-            endpoint_name=str(self._config.get("output_endpoint_name") or ""),
-            endpoint_host_api=str(
-                self._config.get("output_endpoint_host_api") or ""
-            ),
-            send_device_open=bool(send_device_open),
-            arrival_watermark=arrival_watermark,
-        )
-        self._voice_pcm_forwarding_enabled = False
-        self._voice_pcm_min_arrival_sequence = None
-        try:
-            attempt = self._doubao_session.begin(
-                snapshot,
-                lambda owned: self._run_rc003_doubao_attempt(
-                    owned,
-                    existing_sink=existing_sink,
-                ),
-            )
-        except BaseException as exc:  # noqa: BLE001 - input callback must fail closed
-            self._logger.error(
-                "Doubao voice attempt worker failed to start: error_type=%s",
-                type(exc).__name__,
-            )
-            return False
-        if attempt is None:
-            return False
-        self._diagnostic_trace.emit(
-            "doubao_start_pending",
-            **self._diagnostic_trace.current_context(),
-            arrival_watermark=int(arrival_watermark),
-            send_device_open=bool(send_device_open),
-        )
-        return True
-
-    def _create_private_doubao_playback(
-        self, snapshot: rc003_doubao_session.DoubaoAttemptSnapshot
-    ):
-        endpoints = audio_output.enumerate_output_endpoints()
-        audio_output.resolve_selected_endpoint(
-            endpoints,
-            snapshot.endpoint_name,
-            snapshot.endpoint_host_api,
-        )
-        sink = audio_playback.EndpointPlaybackSink(
-            snapshot.endpoint_name,
-            snapshot.endpoint_host_api,
-        )
-        return sink
-
-    def _finish_cancelled_doubao_control(
-        self,
-        attempt: rc003_doubao_session.DoubaoAttempt,
-        prepared: Optional[wetype_control_windows.PreparedDoubaoVoiceStart],
-        *,
-        dispatched: bool,
-    ) -> set[str]:
-        control = self._voice_shortcut.doubao_control
-        if prepared is not None and not dispatched:
-            try:
-                control.cancel_prepared(prepared)
-            except Exception:
-                self._logger.exception("Doubao prepared start cancellation failed")
-                return {"preparation"}
-            wait_settled = getattr(prepared, "wait_settled", None)
-            if callable(wait_settled) and not wait_settled(None):
-                return {"preparation"}
-        if not dispatched and not getattr(control, "cleanup_pending", False):
-            return set()
-        try:
-            expected_markers = len(
-                tuple(dict.fromkeys(win32_keys.resolve_vk_codes(attempt.snapshot.tokens)))
-            )
-        except win32_keys.UnknownKeyTokenError:
-            expected_markers = 0
-        self._voice_shortcut.doubao_physicalizer.expect_markers("up", expected_markers)
-        try:
-            released = bool(control.stop())
-        except Exception:
-            released = False
-            self._logger.exception("Doubao cancelled start could not release shortcut")
-        if not released:
-            attempt.add_cleanup_debts("hotkey")
-            with self._voice_shortcut.lock:
-                self._voice_shortcut.pending_tokens = attempt.snapshot.tokens
-                self._voice_shortcut.pending_backend = (
-                    _VOICE_HOTKEY_BACKEND_DOUBAO
-                )
-                self._voice_shortcut.schedule_release_retry()
-            self._supervisor.request_reconnect()
-            return {"hotkey"}
-        return set()
-
-    def _run_rc003_doubao_attempt(
-        self,
-        attempt: rc003_doubao_session.DoubaoAttempt,
-        *,
-        existing_sink,
-    ) -> None:
-        snapshot = attempt.snapshot
-        sink = existing_sink
-        private_sink = False
-        prepared = None
-        dispatched = False
-        dispatch_may_have_sent = False
-        committed = False
-        outcome = "failed_before_dispatch"
-        cleanup_debts: set[str] = set()
-        error_type = ""
-        watch = None
-        try:
-            if sink is None:
-                sink = self._create_private_doubao_playback(snapshot)
-                private_sink = True
-                attempt.retain_resource("endpoint", sink)
-                sink.open()
-            if attempt.cancelled():
-                outcome = "cancelled_before_dispatch"
-                return
-            prepared = self._voice_shortcut.doubao_control.prepare(
-                snapshot.tokens,
-                cancelled=attempt.cancelled,
-                cancel_event=attempt.cancel_event,
-            )
-            if prepared is None:
-                outcome = (
-                    "cancelled_before_dispatch"
-                    if attempt.cancelled()
-                    else "prepare_failed"
-                )
-                return
-            if not getattr(prepared, "ready", True):
-                outcome = "prepare_timeout"
-                return
-            if not self._prepare_doubao_voice_physicalizer(
-                snapshot.tokens, cancel_event=attempt.cancel_event
-            ):
-                outcome = (
-                    "cancelled_before_dispatch"
-                    if attempt.cancelled()
-                    else "physicalizer_failed"
-                )
-                return
-            physicalizer_generation = int(self._voice_shortcut.doubao_physicalizer.generation)
-            physicalizer_pid = self._voice_shortcut.doubao_physicalizer.target_pid
-            if (
-                physicalizer_pid is None
-                or not self._voice_shortcut.doubao_physicalizer.is_active_generation(
-                    physicalizer_generation
-                )
-            ):
-                outcome = "physicalizer_target_unavailable"
-                return
-            attempt.bind_physicalizer(
-                physicalizer_generation,
-                int(physicalizer_pid),
-            )
-            try:
-                watch = self._doubao_capture_watch_factory(int(physicalizer_pid))
-            except TypeError:
-                # Test/injected factories predating target scoping remain
-                # usable; the production factory always consumes the PID.
-                watch = self._doubao_capture_watch_factory()
-            watch.begin()
-            self._capture_voice_focus_before()
-            with self._voice_shortcut.lock:
-                if (
-                    not self._doubao_attempt_matches_locked(attempt)
-                    or not self._doubao_attempt_target_healthy(attempt)
-                ):
-                    outcome = "cancelled_before_dispatch"
-                    return
-            try:
-                expected_markers = len(
-                    tuple(dict.fromkeys(win32_keys.resolve_vk_codes(snapshot.tokens)))
-                )
-            except win32_keys.UnknownKeyTokenError:
-                expected_markers = 0
-            self._voice_shortcut.doubao_physicalizer.expect_markers("down", expected_markers)
-            trace_context = {
-                **self._diagnostic_trace.current_context(),
-                "action": voice_controller.VoiceHostAction.KEY_DOWN.value,
-            }
-            self._diagnostic_trace.emit(
-                "voice_hotkey_requested",
-                **trace_context,
-                backend=_VOICE_HOTKEY_BACKEND_DOUBAO,
-                tokens=list(snapshot.tokens),
-                source="rc003_doubao_session",
-            )
-            attempt.mark_dispatch_started()
-            dispatched = bool(
-                self._voice_shortcut.doubao_control.dispatch_prepared(
-                    prepared,
-                    cancelled=attempt.cancelled,
-                )
-            )
-            dispatch_may_have_sent = bool(
-                dispatched
-                or self._voice_shortcut.control_flag(
-                    "cleanup_pending",
-                    _VOICE_HOTKEY_BACKEND_DOUBAO,
-                )
-            )
-            generation = self._voice_shortcut.control_generation(
-                _VOICE_HOTKEY_BACKEND_DOUBAO
-            )
-            self._diagnostic_trace.emit(
-                "voice_hotkey_result",
-                **trace_context,
-                backend=_VOICE_HOTKEY_BACKEND_DOUBAO,
-                delivered=bool(dispatched),
-                generation=int(generation) if generation is not None else -1,
-                cleanup_pending=bool(
-                    self._voice_shortcut.control_flag(
-                        "cleanup_pending", _VOICE_HOTKEY_BACKEND_DOUBAO
-                    )
-                ),
-            )
-            if not dispatched:
-                outcome = (
-                    "cancelled_before_dispatch"
-                    if attempt.cancelled()
-                    else (
-                        "dispatch_uncertain"
-                        if dispatch_may_have_sent
-                        else "dispatch_failed"
-                    )
-                )
-                return
-            attempt.transition(rc003_doubao_session.WAITING_HOST)
-            deadline = time.monotonic() + _DOUBAO_HOST_READY_TIMEOUT_SECONDS
-            host_ready = False
-            while not attempt.cancelled() and time.monotonic() < deadline:
-                if not self._doubao_attempt_target_healthy(attempt):
-                    outcome = "physicalizer_target_unavailable"
-                    return
-                watch.poll(time.monotonic())
-                if watch.identity is not None and watch.status == "tracking":
-                    host_ready = True
-                    break
-                attempt.cancel_event.wait(_DOUBAO_HOST_READY_POLL_SECONDS)
-            if not host_ready:
-                outcome = (
-                    "cancelled_waiting_host"
-                    if attempt.cancelled()
-                    else "host_not_ready"
-                )
-                return
-            session = self._ble_session
-            readiness_watermark = int(
-                getattr(session, "audio_arrival_watermark", snapshot.arrival_watermark)
-            )
-            with self._voice_shortcut.lock:
-                if (
-                    not self._doubao_attempt_matches_locked(attempt)
-                    or not self._doubao_attempt_target_healthy(attempt)
-                ):
-                    outcome = "cancelled_waiting_host"
-                    return
-                if private_sink:
-                    if self._voice_audio.sink is not None:
-                        outcome = "playback_owner_changed"
-                        return
-                elif self._voice_audio.sink is not sink:
-                    outcome = "playback_owner_changed"
-                    return
-                action = self._voice_shortcut.controller.on_mic_button_pressed()
-                if action != voice_controller.VoiceHostAction.KEY_DOWN:
-                    outcome = "logical_start_rejected"
-                    return
-                if private_sink:
-                    self._voice_audio.adopt(sink)
-                if not self._voice_audio.ensure_writer(sink):
-                    if private_sink and self._voice_audio.sink is sink:
-                        self._voice_audio.detach(sink)
-                    self._voice_shortcut.controller.cancel_pending()
-                    outcome = "playback_writer_failed"
-                    return
-                if private_sink:
-                    attempt.release_resource("endpoint", sink)
-                # From this point the ordinary connection cleanup owns the
-                # published sink and its writer, including a later watchdog
-                # failure. The attempt must not close it behind that worker.
-                private_sink = False
-                self._voice_shortcut.active_backend = _VOICE_HOTKEY_BACKEND_DOUBAO
-                self._voice_shortcut.pending_tokens = None
-                self._voice_shortcut.pending_backend = None
-                self._voice_shortcut.begin_runtime(_VOICE_HOTKEY_BACKEND_DOUBAO)
-                generation = self._voice_shortcut.control_generation(
-                    _VOICE_HOTKEY_BACKEND_DOUBAO
-                )
-                self._voice_shortcut.track_generation(
-                    generation,
-                    _VOICE_HOTKEY_BACKEND_DOUBAO,
-                )
-                self._voice_shortcut.ui_confirmation = "confirmed"
-                self._voice_pcm_min_arrival_sequence = readiness_watermark
-                self._voice_pcm_forwarding_enabled = True
-                self._set_runtime_voice_result(
-                    bridge_runtime_status.VOICE_RUNTIME_ACTIVE,
-                    provider=voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
-                )
-                self._set_runtime_voice_active(True)
-                self._diagnostic_trace.emit(
-                    "hotkey_sent",
-                    **self._diagnostic_trace.current_context(),
-                    backend=_VOICE_HOTKEY_BACKEND_DOUBAO,
-                )
-                if not self._arm_voice_hold_watchdog_locked():
-                    self._force_voice_hold_release_locked(
-                        "voice hold safety timer unavailable"
-                    )
-                    outcome = "watchdog_failed"
-                    return
-                if snapshot.send_device_open and self._ble_session is not None:
-                    self._ble_session.send_mic_open_threadsafe()
-                committed = True
-                attempt.mark_active()
-                self._diagnostic_trace.emit(
-                    "doubao_host_ready",
-                    **self._diagnostic_trace.current_context(),
-                    readiness_watermark=int(readiness_watermark),
-                )
-            outcome = "active"
-        except audio_output.AudioOutputUnavailableError as exc:
-            error_type = type(exc).__name__
-            outcome = "output_open_failed"
-            self._logger.info("Doubao playback unavailable, failing closed: %s", exc)
-        except BaseException as exc:  # noqa: BLE001 - always settle attempt ownership
-            error_type = type(exc).__name__
-            outcome = "failed_after_dispatch" if dispatched else "failed_before_dispatch"
-            self._logger.exception("Doubao asynchronous voice start failed")
-        finally:
-            if not committed:
-                cleanup_debts.update(
-                    self._finish_cancelled_doubao_control(
-                        attempt,
-                        prepared,
-                        dispatched=dispatched,
-                    )
-                )
-                if private_sink and sink is not None:
-                    try:
-                        sink.close()
-                    except Exception:
-                        cleanup_debts.add("endpoint")
-                        attempt.add_cleanup_debts("endpoint")
-                        with self._voice_shortcut.lock:
-                            if self._voice_audio.sink is None:
-                                self._voice_audio.adopt(sink)
-                        self._logger.exception(
-                            "Doubao private playback cleanup failed; owner retained"
-                        )
-                        self._supervisor.request_reconnect()
-                    else:
-                        attempt.release_resource("endpoint", sink)
-                with self._voice_shortcut.lock:
-                    self._voice_pcm_forwarding_enabled = False
-                    self._voice_pcm_min_arrival_sequence = None
-                    if (
-                        self._voice_shortcut.controller.active
-                        and self._voice_shortcut.active_backend
-                        in (None, _VOICE_HOTKEY_BACKEND_DOUBAO)
-                    ):
-                        self._voice_shortcut.controller.cancel_pending()
-                        self._voice_shortcut.active_backend = None
-                    self._voice_focus_before = None
-                    self._voice_focus_provider = ""
-                    self._voice_focus_submit_method = ""
-                    self._set_runtime_voice_active(False)
-                    self._set_runtime_voice_result(
-                        (
-                            bridge_runtime_status.VOICE_RUNTIME_OUTPUT_OPEN_FAILED
-                            if outcome == "output_open_failed"
-                            else bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED
-                        ),
-                        provider=voice_program_manager.VOICE_PROGRAM_DOUBAO_IME,
-                    )
-                    self._finish_voice_diagnostic_attempt(
-                        (
-                            "failed_after_send"
-                            if dispatch_may_have_sent
-                            else "failed_before_send"
-                        ),
-                        reason=outcome,
-                    )
-            if committed:
-                attempt.finish(
-                    outcome,
-                    error_type=error_type,
-                )
-            else:
-                attempt.finish(
-                    outcome,
-                    error_type=error_type,
-                )
-            self._diagnostic_trace.emit(
-                "doubao_start_finished",
-                outcome=outcome,
-                dispatch_started=bool(attempt.dispatch_started),
-                cleanup_complete=bool(attempt.cleanup_complete),
-                error_type=error_type or "none",
-                capture_watch_status=(
-                    str(watch.status) if watch is not None else "not_started"
-                ),
-            )
-
     def _handle_mic_button_pressed(
         self,
         *,
         send_device_open: bool = True,
+        voice_slot: Optional[int] = None,
     ) -> bool:
         """Resolve and open the user-selected output endpoint FIRST; only
         send the hotkey if that succeeds, and only send MIC_OPEN if the
@@ -5780,23 +6229,20 @@ class RC003App:
         is exactly the "opens after host-trigger failure" defect - so
         failure at either step suppresses MIC_OPEN, not just a missing
         endpoint.
+
+        ``voice_slot`` names the hold-to-talk slot this press belongs to;
+        the physical microphone resolves it from its own binding when the
+        caller (an extra voice key) does not supply one.
         """
 
-        issue = voice_program_manager.voice_configuration_issue(self._config.get("voice_program"))
-        if issue:
-            self._logger.warning("voice startup rejected: %s", issue)
-            self._set_runtime_voice_result(bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED)
-            return False
-        if (
-            self._config.get("voice_program", {}).get("provider")
-            == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
-            and not config.voice_hotkey_for_provider(
-                self._config, voice_program_manager.VOICE_PROGRAM_CHATTERFLY
+        if voice_slot is None:
+            voice_slot = key_mapping.voice_slot_for_action(
+                self._primary_button_action("mic")
             )
-        ):
-            self._logger.warning("voice startup rejected: Chatterfly shortcut is not configured")
-            self._set_runtime_voice_result(bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED)
-            return False
+
+        # 用户又按下了话筒：正在进行中的短按补发让位给这次真实按下。
+        self._voice_short_press_dismiss_hold_outstanding = False
+
         self._ensure_voice_diagnostic_attempt()
         if not self._accept_input_events or not self._accept_ble_events:
             self._voice_pcm_forwarding_enabled = False
@@ -5828,16 +6274,6 @@ class RC003App:
                 return False
             self._voice_shortcut.pending_tokens = None
 
-        if (
-            self._remote_profile == remote_selection.RC003_PROFILE
-            and self._configured_voice_hotkey_backend()
-            == _VOICE_HOTKEY_BACKEND_DOUBAO
-        ):
-            return self._begin_rc003_doubao_attempt_locked(
-                send_device_open=send_device_open
-            )
-
-        self._voice_pcm_min_arrival_sequence = None
         if not self._voice_audio.open():
             self._voice_pcm_forwarding_enabled = False
             self._set_runtime_voice_result(
@@ -5851,23 +6287,13 @@ class RC003App:
             )
             return False
 
-        if not self._wait_for_sogou_voice_process():
-            self._voice_pcm_forwarding_enabled = False
-            self._set_runtime_voice_result(
-                bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED
-            )
-            self._logger.info(
-                "voice failing closed: Sogou voice process is not ready; "
-                "hotkey/MIC_OPEN suppressed"
-            )
-            self._finish_voice_diagnostic_attempt(
-                "failed_before_send", reason="provider_not_ready"
-            )
-            return False
-
         self._capture_voice_focus_before()
         action = self._voice_shortcut.controller.on_mic_button_pressed()
-        action_delivered = self._voice_shortcut.apply(action)
+        action_delivered = self._voice_shortcut.apply(
+            action,
+            voice_slot=voice_slot,
+            inject_mode=self._voice_slot_inject_mode(voice_slot),
+        )
         if not action_delivered:
             self._voice_focus_before = None
             self._voice_focus_provider = ""
@@ -5892,7 +6318,7 @@ class RC003App:
         self._diagnostic_trace.emit(
             "hotkey_sent",
             **self._diagnostic_trace.current_context(),
-            backend=self._configured_voice_hotkey_backend(),
+            backend=_VOICE_HOTKEY_BACKEND_MARKED,
         )
         self._set_runtime_voice_result(bridge_runtime_status.VOICE_RUNTIME_ACTIVE)
         self._set_runtime_voice_active(True)
@@ -5901,7 +6327,18 @@ class RC003App:
                 "voice hold safety timer unavailable"
             )
             return False
-        if send_device_open and self._ble_session is not None:
+        if self._uses_local_voice_microphone():
+            # 模式2：声音来自插在这台电脑上的麦克风，遥控器那条流不需要
+            # 开，也不该被转发（否则两路声音会叠在一起）。
+            if not self._start_local_voice_capture_locked():
+                self._logger.info(
+                    "voice failing closed: local microphone unavailable"
+                )
+                self._force_voice_hold_release_locked(
+                    "local voice microphone unavailable"
+                )
+                return False
+        elif send_device_open and self._ble_session is not None:
             self._ble_session.send_mic_open_threadsafe()
         return True
 
@@ -5924,29 +6361,9 @@ class RC003App:
             if not self._voice_mic_gesture_sources_down:
                 self._finish_voice_mic_gesture()
 
-    def _wait_for_sogou_voice_process(self) -> bool:
-        provider_settings = voice_program_manager.normalize_voice_program_settings(
-            self._config.get("voice_program")
-        )
-        if provider_settings["provider"] != voice_program_manager.VOICE_PROGRAM_SOGOU:
-            return True
-        ready = voice_program_manager.wait_for_sogou_voice_process(timeout=0.6)
-        if ready:
-            self._logger.info("voice program: Sogou voice process ready")
-        else:
-            self._logger.warning("voice program: Sogou voice process is not running")
-        return ready
-
     def _capture_voice_focus_before(self) -> None:
-        provider_settings = voice_program_manager.normalize_voice_program_settings(
-            self._config.get("voice_program")
-        )
-        self._voice_focus_provider = str(provider_settings["provider"])
-        self._voice_focus_submit_method = (
-            "wetype_hotkey"
-            if self._configured_voice_hotkey_backend() == _VOICE_HOTKEY_BACKEND_WETYPE
-            else "hotkey_hold"
-        )
+        self._voice_focus_provider = "recorded_hotkey"
+        self._voice_focus_submit_method = "hotkey_hold"
         snapshot = voice_interaction_diagnostics_windows.capture_focus_snapshot()
         self._voice_focus_before = snapshot
         self._diagnostic_trace.emit(
@@ -6019,7 +6436,7 @@ class RC003App:
                 else -1
             ),
             diagnostic=after.error or "captured",
-            voice_ui=self._voice_shortcut.ui_confirmation or "unknown",
+            voice_ui=getattr(self._voice_shortcut, "ui_confirmation", "") or "unknown",
             foreground_executable=after.foreground_executable,
             process_query_status=after.process_query_status,
             foreground_thread_id=after.foreground_thread_id,
@@ -6049,65 +6466,6 @@ class RC003App:
         self._voice_focus_submit_method = ""
         return observation
 
-
-    def _prepare_doubao_voice_physicalizer(
-        self,
-        tokens: Tuple[str, ...],
-        *,
-        cancel_event: Optional[threading.Event] = None,
-    ) -> bool:
-        try:
-            vk_codes = tuple(win32_keys.resolve_vk_codes(tokens))
-        except win32_keys.UnknownKeyTokenError:
-            self._logger.exception(
-                "Doubao voice physicalizer rejected an unknown hotkey token"
-            )
-            return False
-        # ActivateProfile can finish before ImeService.exe is created. Only
-        # the asynchronous RC003 attempt may wait here; synchronous callers
-        # retain their non-waiting behavior. Never retry a hook/permission/
-        # version failure, or resend a shortcut while waiting for the host.
-        deadline = time.monotonic() + _DOUBAO_PROCESS_READY_TIMEOUT_SECONDS
-        waiting_logged = False
-        while cancel_event is None or not cancel_event.is_set():
-            if self._voice_shortcut.doubao_physicalizer.start(vk_codes):
-                self._logger.info(
-                    "Doubao voice physicalizer ready for configured shortcut"
-                )
-                return True
-            if (
-                cancel_event is None
-                or self._voice_shortcut.doubao_physicalizer.status != "unavailable"
-                or self._voice_shortcut.doubao_physicalizer.error != "ImeService.exe is not running"
-            ):
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            if not waiting_logged:
-                self._logger.info("Waiting for Doubao process after profile activation")
-                waiting_logged = True
-            if cancel_event.wait(min(_DOUBAO_HOST_READY_POLL_SECONDS, remaining)):
-                return False
-            if time.monotonic() >= deadline:
-                break
-        self._logger.warning(
-            "Doubao voice physicalizer unavailable: status=%s error=%s",
-            self._voice_shortcut.doubao_physicalizer.status,
-            self._voice_shortcut.doubao_physicalizer.error or "unknown",
-        )
-        return False
-
-
-
-
-
-
-
-
-
-
-
     def _on_pcm_frame(
         self,
         samples,
@@ -6119,37 +6477,15 @@ class RC003App:
 
         with self._voice_shortcut.lock:
             sink = self._voice_audio.sink
-            doubao_attempt = self._active_doubao_attempt_locked()
-            if (
-                doubao_attempt is not None
-                and not self._doubao_attempt_target_healthy(doubao_attempt)
-            ):
-                self._voice_pcm_forwarding_enabled = False
-                self._voice_shortcut.controller.on_mic_button_released()
-                self._request_active_doubao_cleanup_locked(
-                    doubao_attempt,
-                    reason="physicalizer target lost",
-                )
-                return
-            cutoff = self._voice_pcm_min_arrival_sequence
-            arrived_before_ready = bool(
-                cutoff is not None
-                and _arrival_sequence is not None
-                and int(_arrival_sequence) <= cutoff
-            )
-            if arrived_before_ready:
-                self._diagnostic_trace.emit(
-                    "doubao_pcm_discarded",
-                    **self._diagnostic_trace.current_context(),
-                    arrival_sequence=int(_arrival_sequence),
-                    readiness_watermark=int(cutoff),
-                )
             if (
                 sink is None
                 or not self._accepts_ble_callback(_ble_generation)
                 or not self._voice_pcm_forwarding_enabled
-                or arrived_before_ready
             ):
+                return
+            if self._uses_local_voice_microphone() and _ble_generation is not None:
+                # 模式2 的声音只来自本机麦克风。遥控器如果因为话筒键被按住
+                # 也在送音频，一律丢掉，避免两路声音叠在一起。
                 return
             if not self._voice_audio.ensure_writer(sink):
                 self._voice_pcm_forwarding_enabled = False
@@ -6168,15 +6504,10 @@ async def _run(
     on_runtime_ready=None,
     on_reconnect_ready=None,
     on_settings_reload_ready=None,
-    launch_voice_program_on_start: bool = True,
 ) -> None:
     tray_factory = tray_factory or bridge_tray_windows.BridgeTray
     settings_launcher = settings_launcher or bridge_launcher.launch_settings
-    app = (
-        RC003App(launch_voice_program_on_start=launch_voice_program_on_start)
-        if app_factory is None
-        else app_factory()
-    )
+    app = RC003App() if app_factory is None else app_factory()
     loop = asyncio.get_running_loop()
     tray_exit_requested = threading.Event()
     run_task = asyncio.create_task(app.run_forever())
@@ -6264,7 +6595,6 @@ def main(
     on_runtime_ready=None,
     on_reconnect_ready=None,
     on_settings_reload_ready=None,
-    launch_voice_program_on_start: bool = True,
 ) -> None:
     asyncio.run(
         _run(
@@ -6272,7 +6602,6 @@ def main(
             on_runtime_ready=on_runtime_ready,
             on_reconnect_ready=on_reconnect_ready,
             on_settings_reload_ready=on_settings_reload_ready,
-            launch_voice_program_on_start=launch_voice_program_on_start,
         )
     )
 

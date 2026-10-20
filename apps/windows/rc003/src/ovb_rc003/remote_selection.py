@@ -25,12 +25,21 @@ SCAN_FLAG = "--list-remote-devices"
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_DEVICES = 128
 RC003_PROFILE = "xiaomi-rc003"
-CHROMECAST_PROFILE = "chromecast-remote"
-KNOWN_PROFILES = frozenset({RC003_PROFILE, CHROMECAST_PROFILE})
+KNOWN_PROFILES = frozenset({RC003_PROFILE})
 
 
 class SelectionError(ValueError):
     """An absent/invalid selection must never fall back to another remote."""
+
+
+class _RawIdentityError(SelectionError):
+    """Fixed metadata only; Configuration Manager returns CONFIGRET, not WinError."""
+
+    def __init__(self, message, stage, code, *, kind=None, size=None):
+        super().__init__(message)
+        self.diagnostic = {"stage": stage, "configret": int(code)}
+        if kind is not None:
+            self.diagnostic.update(property_type=int(kind), property_size=int(size))
 
 
 def container_key(value: object) -> str:
@@ -65,13 +74,18 @@ def normalize(value: object) -> dict:
     records = []
     for row in devices:
         if (not isinstance(row, dict) or set(row) != {"key", "profile"}
-                or not valid_key(row.get("key"))
-                or row.get("profile") not in KNOWN_PROFILES or row["key"] in keys):
+                or not valid_key(row.get("key")) or row["key"] in keys):
             raise SelectionError("设备记录不受支持或重复。")
         keys.add(row["key"])
+        if row["profile"] not in KNOWN_PROFILES:
+            # A record for a device type this build no longer supports is
+            # dropped instead of making the whole saved selection unusable.
+            continue
         records.append(dict(row))
     if not isinstance(active, str) or (active and active not in keys):
         raise SelectionError("当前设备不在已添加列表中。")
+    if active not in {row["key"] for row in records}:
+        active = ""
     return {"schema": 1, "devices": records, "active": active}
 
 
@@ -110,7 +124,7 @@ def active_profile(settings: dict) -> str:
 
 def runtime_ready(profile: str) -> bool:
     # Capability only, not a claim that live source/permission checks passed.
-    return profile in (RC003_PROFILE, CHROMECAST_PROFILE)
+    return profile == RC003_PROFILE
 
 
 def label(key: str, profile: str = RC003_PROFILE, peers=()) -> str:
@@ -213,21 +227,28 @@ def raw_path_key(path: str) -> str:
     code = cfg.CM_Get_Device_Interface_PropertyW(
         path, ctypes.byref(interface_key), ctypes.byref(kind), name, ctypes.byref(size), 0)
     if code or kind.value != 0x12 or size.value > ctypes.sizeof(name):
-        raise SelectionError("无法核实所选设备的按键接口。")
+        raise _RawIdentityError("无法核实所选设备的按键接口。", "interface_property", code,
+                                kind=kind.value, size=size.value)
     node = wintypes.DWORD()
-    if cfg.CM_Locate_DevNodeW(ctypes.byref(node), name, 0):
-        raise SelectionError("所选设备的按键接口未连接。")
+    code = cfg.CM_Locate_DevNodeW(ctypes.byref(node), name, 0)
+    if code:
+        raise _RawIdentityError("所选设备的按键接口未连接。", "locate_devnode", code)
     buffer = (ctypes.c_ubyte * 16)()
     size = wintypes.ULONG(16)
     code = cfg.CM_Get_DevNode_PropertyW(
         node, ctypes.byref(container_property), ctypes.byref(kind), buffer, ctypes.byref(size), 0)
     if code or kind.value != 0x0D or size.value != 16:
-        raise SelectionError("无法核实所选设备的按键身份。")
+        raise _RawIdentityError("无法核实所选设备的按键身份。", "container_property", code,
+                                kind=kind.value, size=size.value)
     return container_key(uuid.UUID(bytes_le=bytes(buffer)))
 
 
-def selected_raw_path(paths: list[str], key: str, *, resolve=None) -> str:
+def selected_raw_path(paths: list[str], key: str, *, resolve=None, diagnostic: dict | None = None) -> str:
     from . import hid_identity
+    details = {"matching_paths": 0, "selected_paths": 0, "identity_mismatches": 0,
+               "identity_failures": 0, "error_samples": [], "errors_omitted": 0}
+    if diagnostic is not None:
+        diagnostic.update(details, reason="no_selected_device")
     if not valid_key(key):
         raise hid_identity.NoDevicePathFoundError("no selected remote")
     resolve = resolve or raw_path_key
@@ -235,11 +256,33 @@ def selected_raw_path(paths: list[str], key: str, *, resolve=None) -> str:
     for path in paths:
         if not hid_identity.device_path_matches_rc003(path):
             continue
+        details["matching_paths"] += 1
         try:
             if resolve(path) == key:
                 matches.append(path)
-        except (SelectionError, OSError):
+            else:
+                details["identity_mismatches"] += 1
+        except (SelectionError, OSError) as exc:
+            details["identity_failures"] += 1
+            if len(details["error_samples"]) < 3:
+                error = {"stage": "container_identity", "error_type": "SelectionError"}
+                if isinstance(exc, _RawIdentityError):
+                    error.update(exc.diagnostic)
+                elif isinstance(exc, OSError):
+                    error.update(error_type="OSError", winerror=getattr(exc, "winerror", None),
+                                 errno=exc.errno)
+                details["error_samples"].append(error)
+            else:
+                details["errors_omitted"] += 1
             continue
+    details["selected_paths"] = len(matches)
+    if diagnostic is not None:
+        reason = ("ambiguous_selected_interface" if len(matches) > 1 else
+                  "selected_interface_found" if matches else
+                  "identity_read_failed" if details["identity_failures"] else
+                  "selected_identity_mismatch" if details["identity_mismatches"] else
+                  "no_matching_interface")
+        diagnostic.update(details, reason=reason)
     return hid_identity.select_single_device_path(matches)
 
 
@@ -256,8 +299,7 @@ async def _scan_paired() -> list[dict]:
         except (SelectionError, OSError, TypeError, ValueError):
             continue
         name = getattr(info, "name", "") or ""
-        profile = (RC003_PROFILE if identity.matches_rc003_name(name) else
-                   CHROMECAST_PROFILE if str(name).strip().casefold() == "chromecast remote" else "")
+        profile = RC003_PROFILE if identity.matches_rc003_name(name) else ""
         # Unsupported names are display-only; saved selection still contains only digests/profiles.
         row = {"key": key, "profile": profile,
                "label": label(key, profile) if profile else _unsupported_label(name, key)}

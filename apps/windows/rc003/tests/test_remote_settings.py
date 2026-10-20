@@ -10,7 +10,7 @@ from ovb_rc003 import config, remote_selection as selection, remote_settings as 
 A, B = "a" * 64, "b" * 64
 
 
-def selected(active=A, second=selection.CHROMECAST_PROFILE):
+def selected(active=A, second=selection.RC003_PROFILE):
     return {"schema": 1, "active": active, "devices": [
         {"key": A, "profile": selection.RC003_PROFILE},
         {"key": B, "profile": second}]}
@@ -31,37 +31,17 @@ class EntitySettingsTests(unittest.TestCase):
         mapping["display_notes"] = {"ok": {"single_click": "原设备"}}
         config.save_key_bindings(self.bindings, mapping)
 
-    def switch(self, active, second=selection.CHROMECAST_PROFILE):
+    def switch(self, active, second=selection.RC003_PROFILE):
         return config.switch_remote_settings(self.settings, self.bindings, selected(active, second))
 
-    def test_voice_launch_preferences_are_owned_by_each_remote(self):
-        value = config.load_config(self.settings)
-        value["voice_program"] = {"provider": "custom", "custom_executable": "old.exe",
-            "launch_on_bridge_start_by_provider": {"sogou": False, "custom": True}}
-        config.save_config(self.settings, value)
-        new, _ = self.switch(B)
-        new["voice_program"] = {"provider": "wetype",
-            "launch_on_bridge_start_by_provider": {"sogou": True, "custom": False}}
-        config.save_config(self.settings, new)
-        old, _ = self.switch(A)
-        self.assertEqual(old["voice_program"]["provider"], "custom")
-        self.assertEqual(old["voice_program"]["custom_executable"], "old.exe")
-        self.assertEqual(old["voice_program"]["launch_on_bridge_start_by_provider"],
-                         {"sogou": False, "custom": True})
-        new, _ = self.switch(B)
-        self.assertEqual(new["voice_program"]["provider"], "wetype")
-        self.assertEqual(new["voice_program"]["launch_on_bridge_start_by_provider"],
-                         {"sogou": True, "custom": False})
-
     def test_round_trip_restores_each_entity_and_hold_is_default(self):
-        for second in (selection.RC003_PROFILE, selection.CHROMECAST_PROFILE):
+        for second in (selection.RC003_PROFILE,):
             with self.subTest(second=second):
                 new, mapping = self.switch(B, second)
-                self.assertEqual(new["remote_recording_mode"], "hold")
                 self.assertEqual(new["remote_recording_limit_seconds"], 120)
+                self.assertNotIn("remote_recording_mode", new)
                 self.assertNotIn("ok", mapping["display_notes"])
                 new["gain_db"] = 3
-                new["remote_recording_mode"] = "toggle"
                 new["remote_recording_limit_seconds"] = 300
                 mapping["display_notes"] = {"ok": {"single_click": "新设备"}}
                 config.save_settings_pair(self.settings, new, self.bindings, mapping)
@@ -72,8 +52,6 @@ class EntitySettingsTests(unittest.TestCase):
                 new, mapping = self.switch(B, second)
                 self.assertEqual(new["gain_db"], 3)
                 self.assertEqual(new["remote_recording_limit_seconds"], 300)
-                self.assertEqual(new["remote_recording_mode"], "toggle" if second == selection.CHROMECAST_PROFILE else "hold")
-                self.assertEqual(mapping["display_notes"]["ok"]["single_click"], "新设备")
                 self.switch(A, second)
                 # Begin the next independent profile case with no B record.
                 for filename in (self.settings, self.bindings):
@@ -106,7 +84,8 @@ class EntitySettingsTests(unittest.TestCase):
         data = config.load_config(self.settings)
         data[selection.KEY] = selected("")
         config.save_config(self.settings, data)
-        restored, mappings = self.switch(A)
+        sole = {"schema": 1, "active": A, "devices": [{"key": A, "profile": selection.RC003_PROFILE}]}
+        restored, mappings = config.switch_remote_settings(self.settings, self.bindings, sole)
         self.assertEqual(restored["gain_db"], 7)
         self.assertEqual(mappings["display_notes"]["ok"]["single_click"], "原设备")
         self.assertEqual(restored[records.STORE]["unassigned"], {})
@@ -191,10 +170,10 @@ class EntitySettingsTests(unittest.TestCase):
              self.assertRaises(config.ConfigTransactionError):
             self.switch(B)
 
-    def test_malformed_record_and_mode_fail_closed(self):
+    def test_malformed_record_and_unsupported_limit_fail_closed(self):
         self.switch(B)
         stored = json.loads(self.settings.read_text(encoding="utf-8"))
-        for bad in ({"address": "raw"}, {"remote_recording_mode": "unknown"}):
+        for bad in ({"address": "raw"}, {"remote_recording_limit_seconds": 999}):
             stored[records.STORE]["records"][B] = bad
             config._save_json_atomic(self.settings, stored)
             with self.assertRaises((ValueError, config.ConfigPrivacyError)):
@@ -208,25 +187,63 @@ class EntitySettingsTests(unittest.TestCase):
         self.assertIn(B, config.load_key_bindings(self.bindings)[records.STORE]["records"])
         self.switch(B)
 
-    def test_chromecast_keeps_its_profile_without_xiaomi_defaults(self):
+    def test_retired_record_fields_stay_readable_and_are_cleared_on_rewrite(self):
+        # A file written before schema 18 keeps the dropped provider/trigger
+        # fields inside its records. It must still open with its live settings
+        # intact, and the next save must physically clear them.
         self.switch(B)
-        settings = config.load_config(self.settings)
-        self.assertEqual(selection.active_profile(settings), selection.CHROMECAST_PROFILE)
-        self.assertTrue(selection.runtime_ready(selection.CHROMECAST_PROFILE))
-        self.assertEqual(settings["remote_recording_mode"], "hold")
+        retired = {
+            "voice_shortcut_enabled": True, "voice_trigger_mode": "hold",
+            "voice_program": "legacy-ime", "voice_hotkeys_by_provider": {"legacy-ime": "win+h"},
+            "remote_recording_mode": "hold",
+        }
+        self.assertEqual(set(retired), set(records.CONFIG_RETIRED_FIELDS))
+        stored = json.loads(self.settings.read_text(encoding="utf-8"))
+        stored[records.STORE]["records"][A].update(retired)
+        stored[records.STORE]["records"][B].update(retired, gain_db=4)
+        config._save_json_atomic(self.settings, stored)
+
+        loaded = config.load_config(self.settings)
+        self.assertEqual(loaded["gain_db"], 4)
+        for field in records.CONFIG_RETIRED_FIELDS:
+            self.assertNotIn(field, loaded)
+
+        config.save_config(self.settings, loaded)
+        rewritten = json.loads(self.settings.read_text(encoding="utf-8"))
+        self.assertFalse(records.CONFIG_RETIRED_FIELDS & rewritten.keys())
+        for row in rewritten[records.STORE]["records"].values():
+            self.assertFalse(records.CONFIG_RETIRED_FIELDS & row.keys())
+        self.assertEqual(rewritten[records.STORE]["records"][A]["gain_db"], 7)
+
+    def test_record_toggle_shortcut_is_not_reinterpreted_as_hold(self):
+        # The pre-schema-18 toggle selector only ever lived inside the record.
+        # It stays readable so the old shortcut is never mistaken for a
+        # hold-to-talk key, then is dropped like the other retired fields.
+        self.switch(B)
+        self.switch(A)
+        stored = json.loads(self.settings.read_text(encoding="utf-8"))
+        stored[records.STORE]["records"][A].update({
+            "voice_trigger_mode": "toggle", "voice_hotkey": "win+h",
+            "voice_hotkeys": {"hold": ""},
+        })
+        config._save_json_atomic(self.settings, stored)
+
+        loaded = config.load_config(self.settings)
+        self.assertEqual(loaded["voice_hotkey"], "ralt")
+        self.assertEqual(loaded[config.RUNTIME_LEGACY_VOICE_MODE_KEY], "toggle")
+        self.assertNotIn("voice_trigger_mode", loaded)
 
 
 class DiscoveryTests(unittest.TestCase):
     def test_model_and_entity_are_distinct_and_short_labels_resolve_collision(self):
         first, second = "abcdef01" + "1" * 56, "abcdef02" + "2" * 56
-        self.assertNotEqual(selection.label(first, selection.CHROMECAST_PROFILE, [first, second]),
-                            selection.label(second, selection.CHROMECAST_PROFILE, [first, second]))
-        self.assertIn("Chromecast", selection.label(B, selection.CHROMECAST_PROFILE))
-        self.assertTrue(selection.runtime_ready(selection.CHROMECAST_PROFILE))
+        self.assertNotEqual(selection.label(first, selection.RC003_PROFILE, [first, second]),
+                            selection.label(second, selection.RC003_PROFILE, [first, second]))
+        self.assertTrue(selection.runtime_ready(selection.RC003_PROFILE))
 
     def test_invalid_later_scan_row_raises_contract_error(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "scan.json"
-            path.write_text(json.dumps([{"key": A, "profile": selection.CHROMECAST_PROFILE, "label": "x"}, {}]), encoding="utf-8")
+            path.write_text(json.dumps([{"key": A, "profile": selection.RC003_PROFILE, "label": "x"}, {}]), encoding="utf-8")
             with self.assertRaises(selection.SelectionError):
                 selection._read_scan_result(str(path), 0)

@@ -1,33 +1,32 @@
-"""Shared shortcut ownership, deferred releases and input-method confirmations.
+"""Shared shortcut ownership and deferred releases.
 
 Device gestures stay in their device policy. Application callbacks supply status,
 configuration and the existing recovery policy; this owner retains one set of
-keys, release timers and host generations under the original locks.
+keys and release timers under the original locks.
+
+The RC003 voice shortcut is no longer tied to any input method: a hold gesture
+simply replays the shortcut the user recorded, so the only delivery path here is
+the recorded key replay.  The target application may still reject injected keys,
+which is what the Interception injection mode (``injection_backend``) is for.
 """
 from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
-from . import (hotkey, voice_controller, voice_program_manager, wetype_control_windows,
-               win32_input, win32_keys, bridge_runtime_status, doubao_rpc)
+from . import hotkey, injection_backend, voice_controller, win32_input
 
 _VOICE_HOTKEY_RELEASE_RETRY_INITIAL_SECONDS = 0.1
 _VOICE_HOTKEY_RELEASE_RETRY_MAX_SECONDS = 2.0
 _VOICE_HOTKEY_BACKEND_MARKED = "marked_keybd_event"
-_VOICE_HOTKEY_BACKEND_WETYPE = "wetype_hotkey"
-_VOICE_HOTKEY_BACKEND_DOUBAO = "doubao_hotkey"
-_INPUT_PROFILE_VOICE_HOTKEY_BACKENDS = frozenset(
-    {_VOICE_HOTKEY_BACKEND_WETYPE, _VOICE_HOTKEY_BACKEND_DOUBAO}
-)
+# Injected keys never auto-repeat, so the recorded shortcut of a held voice key
+# is re-sent here at the typematic rate.  The first repeat starts at the same
+# 0.55 s boundary the tap/hold gesture uses, so a tap never looks like a hold.
+_VOICE_HOTKEY_REPEAT_INITIAL_DELAY_SECONDS = 0.550
 
 @dataclass(frozen=True)
 class ShortcutServices:
     configured_backend: Callable
-    prepare_doubao: Callable
     resume_tracking: Callable
-    active_doubao_attempt: Callable
-    doubao_session: Callable
-    cleanup_doubao: Callable
     set_result: Callable
     current_state: Callable
     request_cleanup: Callable
@@ -41,215 +40,34 @@ class VoiceShortcutSession:
         self.trace = trace
         self.lock = threading.Lock()
         self.controller = voice_controller.VoiceController()
-        self.hotkey = hotkey.HotkeySpec.parse(hotkey_text)
+        self.hotkey: Optional[hotkey.HotkeySpec] = (
+            hotkey.HotkeySpec.parse(hotkey_text) if str(hotkey_text).strip() else None
+        )
         self.pending_tokens: Optional[Tuple[str, ...]] = None
         self.active_backend: Optional[str] = None
         self.pending_backend: Optional[str] = None
+        # Injection backend the pending hold was started with.  The release has
+        # to use the same one, otherwise an Interception key-down would be
+        # released through SendInput and stay stuck.
+        self.pending_inject_mode: Optional[str] = None
         self.retry_timer: Optional[object] = None
         self.retry_token: Optional[object] = None
         self.retry_delay = (
             _VOICE_HOTKEY_RELEASE_RETRY_INITIAL_SECONDS
         )
         self.retry_stopping = False
+        self.repeat_timer: Optional[object] = None
+        self.repeat_token: Optional[object] = None
+        self.repeat_stopping = True
         self.timer_factory = threading.Timer
-        self.ui_confirmation = "unknown"
-        self.runtime_lock = threading.Lock()
-        self.runtime_generation: Optional[int] = None
-        self.runtime_audio_finished = False
-        self.runtime_pcm_frames = 0
-        self.runtime_cleanup_result: Optional[bool] = None
-        self.runtime_backend: Optional[str] = None
-        self.runtime_mic_confirmed: Optional[bool] = None
-        self.wetype_control = wetype_control_windows.WeTypeVoiceControl(
-            logger=self.logger,
-            press_keys=win32_input.send_wetype_voice_key_combo_down,
-            release_keys=win32_input.send_wetype_voice_key_combo_up,
-            on_completion=self.on_cleanup,
-            on_confirmation=self.on_confirmation,
-            on_started=lambda generation: self.track_generation(generation, _VOICE_HOTKEY_BACKEND_WETYPE),
-            prepare_playback_mute_guard=self.services.prepare_mute_guard,
-        )
-        self.doubao_control = wetype_control_windows.DoubaoVoiceControl(
-            logger=self.logger,
-        )
-        self.doubao_physicalizer = doubao_rpc.DoubaoPhysicalizer()
 
-    @staticmethod
-    def provider_for_backend(backend: str) -> str:
-        if backend == _VOICE_HOTKEY_BACKEND_DOUBAO:
-            return voice_program_manager.VOICE_PROGRAM_DOUBAO_IME
-        return voice_program_manager.VOICE_PROGRAM_WETYPE
+    def recorded_tokens(self) -> Tuple[str, ...]:
+        """Tokens for the recorded shortcut, or () when the user has not set one."""
 
-
-    def control_for_backend(self, backend: str):
-        if backend == _VOICE_HOTKEY_BACKEND_DOUBAO:
-            return self.doubao_control
-        return self.wetype_control
-
-
-    def begin_runtime(
-        self, backend: str = _VOICE_HOTKEY_BACKEND_WETYPE
-    ) -> None:
-        with self.runtime_lock:
-            self.runtime_generation = None
-            self.runtime_audio_finished = False
-            self.runtime_pcm_frames = 0
-            self.runtime_cleanup_result = None
-            self.runtime_backend = backend
-            self.runtime_mic_confirmed = None
-
-
-    def control_generation(
-        self, backend: str = _VOICE_HOTKEY_BACKEND_WETYPE
-    ) -> Optional[int]:
-        control = self.control_for_backend(backend)
-        value = getattr(control, "current_generation", None)
-        if isinstance(value, int) and not isinstance(value, bool):
-            return value
-        return None
-
-
-    def control_flag(
-        self, name: str, backend: str = _VOICE_HOTKEY_BACKEND_WETYPE
-    ) -> bool:
-        control = self.control_for_backend(backend)
-        value = getattr(control, name, False)
-        return value if isinstance(value, bool) else False
-
-
-    def track_generation(
-        self,
-        generation: Optional[int],
-        backend: str = _VOICE_HOTKEY_BACKEND_WETYPE,
-    ) -> None:
-        if generation is None:
-            return
-        with self.runtime_lock:
-            self.runtime_generation = generation
-            self.runtime_backend = backend
-
-
-    def record_audio_result(self, frames: int) -> bool:
-        with self.runtime_lock:
-            if self.runtime_generation is None:
-                return False
-            self.runtime_audio_finished = True
-            self.runtime_pcm_frames = max(0, int(frames))
-            cleanup_result = self.runtime_cleanup_result
-            backend = self.runtime_backend or _VOICE_HOTKEY_BACKEND_WETYPE
-            mic_confirmed = self.runtime_mic_confirmed
-        if backend == _VOICE_HOTKEY_BACKEND_WETYPE and mic_confirmed is not True:
-            state = bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED
-        elif cleanup_result is True:
-            state = (
-                bridge_runtime_status.VOICE_RUNTIME_SUCCESS
-                if frames > 0
-                else bridge_runtime_status.VOICE_RUNTIME_AUDIO_EMPTY
-            )
-        elif cleanup_result is False:
-            state = bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED
-        else:
-            state = bridge_runtime_status.VOICE_RUNTIME_FINISHING
-        self.services.set_result(
-            state,
-            provider=self.provider_for_backend(backend),
-        )
-        return True
-
-
-    def on_confirmation(
-        self,
-        generation: int,
-        success: bool,
-    ) -> None:
-        with self.runtime_lock:
-            if (
-                generation != self.runtime_generation
-                or self.runtime_backend != _VOICE_HOTKEY_BACKEND_WETYPE
-            ):
-                self.logger.info(
-                    "WeType voice confirmation ignored for stale generation=%s",
-                    generation,
-                )
-                return
-            self.runtime_mic_confirmed = bool(success)
-            self.ui_confirmation = (
-                "confirmed" if success else "not_confirmed"
-            )
-        if success:
-            current_state = self.services.current_state()
-            if current_state == bridge_runtime_status.VOICE_RUNTIME_ACTIVE:
-                self.services.set_result(
-                    bridge_runtime_status.VOICE_RUNTIME_MIC_CONFIRMED,
-                    provider=voice_program_manager.VOICE_PROGRAM_WETYPE,
-                )
-            self.logger.info("WeType microphone open confirmed")
-            return
-
-        self.logger.warning(
-            "WeType microphone open was not confirmed after recovery retries; "
-            "preserving the active hold until the physical microphone key is released"
-        )
-
-
-    def on_cleanup(
-        self,
-        generation: int,
-        success: bool,
-        backend: Optional[str] = None,
-    ) -> None:
-        with self.runtime_lock:
-            if generation != self.runtime_generation:
-                self.logger.info(
-                    "input profile runtime completion ignored for stale generation=%s",
-                    generation,
-                )
-                return
-            resolved_backend = (
-                backend
-                or self.runtime_backend
-                or _VOICE_HOTKEY_BACKEND_WETYPE
-            )
-            if (
-                self.runtime_backend is not None
-                and resolved_backend != self.runtime_backend
-            ):
-                self.logger.info(
-                    "input profile runtime completion ignored for stale backend=%s",
-                    resolved_backend,
-                )
-                return
-            self.runtime_cleanup_result = bool(success)
-            audio_finished = self.runtime_audio_finished
-            frames = self.runtime_pcm_frames
-        provider = self.provider_for_backend(resolved_backend)
-        if not success:
-            tokens = tuple(self.hotkey.modifiers) + (self.hotkey.key,)
-            with self.lock:
-                self.pending_tokens = tokens
-                self.pending_backend = resolved_backend
-                self.active_backend = None
-            self.services.set_result(
-                bridge_runtime_status.VOICE_RUNTIME_HOST_STOP_FAILED,
-                provider=provider,
-            )
-            self.services.request_cleanup()
-            return
-        if not audio_finished:
-            self.services.set_result(
-                bridge_runtime_status.VOICE_RUNTIME_FINISHING,
-                provider=provider,
-            )
-            return
-        self.services.set_result(
-            (
-                bridge_runtime_status.VOICE_RUNTIME_SUCCESS
-                if frames > 0
-                else bridge_runtime_status.VOICE_RUNTIME_AUDIO_EMPTY
-            ),
-            provider=provider,
-        )
-
+        spec = self.hotkey
+        if spec is None:
+            return ()
+        return tuple(spec.modifiers) + (spec.key,)
 
     def apply(
         self,
@@ -258,17 +76,17 @@ class VoiceShortcutSession:
         backend_override: Optional[str] = None,
         tokens_override: Optional[Tuple[str, ...]] = None,
         cancelled=None,
+        voice_slot: Optional[int] = None,
+        inject_mode: Optional[str] = None,
     ) -> bool:
         backend = backend_override or self.services.configured_backend()
-        tokens = tokens_override or (
-            tuple(self.hotkey.modifiers) + (self.hotkey.key,)
-        )
-        if action == voice_controller.VoiceHostAction.KEY_UP and backend_override is None:
-            backend = (
-                self.active_backend
-                or self.pending_backend
-                or backend
-            )
+        tokens = tokens_override or self.recorded_tokens()
+        if action == voice_controller.VoiceHostAction.KEY_UP:
+            # Stop the typematic re-sends before the release edge goes out.
+            self._stop_hold_repeat_locked()
+            # The release must go out on the same injection mode the press used.
+            if inject_mode is None:
+                inject_mode = self.pending_inject_mode
         trace_context = {
             **self.trace.current_context(),
             "action": str(action.value),
@@ -277,143 +95,130 @@ class VoiceShortcutSession:
             "voice_hotkey_requested",
             **trace_context,
             backend=str(backend),
+            inject_mode=str(inject_mode),
             tokens=list(tokens),
             source="voice_controller",
         )
-        if backend in _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS:
-            control = self.control_for_backend(backend)
-            provider = self.provider_for_backend(backend)
-            if action == voice_controller.VoiceHostAction.KEY_DOWN:
-                if (
-                    backend == _VOICE_HOTKEY_BACKEND_DOUBAO
-                    and not self.services.prepare_doubao(tokens)
-                ):
-                    return False
-                self.begin_runtime(backend)
-            if backend == _VOICE_HOTKEY_BACKEND_DOUBAO:
-                try:
-                    expected_markers = len(
-                        tuple(dict.fromkeys(win32_keys.resolve_vk_codes(tokens)))
-                    )
-                except win32_keys.UnknownKeyTokenError:
-                    expected_markers = 0
-                self.doubao_physicalizer.expect_markers(
-                    "down"
-                    if action == voice_controller.VoiceHostAction.KEY_DOWN
-                    else "up",
-                    expected_markers,
-                )
-            try:
-                if action == voice_controller.VoiceHostAction.KEY_DOWN:
-                    delivered = (
-                        control.start(tokens)
-                        if cancelled is None
-                        else control.start(tokens, cancelled=cancelled)
-                    )
-                else:
-                    delivered = control.stop()
-            except (win32_input.Win32InputUnavailableError, OSError):
-                self.logger.exception(
-                    "%s voice shortcut control failed",
-                    provider,
-                )
-                return False
-            generation = self.control_generation(backend)
-            self.trace.emit(
-                "voice_hotkey_result",
-                **trace_context,
-                backend=str(backend),
-                delivered=bool(delivered),
-                generation=int(generation) if generation is not None else -1,
-                cleanup_pending=bool(
-                    self.control_flag("cleanup_pending", backend)
-                ),
-            )
-            cleanup_pending = self.control_flag("cleanup_pending", backend)
-            if delivered or cleanup_pending:
-                self.track_generation(generation, backend)
-            if not delivered:
-                if action == voice_controller.VoiceHostAction.KEY_DOWN and cleanup_pending:
-                    self.pending_tokens = tokens
-                    self.pending_backend = backend
-                    self.schedule_release_retry()
-                self.logger.warning(
-                    "%s voice shortcut did not confirm logical %s",
-                    provider,
-                    action.value,
-                )
-                return False
-            if action == voice_controller.VoiceHostAction.KEY_DOWN:
-                self.active_backend = backend
-            else:
-                self.active_backend = None
-                if self.control_flag("completion_pending", backend):
-                    self.services.set_result(
-                        bridge_runtime_status.VOICE_RUNTIME_FINISHING,
-                        provider=provider,
-                    )
-                elif generation is not None:
-                    self.on_cleanup(
-                        generation,
-                        True,
-                        backend,
-                    )
-            self.pending_tokens = None
-            self.pending_backend = None
-            if action == voice_controller.VoiceHostAction.KEY_UP:
-                self.services.resume_tracking()
-            return True
-        provider_action = action
         try:
-            if provider_action == voice_controller.VoiceHostAction.KEY_DOWN:
+            if action == voice_controller.VoiceHostAction.KEY_DOWN:
                 self.pending_tokens = tokens
                 self.pending_backend = backend
-            self.send_action(provider_action, tokens, backend)
+                self.pending_inject_mode = inject_mode
+            self.send_action(action, tokens, inject_mode)
             if action == voice_controller.VoiceHostAction.KEY_DOWN:
                 self.active_backend = backend
+                self._start_hold_repeat_locked()
             if action == voice_controller.VoiceHostAction.KEY_UP:
                 self.pending_tokens = None
                 self.pending_backend = None
+                self.pending_inject_mode = None
                 self.active_backend = None
                 self.services.resume_tracking()
             return True
         except win32_input.Win32InputUnavailableError:
-            if provider_action == voice_controller.VoiceHostAction.KEY_DOWN:
+            self._stop_hold_repeat_locked()
+            if action == voice_controller.VoiceHostAction.KEY_DOWN:
                 self.pending_tokens = None
                 self.pending_backend = None
+                self.pending_inject_mode = None
                 self.active_backend = None
             self.logger.info("voice hotkey action skipped: no usable voice input backend")
             return False
         except win32_input.InputCleanupIncompleteError:
+            self._stop_hold_repeat_locked()
             self.pending_tokens = tokens
             self.pending_backend = backend
+            self.pending_inject_mode = inject_mode
             self.schedule_release_retry()
             self.logger.exception(
                 "voice hotkey action failed and safety key-up remains pending"
             )
             return False
         except OSError:
-            if provider_action == voice_controller.VoiceHostAction.KEY_DOWN:
+            self._stop_hold_repeat_locked()
+            if action == voice_controller.VoiceHostAction.KEY_DOWN:
                 self.pending_tokens = None
                 self.pending_backend = None
+                self.pending_inject_mode = None
                 self.active_backend = None
             self.logger.exception("voice hotkey action failed to fully deliver")
             return False
-
 
     @staticmethod
     def send_action(
         action: voice_controller.VoiceHostAction,
         tokens: Tuple[str, ...],
-        backend: str,
+        inject_mode: Optional[str] = None,
     ) -> None:
-        if backend in _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS:
-            raise OSError("input profile shortcut is owned by its voice control")
+        backend = injection_backend.backend_for(inject_mode)
         if action == voice_controller.VoiceHostAction.KEY_DOWN:
-            win32_input.send_voice_key_combo_down(tokens)
+            backend.key_down(tokens)
         else:
-            win32_input.send_voice_key_combo_up(tokens)
+            backend.key_up(tokens)
 
+    def _start_hold_repeat_locked(self) -> None:
+        """Begin typematic re-sends for the shortcut that is currently held."""
+
+        self._stop_hold_repeat_locked()
+        if not self.pending_tokens:
+            return
+        self.repeat_stopping = False
+        self.repeat_token = object()
+        self._schedule_repeat_locked(
+            _VOICE_HOTKEY_REPEAT_INITIAL_DELAY_SECONDS
+        )
+
+    def _schedule_repeat_locked(self, delay: float) -> None:
+        token = self.repeat_token
+        if token is None or self.repeat_stopping:
+            return
+        try:
+            timer = self.timer_factory(
+                delay,
+                lambda: self._repeat_tick(token),
+            )
+            timer.daemon = True
+            self.repeat_timer = timer
+            timer.start()
+        except Exception:
+            self.repeat_timer = None
+            self.repeat_stopping = True
+            self.logger.exception("voice hotkey repeat timer failed")
+
+    def _repeat_tick(self, token: object) -> None:
+        # Holding the session lock keeps a release edge from interleaving with
+        # a repeated key-down, which would leave the key stuck down.
+        with self.lock:
+            if self.repeat_token is not token or self.repeat_stopping:
+                return
+            self.repeat_timer = None
+            tokens = self.pending_tokens
+            inject_mode = self.pending_inject_mode
+            if tokens is None:
+                self.repeat_stopping = True
+                return
+            try:
+                injection_backend.backend_for(inject_mode).key_repeat(tokens)
+            except Exception:
+                self.repeat_stopping = True
+                self.logger.exception(
+                    "voice hotkey repeat failed; holding stopped"
+                )
+                return
+            self._schedule_repeat_locked(win32_input.keyboard_repeat_interval())
+
+    def _stop_hold_repeat_locked(self) -> None:
+        self.repeat_stopping = True
+        timer = self.repeat_timer
+        self.repeat_timer = None
+        self.repeat_token = None
+        if timer is not None:
+            cancel = getattr(timer, "cancel", None)
+            if callable(cancel):
+                try:
+                    cancel()
+                except Exception:
+                    pass
 
     def cancel_release_retry(
         self,
@@ -431,7 +236,6 @@ class VoiceShortcutSession:
             cancel = getattr(timer, "cancel", None)
             if callable(cancel):
                 cancel()
-
 
     def schedule_release_retry(self) -> None:
         if (
@@ -456,7 +260,6 @@ class VoiceShortcutSession:
                 self.retry_timer = None
             self.logger.exception("voice hotkey safety-release timer failed")
 
-
     def _retry_release(self, token: object) -> None:
         with self.lock:
             if self.retry_token is not token:
@@ -475,75 +278,28 @@ class VoiceShortcutSession:
                     self.retry_delay * 2.0,
                 ),
             )
-            attempt = self.services.active_doubao_attempt()
-            if (
-                attempt is not None
-                and attempt.has_cleanup_debt("hotkey")
-                and self.pending_backend
-                == _VOICE_HOTKEY_BACKEND_DOUBAO
-            ):
-                if not self.services.doubao_session().request_cleanup(
-                    attempt,
-                    lambda owned: self.services.cleanup_doubao(
-                        owned,
-                        reason="safety release retry",
-                    ),
-                ):
-                    self.schedule_release_retry()
-                return
             self.release_pending()
-
 
     def release_pending(self) -> bool:
         tokens = self.pending_tokens
         if tokens is None:
             return True
-        backend = (
-            self.pending_backend
-            or self.active_backend
-            or self.services.configured_backend()
-        )
+        self._stop_hold_repeat_locked()
         try:
-            if backend in _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS:
-                control = self.control_for_backend(backend)
-                provider = self.provider_for_backend(backend)
-                delivered = control.stop()
-                if not delivered:
-                    self.schedule_release_retry()
-                    return False
-                generation = self.control_generation(backend)
-                if self.control_flag("completion_pending", backend):
-                    self.services.set_result(
-                        bridge_runtime_status.VOICE_RUNTIME_FINISHING,
-                        provider=provider,
-                    )
-                elif generation is not None:
-                    self.on_cleanup(
-                        generation,
-                        True,
-                        backend,
-                    )
-            else:
-                self.send_action(
-                    voice_controller.VoiceHostAction.KEY_UP,
-                    tokens,
-                    backend,
-                )
+            self.send_action(
+                voice_controller.VoiceHostAction.KEY_UP,
+                tokens,
+                self.pending_inject_mode,
+            )
         except (win32_input.Win32InputUnavailableError, OSError):
             self.logger.exception("voice hotkey safety release failed")
             self.schedule_release_retry()
             return False
         self.pending_tokens = None
         self.pending_backend = None
+        self.pending_inject_mode = None
         self.active_backend = None
         self.cancel_release_retry()
-        attempt = self.services.doubao_session().current
-        if (
-            backend == _VOICE_HOTKEY_BACKEND_DOUBAO
-            and attempt is not None
-            and attempt.has_cleanup_debt("hotkey")
-        ):
-            attempt.resolve_cleanup_debt("hotkey")
         self.logger.info("voice hotkey safety release completed")
         self.services.resume_tracking()
         return True

@@ -13,7 +13,6 @@ from unittest import mock
 
 from ovb_rc003 import input_environment_diagnostics_windows as env
 from ovb_rc003 import voice_interaction_diagnostics_windows as focus
-from ovb_rc003 import voice_program_manager as programs
 from ovb_rc003 import diagnostic_trace, shortcut_observation_windows as receiver
 
 
@@ -145,27 +144,6 @@ class EnvironmentSamplerTests(unittest.TestCase):
         self.assertEqual(result['clipboard']['status'], 'query_failed')
         self.assertNotIn('private', json.dumps(result))
 
-    def test_filtered_inventory_uses_existing_names_without_querying_unrelated_processes(self):
-        kernel, advapi = mock.Mock(), mock.Mock()
-        kernel.CreateToolhelp32Snapshot.return_value = 55
-        entries = iter([(7, 'Chrome.exe'), (8, 'ImeService.exe'), (9, 'wetype_server.exe')])
-        def next_process(handle, output):
-            try:
-                pid, name = next(entries)
-            except StopIteration:
-                ctypes.set_last_error(18)
-                return 0
-            output._obj.th32ProcessID = pid
-            output._obj.szExeFile = name
-            return 1
-        kernel.Process32FirstW.side_effect = next_process
-        kernel.Process32NextW.side_effect = next_process
-        with mock.patch.object(programs.ctypes, 'WinDLL', side_effect=lambda name, **_: kernel if name == 'kernel32' else advapi):
-            candidates = programs.diagnostic_voice_processes()
-        self.assertEqual(candidates, (('doubao_ime', 8, 'ImeService.exe'), ('wetype', 9, 'wetype_server.exe')))
-        kernel.OpenProcess.assert_not_called()
-        kernel.CloseHandle.assert_called_once_with(55)
-
 
 class ObservationIntegrationTests(unittest.TestCase):
     def test_late_submission_tail_survives_long_recording_and_other_mapping(self):
@@ -249,41 +227,41 @@ class ObservationIntegrationTests(unittest.TestCase):
         self.assertNotEqual(thread_ids[0], threading.get_ident())
         self.assertEqual(rows[0]['clipboard']['sequence'], 7)
 
-    def test_sogou_diagnostic_attempt_uses_actual_provider(self):
+    def test_diagnostic_attempt_uses_recorded_hotkey_provider(self):
         from ovb_rc003.app import RC003App
         app = RC003App.__new__(RC003App)
         app._voice_shortcut = types.SimpleNamespace()
         app._voice_attempt_id = None
-        app._config = {'voice_program': {'provider': 'sogou'}}
         app._diagnostic_trace = mock.Mock()
         app._diagnostic_trace.current_context.return_value = {}
         app._voice_shortcut.controller = types.SimpleNamespace(trigger_mode=types.SimpleNamespace(value='hold'))
-        app._voice_shortcut.hotkey = types.SimpleNamespace(modifiers=('lctrl', 'lshift'), key='f7')
         with mock.patch.object(diagnostic_trace, 'foreground_context', return_value={}):
             app._ensure_voice_diagnostic_attempt(
-                provider_shortcut_mode='toggle',
                 effective_hotkey_tokens=('lshift', 'f8'),
-                effective_backend='toggle_shortcut',
             )
-        self.assertEqual(app._diagnostic_trace.begin_attempt.call_args.kwargs['provider'], 'sogou')
+        self.assertEqual(app._diagnostic_trace.begin_attempt.call_args.kwargs['provider'], 'recorded_hotkey')
         fields = app._diagnostic_trace.emit.call_args.kwargs
-        self.assertEqual(fields['provider_shortcut_mode'], 'toggle')
+        self.assertEqual(fields['provider_shortcut_mode'], 'hold')
         self.assertEqual(fields['hotkey_tokens'], ['lshift', 'f8'])
-        self.assertEqual(fields['backend'], 'toggle_shortcut')
+        self.assertEqual(fields['backend'], 'marked_keybd_event')
         self.assertEqual(fields['physicalizer_binding'], 'not_required')
 
     def test_voice_attempt_only_observes_tracker_before_dispatch_receipt(self):
+        from ovb_rc003 import remote_selection
         from ovb_rc003.app import RC003App
         app = RC003App.__new__(RC003App)
         app._voice_shortcut = types.SimpleNamespace()
         app._voice_attempt_id = None
-        app._config = {'voice_program': {'provider': 'custom'}}
+        app._config = {}
+        # RC003 replays the recorded shortcut whatever the legacy provider value
+        # says, so this partial app must declare its profile like __init__ does.
+        app._remote_profile = remote_selection.RC003_PROFILE
         app._diagnostic_trace = mock.Mock()
         app._diagnostic_trace.current_context.return_value = {}
         app._voice_shortcut.controller = types.SimpleNamespace(
             trigger_mode=types.SimpleNamespace(value='hold')
         )
-        app._voice_shortcut.hotkey = types.SimpleNamespace(modifiers=(), key='ralt')
+        app._voice_shortcut.recorded_tokens = lambda: ('ralt',)
         app._voice_key_physicalizer_lifecycle_lock = threading.RLock()
         first = types.SimpleNamespace(
             tracker_generation=17,

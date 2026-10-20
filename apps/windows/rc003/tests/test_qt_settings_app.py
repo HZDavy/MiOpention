@@ -20,6 +20,7 @@ whole point of that design is a real, OS-confirmed hard bound this project
 cannot prove any other way.
 """
 
+import copy
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ from pathlib import Path
 from unittest import mock
 
 from ovb_rc003 import (
+    app_profiles,
     application_update,
     audio_output,
     bridge_control_windows,
@@ -41,6 +43,7 @@ from ovb_rc003 import (
     device_catalog,
     frida_compat,
     hotkey,
+    interception_driver_install,
     key_detection_bridge,
     key_mapping,
     product_identity,
@@ -50,7 +53,6 @@ from ovb_rc003 import (
     shell_targets,
     single_instance,
     vb_cable_bundle,
-    voice_program_manager,
     windows_diagnostics,
 )
 
@@ -91,6 +93,30 @@ if _HAS_PYSIDE6:
 
 
 _SKIP_REASON = "PySide6-Essentials not installed - Qt settings UI not verified here"
+
+_UPDATE_CHECK_ENABLED_PATCH = None
+
+
+def setUpModule() -> None:
+    """Enable online update checks for this module's controller tests only.
+
+    特别版默认停用联网更新检查（``APPLICATION_UPDATE_CHECK_ENABLED`` 为
+    False）。下面的控制器用例仍在验证检查/下载这套机制，因此本模块运行期间
+    临时打开该开关；需要它的 QML 探针脚本在自己的子进程里自行打开。
+    """
+
+    global _UPDATE_CHECK_ENABLED_PATCH
+    _UPDATE_CHECK_ENABLED_PATCH = mock.patch.object(
+        qt_settings_app, "APPLICATION_UPDATE_CHECK_ENABLED", True
+    )
+    _UPDATE_CHECK_ENABLED_PATCH.start()
+
+
+def tearDownModule() -> None:
+    global _UPDATE_CHECK_ENABLED_PATCH
+    if _UPDATE_CHECK_ENABLED_PATCH is not None:
+        _UPDATE_CHECK_ENABLED_PATCH.stop()
+        _UPDATE_CHECK_ENABLED_PATCH = None
 
 
 class DiagnosticsThreadLifecycleAtExitTests(unittest.TestCase):
@@ -256,7 +282,7 @@ class ButtonMappingModelTests(unittest.TestCase):
             "buttonId", "displayName", "hidUsage", "actionText", "isMic",
             "doubleClickText", "longPressText",
             "isSelected", "hotspotX", "hotspotY", "hotspotWidth",
-            "hotspotHeight", "isVoice",
+            "hotspotHeight", "isVoice", "injectMode",
         ):
             self.assertIn(expected, role_names)
 
@@ -420,16 +446,48 @@ class ButtonMappingModelTests(unittest.TestCase):
         model = self.Model()
         self.assertEqual(model.indexOfButton("does_not_exist"), -1)
 
+    def test_inject_mode_role_defaults_to_sendinput_for_every_button(self):
+        model = self.Model()
+        index = model.index(model.index_of("power"), 0)
+        self.assertEqual(
+            model.data(index, model.InjectModeRole),
+            key_mapping.DEFAULT_INJECT_MODE,
+        )
+        self.assertEqual(model.inject_mode_for("power"), "sendinput")
+        self.assertEqual(set(model.to_inject_mode_map().values()), {"sendinput"})
+
+    def test_set_inject_mode_at_updates_the_role_and_signals_only_on_change(self):
+        model = self.Model()
+        changes = []
+        model.mappingEdited.connect(lambda: changes.append(True))
+        row = model.index_of("power")
+
+        model.setInjectModeAt(row, "interception")
+        model.setInjectModeAt(row, "interception")
+
+        index = model.index(row, 0)
+        self.assertEqual(model.data(index, model.InjectModeRole), "interception")
+        self.assertEqual(model.to_inject_mode_map()["power"], "interception")
+        self.assertEqual(len(changes), 1)
+
+    def test_set_inject_mode_at_ignores_an_out_of_range_row(self):
+        model = self.Model()
+        model.setInjectModeAt(999, "interception")
+        self.assertEqual(set(model.to_inject_mode_map().values()), {"sendinput"})
+
+    def test_load_inject_modes_normalizes_persisted_backends(self):
+        model = self.Model()
+        model.load_inject_modes({"power": "interception", "up": "bogus"})
+        power = model.index(model.index_of("power"), 0)
+        up = model.index(model.index_of("up"), 0)
+        self.assertEqual(model.data(power, model.InjectModeRole), "interception")
+        self.assertEqual(model.data(up, model.InjectModeRole), "sendinput")
+        self.assertEqual(model.inject_mode_for("up"), "sendinput")
+
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
 class SettingsControllerTests(unittest.TestCase):
     def setUp(self):
-        profile_patch = mock.patch.object(
-            qt_settings_app.wetype_control_windows, "begin_input_profile_selection",
-            return_value=mock.Mock(result=mock.Mock(return_value=False)),
-        )
-        self._profile_selection_mock = profile_patch.start()
-        self.addCleanup(profile_patch.stop)
         classes = qt_settings_app._load_qt_classes()
         self.Model = classes["ButtonMappingModel"]
         self.Controller = classes["SettingsController"]
@@ -439,9 +497,6 @@ class SettingsControllerTests(unittest.TestCase):
         from PySide6.QtCore import QStandardPaths
         self._desktop = Path(self._tmpdir.name) / "redirected-desktop"
         self._desktop.mkdir()
-        logging_patch = mock.patch("ovb_rc003.chromecast_etw_windows.sensitive_logging_enabled", return_value=True)
-        logging_patch.start()
-        self.addCleanup(logging_patch.stop)
         real_location = QStandardPaths.writableLocation
         desktop_patch = mock.patch.object(
             QStandardPaths, "writableLocation",
@@ -494,54 +549,6 @@ class SettingsControllerTests(unittest.TestCase):
             return_value=True,
         )
         self._hid_helper_consumer_patch.start()
-        self._voice_hotkey_read_patch = mock.patch.object(
-            qt_settings_app.voice_hotkey_sync_windows,
-            "read_provider_hotkey",
-            side_effect=lambda provider_id, **_kwargs: (
-                qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                    str(provider_id),
-                    False,
-                    "local_only",
-                    message="test uses remembered shortcut",
-                )
-            ),
-        )
-        self._voice_hotkey_read_mock = self._voice_hotkey_read_patch.start()
-        self._voice_program_launch_patch = mock.patch.object(
-            qt_settings_app.voice_program_manager, "launch_voice_program",
-            return_value=voice_program_manager.VoiceProgramLaunchResult(
-                "sogou", False, True, "already_running"
-            ),
-        )
-        self._voice_program_launch_mock = self._voice_program_launch_patch.start()
-        self._voice_hotkey_sync_patch = mock.patch.object(
-            qt_settings_app.voice_hotkey_sync_windows,
-            "sync_provider_hotkey",
-            side_effect=lambda provider_id, shortcut, **_kwargs: (
-                qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                    str(provider_id),
-                    True,
-                    "synced",
-                    shortcut,
-                    "test shortcut synchronized",
-                )
-            ),
-        )
-        self._voice_hotkey_sync_mock = self._voice_hotkey_sync_patch.start()
-        self._voice_hotkey_restore_patch = mock.patch.object(
-            qt_settings_app.voice_hotkey_sync_windows,
-            "restore_provider_write",
-            side_effect=lambda provider_id, _receipt, **_kwargs: (
-                qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                    str(provider_id),
-                    True,
-                    "restored",
-                    "lctrl+lshift+f7",
-                    "test provider state restored",
-                )
-            ),
-        )
-        self._voice_hotkey_restore_mock = self._voice_hotkey_restore_patch.start()
         qt_settings_app._vb_cable_test_active_event.clear()
         qt_settings_app._driver_action_active_event.clear()
 
@@ -557,10 +564,6 @@ class SettingsControllerTests(unittest.TestCase):
         self._hid_helper_offer_patch.stop()
         self._startup_rebind_patch.stop()
         self._startup_state_patch.stop()
-        self._voice_hotkey_sync_patch.stop()
-        self._voice_hotkey_restore_patch.stop()
-        self._voice_hotkey_read_patch.stop()
-        self._voice_program_launch_patch.stop()
         self._bridge_status_patch.stop()
         logger = logging.getLogger(qt_settings_app.logging_setup.LOGGER_NAME)
         for handler in list(logger.handlers):
@@ -663,6 +666,67 @@ class SettingsControllerTests(unittest.TestCase):
             controller.trayIconSource.endswith("remote-mic-unavailable.svg")
         )
 
+    def test_per_button_inject_mode_round_trips_through_the_controller(self):
+        controller, _model = self._make_controller()
+        self.assertEqual(controller.buttonInjectMode("power"), "sendinput")
+        options = {
+            option["value"]: option for option in controller.injectModeOptions
+        }
+        self.assertEqual(set(options), {"sendinput", "interception"})
+        self.assertTrue(options["sendinput"]["available"])
+        for option in options.values():
+            self.assertTrue(option["label"])
+            self.assertIsInstance(option["reason"], str)
+        self.assertIsInstance(controller.interceptionAvailable, bool)
+        self.assertIsInstance(controller.interceptionUnavailableHint, str)
+
+        controller.setButtonInjectMode("power", "interception")
+        self.assertEqual(controller.buttonInjectMode("power"), "interception")
+        # An unknown button id is ignored instead of raising.
+        controller.setButtonInjectMode("does_not_exist", "interception")
+
+    def test_interception_driver_install_slots_report_real_outcomes(self):
+        controller, _model = self._make_controller()
+        self.assertIsInstance(controller.interceptionInstallerAvailable, bool)
+
+        with mock.patch.object(
+            interception_driver_install, "install_driver"
+        ) as install:
+            result = controller.installInterceptionDriver()
+        install.assert_called_once_with()
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["cancelled"])
+        self.assertIn("重启", result["message"])
+
+        with mock.patch.object(
+            interception_driver_install, "uninstall_driver"
+        ) as uninstall:
+            result = controller.uninstallInterceptionDriver()
+        uninstall.assert_called_once_with()
+        self.assertTrue(result["ok"])
+
+        # A declined UAC prompt installed nothing: neutral, still not "ok".
+        with mock.patch.object(
+            interception_driver_install,
+            "install_driver",
+            side_effect=interception_driver_install.DriverInstallCancelledError(
+                "用户取消了 UAC 提升请求；未安装或卸载任何驱动。"
+            ),
+        ):
+            result = controller.installInterceptionDriver()
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["cancelled"])
+
+        with mock.patch.object(
+            interception_driver_install,
+            "install_driver",
+            side_effect=interception_driver_install.DriverInstallerError("哈希不匹配"),
+        ):
+            result = controller.installInterceptionDriver()
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["cancelled"])
+        self.assertIn("哈希不匹配", result["message"])
+
     def test_tray_requires_connection_and_a_usable_selected_receiver(self):
         controller, _model = self._make_controller()
         controller._config["remote_selection"] = {
@@ -721,37 +785,6 @@ class SettingsControllerTests(unittest.TestCase):
         )
         self.assertIn("按键接收异常", controller.trayTooltip)
         self.assertGreaterEqual(len(changes), 5)
-
-    def test_chromecast_tray_uses_its_receiver_and_selected_device_name(self):
-        controller, _model = self._make_controller()
-        controller._config["remote_selection"] = {
-            "schema": 1,
-            "active": "c" * 64,
-            "devices": [
-                {"key": "c" * 64, "profile": "chromecast-remote"}
-            ],
-        }
-        controller.remoteSelectionChanged.emit()
-        controller._set_bridge_running(True)
-        controller._set_bridge_connected(True)
-        controller._set_bridge_input_states(
-            bridge_runtime_status.BridgeRuntimeStatus(
-                schema=bridge_runtime_status.SCHEMA_VERSION,
-                state=bridge_runtime_status.BridgeConnectionState.CONNECTED,
-                pid=os.getpid(),
-                updated_at=time.time(),
-                raw_input_state="chromecast_ready",
-                hid_tap_state="failed",
-                voice_key_physicalizer_state="failed",
-            )
-        )
-
-        self.assertTrue(controller.buttonReceiverUsable)
-        self.assertTrue(
-            controller.trayIconSource.endswith("remote-mic-connected.svg")
-        )
-        self.assertIn("谷歌 Chromecast 遥控器", controller.trayTooltip)
-        self.assertNotIn(device_catalog.RC003_DISPLAY_NAME, controller.trayTooltip)
 
     def test_remote_battery_exposes_valid_level_and_clears_when_status_disappears(self):
         controller, _model = self._make_controller()
@@ -2197,113 +2230,18 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertEqual(quit_calls, [True])
 
-    def test_hotkey_text_defaults_to_the_configured_default(self):
+    def test_hotkey_text_defaults_to_nothing_recorded(self):
         controller, _ = self._make_controller()
-        self.assertEqual(controller.hotkeyText, "ralt")
-
-    def test_voice_program_management_defaults_to_optional_and_disabled(self):
-        controller, _ = self._make_controller()
-        self.assertEqual(controller.voiceProgramOptions[0], "请选择语音程序")
-        self.assertEqual(controller.voiceProgramOptions[2], "微信输入法")
-        self.assertEqual(controller.voiceProgramOptions[3], "豆包输入法")
-        self.assertEqual(controller.voiceProgramOptions[4], "Chatterfly")
-        self.assertEqual(len(controller.voiceProgramOptions), 5)
-        self.assertNotIn("自定义程序", controller.voiceProgramOptions)
-        self.assertEqual(controller.selectedVoiceProgramIndex, 0)
-        self.assertFalse(controller.voiceProgramSystemManaged)
-        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
-        self.assertFalse(controller.voiceProgramLaunchElevated)
-        self.assertFalse(controller.voiceProgramSettingsDirty)
-        self.assertEqual(controller.voiceProgramElevationStatus, "unknown")
-        self.assertIn("请选择语音程序", controller.voiceProgramStatusText)
-
-    def test_legacy_custom_load_and_failed_reselection_preserve_saved_settings(self):
-        saved = config.default_config()
-        saved["voice_program"] = {
-            "provider": "custom", "custom_executable": "C:/legacy/voice.exe",
-            "launch_on_bridge_start": True, "launch_elevated": False,
-        }
-        config.set_voice_hotkey_for_provider(saved, "custom", "ctrl+f8", source="manual")
-        path = config.config_path(config.config_root())
-        config.save_config(path, saved)
-        before = path.read_bytes()
-        controller, _ = self._make_controller()
-        self.assertEqual(controller.selectedVoiceProgramIndex, 4)
-        self.assertTrue(controller.voiceProgramCustomSelected)
-        self.assertEqual(controller.voiceProgramCustomPath, "C:/legacy/voice.exe")
-        self.assertEqual(path.read_bytes(), before)
-        with mock.patch.object(config, "save_config", side_effect=OSError("locked")):
-            controller.selectedVoiceProgramIndex = 2
-        self.assertTrue(controller.voiceProgramCustomSelected)
-        self.assertEqual(path.read_bytes(), before)
-        controller.selectedVoiceProgramIndex = 2
-        stored = config.load_config(path)
-        self.assertEqual(stored["voice_program"]["provider"], "wetype")
-        self.assertEqual(stored["voice_program"]["custom_executable"], "C:/legacy/voice.exe")
-        self.assertEqual(config.voice_hotkey_for_provider(stored, "custom"), "ctrl+f8")
-        after = path.read_bytes()
-        controller.selectedVoiceProgramIndex = 4
-        self.assertEqual(controller.selectedVoiceProgramIndex, 2)
-        self.assertEqual(path.read_bytes(), after)
-        reopened, _ = self._make_controller()
-        self.assertEqual(reopened.selectedVoiceProgramIndex, 2)
-        self.assertEqual(path.read_bytes(), after)
-
-    def test_voice_program_status_exposes_actual_elevation_without_parsing_text(self):
-        controller, _ = self._make_controller()
-        for elevated, expected in (
-            (True, "elevated"),
-            (False, "standard"),
-            (None, "unknown"),
-        ):
-            status = voice_program_manager.VoiceProgramStatus(
-                provider_id="sogou",
-                display_name="搜狗输入法",
-                available=True,
-                running=True,
-                elevated=elevated,
-                executable=Path("C:/Program Files/Sogou/voice.exe"),
-                code="running",
-            )
-            with mock.patch.object(
-                qt_settings_app.voice_program_manager,
-                "inspect_voice_program",
-                return_value=status,
-            ):
-                controller._refresh_voice_program_status()
-            self.assertEqual(controller.voiceProgramElevationStatus, expected)
-
-    def test_voice_program_status_refresh_runs_in_a_worker_thread(self):
-        controller, _ = self._make_controller()
-        controller._background_task_runner = None
-        caller_thread = threading.get_ident()
-        worker_threads = []
-        completed = threading.Event()
-
-        def payload(settings):
-            worker_threads.append(threading.get_ident())
-            completed.set()
-            return "后台结果", "running", "standard"
-
-        with mock.patch.object(
-            controller, "_voice_program_status_payload", side_effect=payload
-        ):
-            controller._request_voice_program_status_refresh()
-            self.assertTrue(completed.wait(2.0))
-
-        self.assertEqual(len(worker_threads), 1)
-        self.assertNotEqual(worker_threads[0], caller_thread)
+        self.assertEqual(controller.hotkeyText, "")
 
     def test_background_shutdown_joins_workers_and_suppresses_all_results(self):
         controller, _ = self._make_controller()
         controller._background_task_runner = None
         endpoint_started = threading.Event()
-        status_started = threading.Event()
-        hotkey_started = threading.Event()
+        worker_started = threading.Event()
         release_workers = threading.Event()
-        hotkey_completions = []
+        worker_results = []
         original_options = list(controller.endpointOptions)
-        original_status = controller.voiceProgramStatusText
 
         def endpoint_payload(_config_snapshot):
             endpoint_started.set()
@@ -2316,30 +2254,23 @@ class SettingsControllerTests(unittest.TestCase):
                 "migration_message": "",
             }
 
-        def status_payload(_settings_snapshot):
-            status_started.set()
+        def generic_worker():
+            worker_started.set()
             release_workers.wait(2.0)
-            return "关闭后状态", "running", "standard"
-
-        def hotkey_payload():
-            hotkey_started.set()
-            release_workers.wait(2.0)
-            return "关闭后快捷键"
+            worker_results.append(
+                controller._emit_background_result(
+                    controller._endpointOptionsRefreshReady,
+                    (dict(controller._config), {"options": ["迟到结果"]}),
+                )
+            )
 
         with mock.patch.object(
             controller, "_endpoint_options_payload", side_effect=endpoint_payload
-        ), mock.patch.object(
-            controller, "_voice_program_status_payload", side_effect=status_payload
         ):
             controller._request_endpoint_options_refresh()
-            controller._request_voice_program_status_refresh()
-            controller._submit_voice_hotkey_step(
-                hotkey_payload,
-                lambda ok, payload: hotkey_completions.append((ok, payload)),
-            )
+            controller._start_background_task(generic_worker, "shutdown-test-worker")
             self.assertTrue(endpoint_started.wait(1.0))
-            self.assertTrue(status_started.wait(1.0))
-            self.assertTrue(hotkey_started.wait(1.0))
+            self.assertTrue(worker_started.wait(1.0))
 
             releaser = threading.Timer(0.05, release_workers.set)
             releaser.start()
@@ -2348,9 +2279,7 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertEqual(len(controller._background_threads), 0)
         self.assertEqual(controller.endpointOptions, original_options)
-        self.assertEqual(controller.voiceProgramStatusText, original_status)
-        self.assertEqual(hotkey_completions, [])
-        self.assertFalse(controller.voiceHotkeyBusy)
+        self.assertEqual(worker_results, [False])
 
         controller._on_endpoint_options_refresh_ready(
             (
@@ -2364,16 +2293,7 @@ class SettingsControllerTests(unittest.TestCase):
                 },
             )
         )
-        controller._on_voice_program_status_refresh_ready(
-            (dict(controller._voice_program_settings), ("迟到状态", "running", "standard"))
-        )
-        controller._on_voice_hotkey_task_ready(
-            (controller._voice_hotkey_task_token, (True, "迟到快捷键"))
-        )
         self.assertEqual(controller.endpointOptions, original_options)
-        self.assertEqual(controller.voiceProgramStatusText, original_status)
-        self.assertEqual(hotkey_completions, [])
-
     def test_injected_background_runner_does_not_register_threads(self):
         controller, _ = self._make_controller()
 
@@ -2382,1117 +2302,15 @@ class SettingsControllerTests(unittest.TestCase):
         controller.shutdownBackgroundTasks()
         self.assertTrue(controller._background_shutdown_event.is_set())
 
-    def test_voice_program_status_refresh_coalesces_repeated_requests(self):
-        controller, _ = self._make_controller()
-        controller._voice_program_status_refresh_running = True
-
-        with mock.patch.object(controller, "_schedule_voice_program_status_refresh") as schedule:
-            controller._request_voice_program_status_refresh()
-            controller._request_voice_program_status_refresh()
-            self.assertTrue(controller._voice_program_status_refresh_pending)
-            controller._on_voice_program_status_refresh_ready(
-                (
-                    dict(controller._voice_program_settings),
-                    ("后台结果", "running", "standard"),
-                )
-            )
-
-        self.assertFalse(controller._voice_program_status_refresh_pending)
-        self.assertEqual(controller.voiceProgramStatusText, "后台结果")
-        schedule.assert_called_once_with()
-
-    def test_stale_voice_program_status_result_is_discarded_and_refreshed(self):
-        controller, _ = self._make_controller()
-        old_settings = dict(controller._voice_program_settings)
-        controller._voice_program_settings = voice_program_manager.normalize_voice_program_settings(
-            {"provider": "sogou"}
-        )
-
-        with mock.patch.object(controller, "_schedule_voice_program_status_refresh") as schedule:
-            controller._voice_program_status_refresh_running = True
-            controller._on_voice_program_status_refresh_ready(
-                (old_settings, ("旧结果", "running", "standard"))
-            )
-
-        self.assertNotEqual(controller.voiceProgramStatusText, "旧结果")
-        schedule.assert_called_once_with()
-
-    def test_selecting_a_voice_program_enables_bridge_autostart_automatically(self):
-        controller, _ = self._make_controller()
-
-        controller.selectedVoiceProgramIndex = 1
-
-        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
-        self.assertFalse(controller.voiceProgramSettingsDirty)
-        self.assertFalse(controller.settingsDirty)
-        self.assertTrue(controller.voiceProgramLaunchElevated)
-        saved = config.load_config(config.config_path(config.config_root()))
-        self.assertEqual(saved["voice_program"]["provider"], "sogou")
-        self.assertTrue(saved["voice_program"]["launch_on_bridge_start"])
-        self.assertTrue(saved["voice_program"]["launch_elevated"])
-
-    def test_selecting_wetype_uses_windows_management_without_autostart(self):
-        controller, _ = self._make_controller()
-
-        controller.selectedVoiceProgramIndex = 2
-
-        self.assertTrue(controller.voiceProgramSystemManaged)
-        self.assertFalse(controller.voiceProgramLaunchable)
-        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
-        self.assertFalse(controller.voiceProgramSettingsDirty)
-
-    def test_selecting_chatterfly_uses_menu_mode_and_requires_own_shortcut(self):
-        controller, _ = self._make_controller()
-
-        controller.selectVoiceProgramMenuOption(3)
-
-        self.assertTrue(controller.voiceProgramChatterflySelected)
-        self.assertEqual(controller.selectedVoiceProgramIndex, 5)
-        self.assertEqual(controller.voiceProgramMenuIndex, 3)
-        self.assertTrue(controller.voiceProgramSystemManaged)
-        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
-        self.assertEqual(controller.holdVoiceHotkeyText, "")
-        saved = config.load_config(config.config_path(config.config_root()))
-        self.assertEqual(saved["voice_program"]["provider"], "chatterfly")
-        self.assertEqual(config.voice_hotkey_for_provider(saved, "chatterfly"), "")
-
-    def test_selecting_doubao_uses_the_direct_adapter_without_autostart(self):
-        controller, _ = self._make_controller()
-
-        controller.selectedVoiceProgramIndex = 3
-
-        self.assertTrue(controller.voiceProgramDoubaoSelected)
-        self.assertFalse(controller.voiceProgramSystemManaged)
-        self.assertFalse(controller.voiceProgramLaunchable)
-        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
-        saved = config.load_config(config.config_path(config.config_root()))
-        self.assertEqual(saved["voice_program"]["provider"], "doubao_ime")
-
-    def test_selecting_sogou_adopts_and_remembers_its_detected_shortcut(self):
-        self._voice_hotkey_read_mock.side_effect = None
-        self._voice_hotkey_read_mock.return_value = (
-            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "sogou",
-                True,
-                "read",
-                "lctrl+lshift+f9",
-                "read from Sogou",
-            )
-        )
-        controller, _ = self._make_controller()
-
-        controller.selectedVoiceProgramIndex = 1
-
-        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
-        saved = config.load_config(config.config_path(config.config_root()))
-        self.assertEqual(
-            saved["voice_hotkeys_by_provider"]["sogou"]["hold"],
-            "lctrl+lshift+f9",
-        )
-
-    def test_selecting_sogou_launches_after_save_without_restarting_running_service(self):
-        controller, _ = self._make_controller()
-        controller._set_bridge_running(True)
-        def launch(settings):
-            saved = config.load_config(config.config_path(config.config_root()))
-            self.assertEqual(saved["voice_program"]["provider"], "sogou")
-            self.assertTrue(settings["launch_elevated"])
-            return voice_program_manager.VoiceProgramLaunchResult("sogou", True, False, "started")
-        self._voice_program_launch_mock.side_effect = launch
-        with mock.patch.object(controller, "_begin_bridge_restart") as restart:
-            controller.selectedVoiceProgramIndex = 1
-        self._voice_program_launch_mock.assert_called_once()
-        restart.assert_not_called()
-        self.assertTrue(controller._bridge_running)
-        self.assertFalse(controller.voiceHotkeyBusy)
-
-    def test_selecting_sogou_reports_missing_failed_and_cancelled_launch(self):
-        for code, text in (("not_found", "未找到搜狗语音程序，请先安装或手动启动"),
-                           ("launch_failed", "启动失败，请手动启动"),
-                           ("cancelled", "已取消启动搜狗语音程序")):
-            with self.subTest(code=code):
-                controller, _ = self._make_controller()
-                controller.selectedVoiceProgramIndex = 2
-                self._voice_program_launch_mock.return_value = (
-                    voice_program_manager.VoiceProgramLaunchResult("sogou", False, False, code)
-                )
-                controller.selectedVoiceProgramIndex = 1
-                self.assertIn(text, controller.errorMessage + controller.statusMessage)
-                self.assertFalse(controller.voiceHotkeyBusy)
-
-    def test_failed_sogou_selection_save_never_launches(self):
-        controller, _ = self._make_controller()
-        with mock.patch.object(controller, "_update_and_persist_voice_program", return_value=False):
-            controller.selectedVoiceProgramIndex = 1
-        self._voice_program_launch_mock.assert_not_called()
-
-    def test_other_provider_selection_and_hotkey_refresh_do_not_launch(self):
-        controller, _ = self._make_controller()
-        for provider in (2, 3):
-            controller.selectedVoiceProgramIndex = provider
-        self._voice_program_launch_mock.assert_not_called()
-        controller.selectedVoiceProgramIndex = 1
-        self._voice_program_launch_mock.reset_mock()
-        controller.loadVoiceHotkeyFromProvider()
-        self._voice_program_launch_mock.assert_not_called()
-
-    def test_profile_selection_starts_after_save_and_holds_busy_until_finished(self):
-        controller, _ = self._make_controller()
-        pending = []
-        def begin(provider, **kwargs):
-            saved = config.load_config(config.config_path(config.config_root()))
-            self.assertEqual(saved["voice_program"]["provider"], provider)
-            self.assertTrue(controller.voiceHotkeyBusy)
-            return mock.Mock(result=lambda: True)
-        self._profile_selection_mock.side_effect = begin
-        original = controller._submit_voice_hotkey_step
-        def submit(callback, completion, **kwargs):
-            if kwargs.get("cancel_event") is not None:
-                pending.append((callback, completion))
-            else:
-                original(callback, completion, **kwargs)
-        with mock.patch.object(controller, "_submit_voice_hotkey_step", side_effect=submit):
-            controller.selectedVoiceProgramIndex = 3
-        self.assertTrue(controller.voiceHotkeyBusy)
-        controller.selectedVoiceProgramIndex = 2
-        self.assertTrue(controller.voiceProgramDoubaoSelected)
-        callback, completion = pending.pop()
-        completion(True, callback())
-        self.assertFalse(controller.voiceHotkeyBusy)
-
-    def test_profile_selection_failure_keeps_saved_choice_and_unlocks(self):
-        controller, _ = self._make_controller()
-        self._profile_selection_mock.side_effect = OSError("busy")
-        controller.selectedVoiceProgramIndex = 3
-        self.assertTrue(controller.voiceProgramDoubaoSelected)
-        self.assertFalse(controller.voiceHotkeyBusy)
-        self.assertIn("选择已保存", controller.errorMessage)
-
-    def test_failed_provider_save_does_not_switch_input_profile(self):
-        controller, _ = self._make_controller()
-        with mock.patch.object(controller, "_update_and_persist_voice_program", return_value=False):
-            controller.selectedVoiceProgramIndex = 3
-        self._profile_selection_mock.assert_not_called()
-
-    def test_profile_selection_does_not_switch_during_current_recording(self):
-        controller, _ = self._make_controller()
-        controller._voice_runtime_state = bridge_runtime_status.VOICE_RUNTIME_ACTIVE
-        controller.selectedVoiceProgramIndex = 3
-        self.assertTrue(controller.voiceProgramDoubaoSelected)
-        self._profile_selection_mock.assert_not_called()
-        self.assertFalse(controller.voiceHotkeyBusy)
-
-    def test_selecting_wetype_loads_its_saved_shortcut(self):
-        controller, _ = self._make_controller()
-
-        controller.selectedVoiceProgramIndex = 2
-
-        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lwin")
-        self.assertEqual(controller.errorMessage, "")
-
-    def test_empty_manual_wetype_value_falls_back_to_automatic_read(self):
-        path = config.config_path(config.config_root())
-        path.parent.mkdir(parents=True, exist_ok=True)
-        data = config.default_config()
-        data["voice_hotkeys_by_provider"]["wetype"] = {
-            "hold": "",
-            "source": config.VOICE_HOTKEY_SOURCE_MANUAL,
-        }
-        path.write_text(json.dumps(data), encoding="utf-8")
-        self._voice_hotkey_read_mock.side_effect = None
-        self._voice_hotkey_read_mock.return_value = (
-            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "wetype",
-                True,
-                "read",
-                "lctrl+lwin",
-                "read from WeType",
-            )
-        )
-        controller, _ = self._make_controller()
-
-        controller.selectedVoiceProgramIndex = 2
-
-        self._voice_hotkey_read_mock.assert_called_with("wetype")
-        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lwin")
-        self.assertEqual(controller.voiceHotkeySource, "auto")
-
-    def test_empty_wetype_value_stays_selected_when_automatic_read_fails(self):
-        path = config.config_path(config.config_root())
-        path.parent.mkdir(parents=True, exist_ok=True)
-        data = config.default_config()
-        data["voice_hotkeys_by_provider"]["wetype"] = {
-            "hold": "",
-            "source": config.VOICE_HOTKEY_SOURCE_MANUAL,
-        }
-        path.write_text(json.dumps(data), encoding="utf-8")
-        self._voice_hotkey_read_mock.side_effect = None
-        self._voice_hotkey_read_mock.return_value = (
-            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "wetype",
-                False,
-                "read_failed",
-                message="automatic read failed",
-            )
-        )
-        controller, _ = self._make_controller()
-
-        controller.selectedVoiceProgramIndex = 2
-
-        self.assertEqual(controller.selectedVoiceProgramIndex, 2)
-        self.assertEqual(controller.holdVoiceHotkeyText, "")
-        self.assertEqual(controller.voiceHotkeySource, "default")
-        self.assertIn("录入", controller.errorMessage)
-        self.assertNotIn("hotkey text must not be empty", controller.errorMessage)
-        saved = config.load_config(path)
-        self.assertEqual(saved["voice_program"]["provider"], "wetype")
-        self.assertEqual(
-            saved["voice_hotkeys_by_provider"]["wetype"],
-            {"hold": "", "source": config.VOICE_HOTKEY_SOURCE_DEFAULT},
-        )
-
-    def test_valid_manual_wetype_value_keeps_priority_and_is_identifiable(self):
-        data = config.default_config()
-        config.set_voice_hotkey_for_provider(
-            data,
-            "wetype",
-            "lctrl+lshift+f9",
-            source=config.VOICE_HOTKEY_SOURCE_MANUAL,
-        )
-        config.save_config(config.config_path(config.config_root()), data)
-        controller, _ = self._make_controller()
-        self._voice_hotkey_read_mock.reset_mock()
-
-        controller.selectedVoiceProgramIndex = 2
-
-        self._voice_hotkey_read_mock.assert_not_called()
-        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
-        self.assertEqual(controller.voiceHotkeySource, "manual")
-
-    def test_selecting_doubao_adopts_and_saves_its_detected_shortcut(self):
-        self._voice_hotkey_read_mock.side_effect = None
-        self._voice_hotkey_read_mock.return_value = (
-            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "doubao_ime",
-                True,
-                "read",
-                "ralt",
-                "read from Doubao",
-            )
-        )
-        controller, _ = self._make_controller()
-
-        controller.selectedVoiceProgramIndex = 3
-
-        self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
-        saved = config.load_config(config.config_path(config.config_root()))
-        self.assertEqual(
-            saved["voice_hotkeys_by_provider"]["doubao_ime"]["hold"],
-            "ralt",
-        )
-
-    def test_wetype_saves_direct_shortcut_edits_locally(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
-        self._voice_hotkey_sync_mock.reset_mock()
-
-        controller.holdVoiceHotkeyText = "ctrl+shift+f9"
-
-        self.assertEqual(controller.holdVoiceHotkeyText, "ctrl+shift+f9")
-        self.assertEqual(controller.voiceHotkeySaveState, "saved")
-        self._voice_hotkey_sync_mock.assert_called_once_with(
-            "wetype", "ctrl+shift+f9"
-        )
-        saved = config.load_config(config.config_path(config.config_root()))
-        self.assertEqual(
-            saved["voice_hotkeys_by_provider"]["wetype"]["hold"],
-            "ctrl+shift+f9",
-        )
-
-    def test_provider_sync_failure_restores_the_previous_shortcut(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        previous = controller.holdVoiceHotkeyText
-        self._voice_hotkey_sync_mock.side_effect = None
-        self._voice_hotkey_sync_mock.return_value = (
-            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "sogou",
-                False,
-                "write_failed",
-                message="Sogou rejected shortcut",
-            )
-        )
-
-        controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
-
-        self.assertEqual(controller.holdVoiceHotkeyText, previous)
-        self.assertIn("Sogou rejected", controller.errorMessage)
-        self.assertEqual(controller.voiceHotkeySaveState, "retry")
-
-    def test_reentering_the_current_provider_refreshes_its_shortcut(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        self._voice_hotkey_read_mock.reset_mock()
-
-        controller.selectedVoiceProgramIndex = 1
-
-        self._voice_hotkey_read_mock.assert_called_once_with("sogou")
-        self.assertFalse(controller.voiceHotkeyBusy)
-
-    def test_reentering_the_same_hotkey_still_synchronizes_the_provider(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        current = controller.holdVoiceHotkeyText
-        self._voice_hotkey_sync_mock.reset_mock()
-
-        controller.holdVoiceHotkeyText = current
-
-        self._voice_hotkey_sync_mock.assert_called_once_with(
-            "sogou", current, cancel_event=mock.ANY
-        )
-        self.assertFalse(controller.voiceHotkeyBusy)
-        self.assertEqual(controller.voiceHotkeySaveState, "saved")
-
-    def test_provider_sync_exception_keeps_the_saved_shortcut_and_clears_busy(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        previous = controller.holdVoiceHotkeyText
-        self._voice_hotkey_sync_mock.side_effect = OSError("provider unavailable")
-
-        controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
-
-        self.assertEqual(controller.holdVoiceHotkeyText, previous)
-        self.assertFalse(controller.voiceHotkeyBusy)
-        self.assertIn("provider unavailable", controller.errorMessage)
-        self.assertEqual(controller.voiceHotkeySaveState, "retry")
-
-    def test_failed_provider_value_adoption_restores_the_saved_display(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        previous = controller.holdVoiceHotkeyText
-        self._voice_hotkey_sync_mock.side_effect = None
-        self._voice_hotkey_sync_mock.return_value = (
-            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "sogou",
-                False,
-                "rollback_failed",
-                "lctrl+lshift+f8",
-                "provider remains changed",
-            )
-        )
-
-        with mock.patch.object(
-            config, "save_config", side_effect=OSError("settings file is locked")
-        ):
-            controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
-
-        self.assertEqual(controller.holdVoiceHotkeyText, previous)
-        self.assertIn("两边仍不一致", controller.errorMessage)
-
-    def test_readback_failure_restores_disk_ui_and_provider_to_previous_hotkey(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        previous = controller.holdVoiceHotkeyText
-        config_path = config.config_path(config.config_root())
-        previous_bytes = config_path.read_bytes()
-        receipt = (
-            qt_settings_app.voice_hotkey_sync_windows.SogouWriteReceipt(
-                b"provider-before",
-                b"provider-after",
-            )
-        )
-        self._voice_hotkey_sync_mock.side_effect = [
-            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "sogou",
-                True,
-                "synced",
-                "lctrl+lshift+f9",
-                "shortcut synchronized",
-                written_sha256="new-digest",
-                write_receipt=receipt,
-            ),
-        ]
-        self._voice_hotkey_restore_mock.side_effect = None
-        self._voice_hotkey_restore_mock.return_value = (
-            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "sogou", True, "restored", previous, "shortcut restored"
-            )
-        )
-
-        with mock.patch.object(
-            config,
-            "load_config",
-            side_effect=config.ConfigFormatError("readback failed"),
-        ):
-            controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
-
-        self.assertEqual(config_path.read_bytes(), previous_bytes)
-        self.assertEqual(controller.holdVoiceHotkeyText, previous)
-        self.assertFalse(controller.voiceHotkeyBusy)
-        self.assertIn("语音程序快捷键已恢复原值", controller.errorMessage)
-        self.assertEqual(
-            self._voice_hotkey_sync_mock.call_args_list,
-            [
-                mock.call("sogou", "lctrl+lshift+f9", cancel_event=mock.ANY),
-            ],
-        )
-        self._voice_hotkey_restore_mock.assert_called_once_with(
-            "sogou",
-            receipt,
-            cancel_event=mock.ANY,
-        )
-
-    def test_failed_local_save_reports_when_provider_rollback_also_fails(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        previous = controller.holdVoiceHotkeyText
-        receipt = (
-            qt_settings_app.voice_hotkey_sync_windows.SogouWriteReceipt(
-                b"provider-before",
-                b"provider-after",
-            )
-        )
-        self._voice_hotkey_sync_mock.side_effect = [
-            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "sogou",
-                True,
-                "synced",
-                "lctrl+lshift+f9",
-                "shortcut synchronized",
-                written_sha256="new-digest",
-                write_receipt=receipt,
-            ),
-        ]
-        self._voice_hotkey_restore_mock.side_effect = None
-        self._voice_hotkey_restore_mock.return_value = (
-            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "sogou",
-                False,
-                "write_failed",
-                message="rollback failed",
-            )
-        )
-
-        with mock.patch.object(
-            config, "save_config", side_effect=OSError("settings file is locked")
-        ):
-            controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
-
-        self.assertEqual(controller.holdVoiceHotkeyText, previous)
-        self.assertIn("语音设置保存失败", controller.errorMessage)
-        self.assertIn("第三方程序快捷键也未能恢复", controller.errorMessage)
-        self.assertEqual(
-            self._voice_hotkey_sync_mock.call_args_list,
-            [
-                mock.call("sogou", "lctrl+lshift+f9", cancel_event=mock.ANY),
-            ],
-        )
-        self._voice_hotkey_restore_mock.assert_called_once_with(
-            "sogou",
-            receipt,
-            cancel_event=mock.ANY,
-        )
-
-    def test_refresh_adopts_an_external_provider_change(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        self._voice_hotkey_read_mock.side_effect = None
-        self._voice_hotkey_read_mock.return_value = (
-            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "sogou",
-                True,
-                "read",
-                "lctrl+lshift+f9",
-                "read from Sogou",
-            )
-        )
-
-        controller.refreshVoiceHotkeyFromProvider()
-
-        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
-        saved = config.load_config(config.config_path(config.config_root()))
-        self.assertEqual(
-            saved["voice_hotkeys_by_provider"]["sogou"]["hold"],
-            "lctrl+lshift+f9",
-        )
-        self.assertEqual(controller.voiceHotkeySaveState, "saved")
-
-    def test_refresh_reads_and_saves_an_external_wetype_change(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
-        self._voice_hotkey_read_mock.side_effect = None
-        self._voice_hotkey_read_mock.return_value = (
-            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "wetype",
-                True,
-                "read",
-                "lctrl+lshift+f9",
-                "read from WeType",
-            )
-        )
-
-        controller.refreshVoiceHotkeyFromProvider()
-
-        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
-        saved = config.load_config(config.config_path(config.config_root()))
-        self.assertEqual(
-            saved["voice_hotkeys_by_provider"]["wetype"]["hold"],
-            "lctrl+lshift+f9",
-        )
-        self.assertEqual(controller.voiceHotkeySaveState, "saved")
-        self.assertTrue(self._voice_hotkey_read_mock.call_args.kwargs["allow_settings_window"])
-
-    def test_wetype_automatic_load_and_reselection_do_not_open_settings(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
-        self.assertNotIn("正在读取", controller.statusMessage)
-        self._voice_hotkey_read_mock.reset_mock()
-        controller.loadVoiceHotkeyFromProvider()
-        controller.selectedVoiceProgramIndex = 2
-        self._voice_hotkey_read_mock.assert_not_called()
-
-    def test_wetype_refresh_failures_preserve_manual_value_source_and_disk(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
-        controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
-        path = config.config_path(config.config_root())
-        previous = path.read_bytes()
-        for code in ("open_failed", "timeout", "navigation_failed", "read_failed"):
-            with self.subTest(code=code):
-                self._voice_hotkey_read_mock.side_effect = None
-                self._voice_hotkey_read_mock.return_value = qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                    "wetype", False, code, message=code,
-                )
-                controller.refreshVoiceHotkeyFromProvider()
-                self.assertEqual(path.read_bytes(), previous)
-                self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
-                self.assertEqual(controller.voiceHotkeySource, "manual")
-                self.assertIn("已保留当前快捷键", controller.errorMessage)
-                self.assertFalse(controller.voiceHotkeyBusy)
-
-    def test_wetype_refresh_page_change_cancels_and_discards_late_success(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
-        controller.activePageIndex = 2
-        path = config.config_path(config.config_root())
-        previous = path.read_bytes()
-
-        def read(_provider, **kwargs):
-            controller.activePageIndex = 0
-            self.assertTrue(kwargs["cancel_event"].is_set())
-            return qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "wetype", True, "read", "ralt", "read",
-            )
-
-        self._voice_hotkey_read_mock.side_effect = read
-        controller.refreshVoiceHotkeyFromProvider()
-        self.assertEqual(path.read_bytes(), previous)
-        self.assertIn("刷新已取消", controller.errorMessage)
-        self.assertFalse(controller.voiceHotkeyBusy)
-
-    def test_wetype_refresh_timeout_cancels_and_ignores_late_result(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
-        previous = controller.holdVoiceHotkeyText
-        pending = []
-        controller._background_task_runner = lambda callback, _name: pending.append(callback)
-        controller.refreshVoiceHotkeyFromProvider()
-        cancellation = controller._wetype_hotkey_refresh_cancel
-        controller._on_voice_hotkey_task_timeout()
-        self.assertTrue(cancellation.is_set())
-        self.assertFalse(controller.voiceHotkeyBusy)
-        self.assertIn("超时", controller.errorMessage)
-        pending.pop()()
-        self.assertEqual(controller.holdVoiceHotkeyText, previous)
-        self.assertFalse(controller.voiceHotkeyBusy)
-        self.assertIn("超时", controller.errorMessage)
-
-    def test_sogou_shutdown_reports_a_stalled_provider_transaction(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        entered = threading.Event()
-        release = threading.Event()
-
-        def stalled_sync(provider_id, shortcut, **kwargs):
-            self.assertEqual(provider_id, "sogou")
-            entered.set()
-            release.wait(1.0)
-            return qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                provider_id,
-                False,
-                "cancelled",
-                message="cancelled",
-            )
-
-        self._voice_hotkey_sync_mock.side_effect = stalled_sync
-        controller._background_task_runner = None
-        controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
-        self.assertTrue(entered.wait(1.0))
-        with mock.patch.object(
-            qt_settings_app,
-            "_SETTINGS_BACKGROUND_JOIN_TIMEOUT_SECONDS",
-            0.01,
-        ):
-            self.assertFalse(controller.shutdownBackgroundTasks())
-
-        self.assertTrue(controller.voiceHotkeyBusy)
-        self.assertTrue(
-            self._voice_hotkey_sync_mock.call_args.kwargs["cancel_event"].is_set()
-        )
-        release.set()
-        for thread in list(controller._background_threads):
-            thread.join(1.0)
-
-    def test_sogou_shutdown_does_not_treat_an_undelivered_result_as_settled(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        pending = []
-        controller._background_task_runner = (
-            lambda callback, _name: pending.append(callback)
-        )
-        controller._emit_background_result = mock.Mock(return_value=False)
-        self._voice_hotkey_sync_mock.return_value = (
-            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-                "sogou",
-                True,
-                "synced",
-                "lctrl+lshift+f9",
-                "synced",
-                written_sha256="receipt",
-            )
-        )
-
-        controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
-        pending.pop()()
-
-        self.assertFalse(controller.shutdownBackgroundTasks())
-        self.assertTrue(controller.voiceHotkeyBusy)
-
-    def test_wetype_refresh_local_save_failure_restores_manual_value_and_source(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
-        controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
-        path = config.config_path(config.config_root())
-        previous = path.read_bytes()
-        self._voice_hotkey_read_mock.side_effect = None
-        self._voice_hotkey_read_mock.return_value = qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-            "wetype", True, "read", "lctrl+lwin", "read",
-        )
-        with mock.patch.object(config, "save_config", side_effect=OSError("locked")):
-            controller.refreshVoiceHotkeyFromProvider()
-        self.assertEqual(path.read_bytes(), previous)
-        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
-        self.assertEqual(controller.voiceHotkeySource, "manual")
-        self.assertEqual(controller.voiceHotkeySaveState, "retry")
-        self.assertFalse(controller.voiceHotkeyBusy)
-
-    def test_wetype_refresh_does_not_open_during_confirmed_mic_or_audio(self):
-        for state in (bridge_runtime_status.VOICE_RUNTIME_MIC_CONFIRMED, bridge_runtime_status.VOICE_RUNTIME_RECEIVING_AUDIO):
-            with self.subTest(state=state):
-                controller, _ = self._make_controller()
-                controller.selectedVoiceProgramIndex = 2
-                self._voice_hotkey_read_mock.reset_mock()
-                controller._voice_runtime_state = state
-                controller.refreshVoiceHotkeyFromProvider()
-                self._voice_hotkey_read_mock.assert_not_called()
-
-    def test_wetype_refresh_runtime_update_cancels_worker(self):
-        controller, _ = self._make_controller()
-        controller._wetype_hotkey_refresh_cancel = threading.Event()
-        status = bridge_runtime_status.BridgeRuntimeStatus(
-            schema=bridge_runtime_status.SCHEMA_VERSION,
-            state=bridge_runtime_status.BridgeConnectionState.CONNECTED,
-            pid=os.getpid(), updated_at=time.time(),
-            voice_runtime_state=bridge_runtime_status.VOICE_RUNTIME_RECEIVING_AUDIO,
-            voice_runtime_provider="wetype",
-        )
-        controller._set_bridge_input_states(status)
-        self.assertTrue(controller._wetype_hotkey_refresh_cancel.is_set())
-
-    def test_refreshing_local_only_provider_does_not_leave_processing_status(self):
-        controller, _ = self._make_controller()
-        controller._set_status_message("existing voice result", 2)
-
-        controller.refreshVoiceHotkeyFromProvider()
-
-        self.assertFalse(controller.voiceHotkeyBusy)
-        self.assertEqual(controller.statusMessage, "existing voice result")
-        self._voice_hotkey_read_mock.assert_not_called()
-
-    def test_refresh_is_blocked_while_capturing_or_voice_is_active(self):
-        blockers = (
-            (
-                "saving",
-                lambda controller: controller._set_settings_save_busy(True),
-            ),
-            (
-                "capture",
-                lambda controller: controller._set_input_operation_state(
-                    "hotkey", "active"
-                ),
-            ),
-            (
-                "speaking",
-                lambda controller: setattr(
-                    controller,
-                    "_voice_runtime_state",
-                    bridge_runtime_status.VOICE_RUNTIME_ACTIVE,
-                ),
-            ),
-            (
-                "finishing",
-                lambda controller: setattr(
-                    controller,
-                    "_voice_runtime_state",
-                    bridge_runtime_status.VOICE_RUNTIME_FINISHING,
-                ),
-            ),
-        )
-
-        for name, block in blockers:
-            with self.subTest(name=name):
-                controller, _ = self._make_controller()
-                controller.selectedVoiceProgramIndex = 1
-                self._voice_hotkey_read_mock.reset_mock()
-                block(controller)
-
-                controller.refreshVoiceHotkeyFromProvider()
-
-                self.assertFalse(controller.voiceHotkeyBusy)
-                self._voice_hotkey_read_mock.assert_not_called()
-
-    def test_refresh_rechecks_runtime_before_starting_provider_read(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        self._voice_hotkey_read_mock.reset_mock()
-
-        def refresh_runtime():
-            controller._voice_runtime_state = (
-                bridge_runtime_status.VOICE_RUNTIME_ACTIVE
-            )
-            return True
-
-        with mock.patch.object(
-            controller,
-            "_refresh_bridge_status",
-            side_effect=refresh_runtime,
-        ):
-            controller.refreshVoiceHotkeyFromProvider()
-
-        self.assertFalse(controller.voiceHotkeyBusy)
-        self._voice_hotkey_read_mock.assert_not_called()
-
-    def test_refresh_fails_closed_when_live_runtime_cannot_be_read(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        self._voice_hotkey_read_mock.reset_mock()
-
-        with mock.patch.object(
-            controller,
-            "_refresh_bridge_status",
-            return_value=None,
-        ):
-            controller.refreshVoiceHotkeyFromProvider()
-
-        self.assertFalse(controller.voiceHotkeyBusy)
-        self._voice_hotkey_read_mock.assert_not_called()
-
-    def test_refresh_discards_result_when_voice_starts_during_provider_read(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        previous = controller.holdVoiceHotkeyText
-        controller._set_voice_hotkey_busy(True)
-        result = qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
-            "sogou",
-            True,
-            "read",
-            "lctrl+lshift+f9",
-            "read from Sogou",
-        )
-
-        def refresh_runtime():
-            controller._voice_runtime_state = (
-                bridge_runtime_status.VOICE_RUNTIME_ACTIVE
-            )
-            return True
-
-        with mock.patch.object(
-            controller,
-            "_refresh_bridge_status",
-            side_effect=refresh_runtime,
-        ), mock.patch.object(controller, "_persist_voice_settings") as persist:
-            controller._on_voice_hotkey_refresh_ready(True, True, result)
-
-        self.assertEqual(controller.holdVoiceHotkeyText, previous)
-        self.assertFalse(controller.voiceHotkeyBusy)
-        self.assertIn("本次未刷新语音按键", controller.statusMessage)
-        persist.assert_not_called()
-
-    def test_voice_program_options_keep_missing_apps_and_mark_them(self):
-        controller, _ = self._make_controller()
-
-        def inspect(settings):
-            provider_id = settings["provider"]
-            return voice_program_manager.VoiceProgramStatus(
-                provider_id=provider_id,
-                display_name=voice_program_manager.VOICE_PROGRAM_PROVIDER_NAMES[
-                    provider_id
-                ],
-                available=provider_id != voice_program_manager.VOICE_PROGRAM_SOGOU,
-                running=False,
-                elevated=None,
-                executable=None,
-                code=(
-                    "not_found"
-                    if provider_id == voice_program_manager.VOICE_PROGRAM_SOGOU
-                    else "stopped"
-                ),
-            )
-
-        with mock.patch.object(
-            qt_settings_app.voice_program_manager,
-            "inspect_voice_program",
-            side_effect=inspect,
-        ):
-            controller.refreshVoiceProgramOptions()
-
-        self.assertEqual(controller.voiceProgramOptions[1], "搜狗语音输入（未安装）")
-        self.assertEqual(controller.voiceProgramOptions[2], "微信输入法")
-        self.assertEqual(controller.voiceProgramOptions[3], "豆包输入法")
-        self.assertEqual(controller.voiceProgramOptions[4], "Chatterfly")
-        self.assertEqual(len(controller.voiceProgramOptions), 5)
-
-    def test_unrelated_mapping_edit_does_not_mark_voice_program_dirty(self):
-        controller, model = self._make_controller()
-
-        model.setActionTextAt(model.index_of("power"), "f5")
-
-        self.assertTrue(controller.settingsDirty)
-        self.assertFalse(controller.voiceProgramSettingsDirty)
-
-    def test_retired_none_selection_cannot_disable_selected_program(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        controller.voiceProgramLaunchElevated = False
-
-        controller.selectedVoiceProgramIndex = 0
-
-        self.assertEqual(controller.selectedVoiceProgramIndex, 1)
-        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
-        self.assertFalse(controller.voiceProgramLaunchElevated)
-
-    def test_rejected_none_selection_preserves_saved_program_after_reopen(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        controller.voiceProgramLaunchElevated = False
-        controller.selectedVoiceProgramIndex = 0
-
-        self.assertTrue(controller.saveSettings())
-
-        reopened, _ = self._make_controller()
-        self.assertEqual(reopened.selectedVoiceProgramIndex, 1)
-        self.assertTrue(reopened.voiceProgramLaunchOnBridgeStart)
-        self.assertFalse(reopened.voiceProgramLaunchElevated)
-
-    def test_sogou_and_custom_elevation_preferences_are_remembered_separately(self):
-        saved = config.default_config()
-        saved["voice_program"]["provider"] = "custom"
-        config.save_config(config.config_path(config.config_root()), saved)
-        controller, _ = self._make_controller()
-        self.assertFalse(controller.voiceProgramLaunchElevated)
-        controller.voiceProgramLaunchElevated = True
-        reopened, _ = self._make_controller()
-        self.assertEqual(reopened.selectedVoiceProgramIndex, 4)
-        self.assertTrue(reopened.voiceProgramLaunchElevated)
-        reopened.selectedVoiceProgramIndex = 1
-        self.assertTrue(reopened.voiceProgramLaunchElevated)
-        reopened.voiceProgramLaunchElevated = False
-        self.assertFalse(reopened.voiceProgramLaunchElevated)
-        self.assertTrue(reopened._voice_program_settings["launch_elevated_by_provider"]["custom"])
-        reopened.selectedVoiceProgramIndex = 4
-        self.assertEqual(reopened.selectedVoiceProgramIndex, 1)
-
-    def test_existing_sogou_false_uses_automatic_start_without_changing_elevation(self):
-        saved = config.default_config()
-        saved["voice_program"] = {
-            "provider": "sogou",
-            "custom_executable": "",
-            "launch_on_bridge_start": False,
-            "launch_elevated": False,
-        }
-        config.save_config(config.config_path(config.config_root()), saved)
-
-        controller, _ = self._make_controller()
-
-        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
-        self.assertFalse(controller.voiceProgramLaunchElevated)
-        self.assertFalse(controller.voiceProgramSettingsDirty)
-        self.assertFalse(controller.settingsDirty)
-        self.assertNotIn("随桥接启动", controller.statusMessage)
-
-    def test_voice_program_settings_persist_without_the_mapping_save(self):
-        executable = Path(self._tmpdir.name) / "voice.exe"
-        executable.touch()
-        saved = config.default_config()
-        saved["voice_program"]["provider"] = "custom"
-        config.save_config(config.config_path(config.config_root()), saved)
-        controller, _ = self._make_controller()
-        controller.voiceProgramCustomPath = str(executable)
-        controller.voiceProgramLaunchOnBridgeStart = True
-        controller.voiceProgramLaunchElevated = True
-
-        self.assertFalse(controller.settingsDirty)
-        self.assertFalse(controller.voiceProgramSettingsDirty)
-
-        saved = config.load_config(config.config_path(config.config_root()))
-        self.assertEqual(
-            saved["voice_program"],
-            {
-                "provider": "custom",
-                "custom_executable": str(executable),
-                "launch_on_bridge_start": True,
-                "launch_on_bridge_start_by_provider": {"custom": True},
-                "launch_elevated": True,
-                "launch_elevated_by_provider": {
-                    "sogou": True,
-                    "custom": True,
-                },
-            },
-        )
-
-    def test_voice_auto_save_failure_restores_the_last_saved_values(self):
-        controller, _ = self._make_controller()
-
-        with mock.patch.object(
-            config, "save_config", side_effect=OSError("settings file is locked")
-        ):
-            controller.selectedVoiceProgramIndex = 1
-
-        self.assertEqual(controller.selectedVoiceProgramIndex, 0)
-        self.assertFalse(controller.voiceProgramSettingsDirty)
-        self.assertIn("语音设置保存失败", controller.errorMessage)
-
-        with mock.patch.object(
-            config, "save_config", side_effect=OSError("settings file is locked")
-        ):
-            controller.holdVoiceHotkeyText = "ctrl+l"
-
-        self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
-        self.assertIn("语音设置保存失败", controller.errorMessage)
-
-    def test_voice_start_preferences_survive_program_switch_and_reopen(self):
-        saved = config.default_config()
-        saved["voice_program"] = {"provider": "custom",
-                                  "launch_on_bridge_start_by_provider": {"custom": True}}
-        config.save_config(config.config_path(config.config_root()), saved)
-        controller, _ = self._make_controller()
-        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
-        with mock.patch.object(config, "save_config", side_effect=OSError("locked")):
-            controller.voiceProgramLaunchOnBridgeStart = False
-        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
-        controller.voiceProgramLaunchOnBridgeStart = False
-        controller.selectedVoiceProgramIndex = 2
-        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
-        controller.selectedVoiceProgramIndex = 1
-        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
-        reopened, _ = self._make_controller()
-        self.assertTrue(reopened.voiceProgramLaunchOnBridgeStart)
-        reopened.selectedVoiceProgramIndex = 4
-        self.assertEqual(reopened.selectedVoiceProgramIndex, 1)
-        self.assertTrue(reopened.voiceProgramLaunchOnBridgeStart)
-        self.assertFalse(reopened._voice_program_settings["launch_on_bridge_start_by_provider"]["custom"])
-
-    def test_custom_path_paste_validation_and_save_failure_preserve_previous(self):
-        saved = config.default_config()
-        saved["voice_program"]["provider"] = "custom"
-        config.save_config(config.config_path(config.config_root()), saved)
-        controller, _ = self._make_controller()
-        executable = Path(self._tmpdir.name) / "语音 程序.exe"
-        executable.touch()
-        controller.voiceProgramCustomPath = '  "' + str(executable) + '"  '
-        self.assertEqual(controller.voiceProgramCustomPath, str(executable))
-        for invalid in (str(executable) + " --run", str(executable.with_suffix(".txt")),
-                        str(executable.parent / "missing.exe")):
-            controller.voiceProgramCustomPath = invalid
-            self.assertEqual(controller.voiceProgramCustomPath, str(executable))
-            self.assertIn("路径无效", controller.errorMessage)
-        another = executable.parent / "another.exe"
-        another.touch()
-        with mock.patch.object(config, "save_config", side_effect=OSError("locked")):
-            controller.voiceProgramCustomPath = str(another)
-        self.assertEqual(controller.voiceProgramCustomPath, str(executable))
-        controller.voiceProgramCustomPath = ""
-        self.assertEqual(controller.voiceProgramCustomPath, "")
-
-    def test_legacy_none_keeps_hotkey_and_path_without_selecting_or_launching(self):
-        saved = config.default_config()
-        saved["voice_program"] = {"provider": "none", "custom_executable": "old.exe",
-                                  "launch_on_bridge_start": True}
-        config.set_voice_hotkey_for_provider(saved, "none", "ctrl+f8", source="manual")
-        config.save_config(config.config_path(config.config_root()), saved)
-        controller, _ = self._make_controller()
-        self.assertEqual(controller.selectedVoiceProgramIndex, 0)
-        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
-        self.assertEqual(controller.voiceProgramCustomPath, "old.exe")
-        controller.selectedVoiceProgramIndex = 2
-        result = config.load_config(config.config_path(config.config_root()))
-        self.assertEqual(config.voice_hotkey_for_provider(result, "none"), "ctrl+f8")
-        self.assertEqual(result["voice_program"]["custom_executable"], "old.exe")
-        for invalid in (-1, 0, 90):
-            controller.selectedVoiceProgramIndex = invalid
-            self.assertEqual(controller.selectedVoiceProgramIndex, 2)
-
     def test_mapping_save_is_rejected_during_voice_hotkey_work(self):
         controller, _ = self._make_controller()
-        controller._set_voice_hotkey_busy(True)
+        controller._voice_hotkey_busy = True
 
         with mock.patch.object(config, "save_settings_pair") as save_pair:
             self.assertFalse(controller.saveSettings())
 
         save_pair.assert_not_called()
         self.assertIn("语音快捷键正在处理", controller.errorMessage)
-
-    def test_voice_settings_do_not_start_during_conflicting_audio_work(self):
-        blockers = (
-            (
-                "channel_test",
-                lambda controller: qt_settings_app._vb_cable_test_active_event.set(),
-                lambda controller: qt_settings_app._vb_cable_test_active_event.clear(),
-            ),
-            (
-                "bridge_launch",
-                lambda controller: controller._set_bridge_launch_phase("starting"),
-                lambda controller: controller._set_bridge_launch_phase("idle"),
-            ),
-            (
-                "endpoint_preflight",
-                lambda controller: setattr(controller, "_endpoint_preflight_busy", True),
-                lambda controller: setattr(controller, "_endpoint_preflight_busy", False),
-            ),
-            (
-                "driver_action",
-                lambda controller: qt_settings_app._driver_action_active_event.set(),
-                lambda controller: qt_settings_app._driver_action_active_event.clear(),
-            ),
-        )
-
-        for name, start, stop in blockers:
-            with self.subTest(name=name):
-                controller, _ = self._make_controller()
-                self._voice_hotkey_read_mock.reset_mock()
-                self._voice_hotkey_sync_mock.reset_mock()
-                start(controller)
-                try:
-                    controller.holdVoiceHotkeyText = "ctrl+l"
-                    controller.selectedVoiceProgramIndex = 1
-                    controller.refreshVoiceHotkeyFromProvider()
-                finally:
-                    stop(controller)
-
-                self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
-                self.assertEqual(controller.selectedVoiceProgramIndex, 0)
-                self._voice_hotkey_read_mock.assert_not_called()
-                self._voice_hotkey_sync_mock.assert_not_called()
 
     def test_mapping_save_is_rejected_during_audio_configuration_work(self):
         blockers = (
@@ -3526,26 +2344,6 @@ class SettingsControllerTests(unittest.TestCase):
                 save.assert_not_called()
                 self.assertIn("其它操作正在进行", controller.errorMessage)
 
-    def test_voice_program_launch_reports_a_normal_provider_result(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        result = voice_program_manager.VoiceProgramLaunchResult(
-            provider_id="sogou",
-            started=True,
-            already_running=False,
-            code="started",
-            elevated=True,
-        )
-        with mock.patch.object(
-            qt_settings_app.voice_program_manager,
-            "launch_voice_program",
-            return_value=result,
-        ):
-            controller.launchVoiceProgram()
-
-        self.assertIn("管理员权限", controller.statusMessage)
-        self.assertEqual(controller.errorMessage, "")
-
     def test_existing_right_alt_hotkey_is_preserved_when_loading_saved_config(self):
         saved = config.default_config()
         saved["voice_hotkey"] = "ralt"
@@ -3573,21 +2371,21 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertFalse(controller.voiceMappingReady)
 
-    def test_only_mic_primary_options_include_hold_to_talk(self):
+    def test_every_primary_button_offers_hold_to_talk_slots(self):
         controller, _ = self._make_controller()
         self.assertNotIn(settings_ui._VOICE_HOLD_DISPLAY, controller.primaryActionOptions)
         self.assertNotIn(
             "开关型语音",
             controller.primaryActionOptionsFor("mic"),
         )
-        self.assertIn(
-            settings_ui._VOICE_HOLD_DISPLAY,
-            controller.primaryActionOptionsFor("mic"),
-        )
-        self.assertNotIn(
-            settings_ui._VOICE_HOLD_DISPLAY,
-            controller.primaryActionOptionsFor("up"),
-        )
+        for button_id in ("mic", "up"):
+            options = controller.primaryActionOptionsFor(button_id)
+            for slot in range(1, key_mapping.MAX_VOICE_SLOTS + 1):
+                self.assertIn(settings_ui.voice_slot_display(slot), options)
+            self.assertNotIn(
+                settings_ui.voice_slot_display(key_mapping.MAX_VOICE_SLOTS + 1),
+                options,
+            )
 
     def test_secondary_options_exclude_voice_lifecycles(self):
         controller, _ = self._make_controller()
@@ -3680,6 +2478,7 @@ class SettingsControllerTests(unittest.TestCase):
                 "back",
                 "single_click",
                 "not_a_key",
+                "sendinput",
             ),
             "单击：不认识按键“not_a_key”，请检查键名或使用按键录入。",
         )
@@ -3688,8 +2487,30 @@ class SettingsControllerTests(unittest.TestCase):
                 "back",
                 "single_click",
                 "ctrl+shift+p",
+                "sendinput",
             ),
             "",
+        )
+        # Consumer controls now carry real scan codes, so Interception works.
+        self.assertEqual(
+            controller.buttonActionValidationMessage(
+                "back",
+                "single_click",
+                "volume_up",
+                "interception",
+            ),
+            "",
+        )
+        # Element navigation is not an ordinary key action: it has its own host
+        # path, so no injection backend applies and Interception must be rejected.
+        self.assertIn(
+            "该动作不是普通按键动作",
+            controller.buttonActionValidationMessage(
+                "back",
+                "single_click",
+                "元素导航开关",
+                "interception",
+            ),
         )
 
     def test_hidden_legacy_combo_never_blocks_tv_double_click_save(self):
@@ -3892,6 +2713,33 @@ class SettingsControllerTests(unittest.TestCase):
                     "left_bracket", "tab", "numpad_add", "numpad_subtract",
                     "numpad_multiply", "numpad_divide", "numpad_decimal", "left", "vk_e2",
                 })
+
+    def test_qt_capture_does_not_reintroduce_forwarded_chatterfly_probe(self):
+        controller, _ = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        controller._hotkey_capture = mock.Mock()
+        controller._set_input_operation_state("hotkey", "active")
+        control = self.Qt.KeyboardModifier.ControlModifier.value
+        shift = self.Qt.KeyboardModifier.ShiftModifier.value
+        controller._capture_hotkey_qt_event(
+            self.Qt.Key.Key_Control.value, control, "", True, False,
+            native_virtual_key=0xA3, native_scan_code=0xE01D)
+        before = list(controller._qt_hotkey_tokens)
+        for pressed in (True, False):
+            self.assertFalse(controller._capture_hotkey_qt_event(
+                self.Qt.Key.Key_unknown.value, control, "", pressed, False,
+                native_virtual_key=0xFC, native_scan_code=0))
+        self.assertEqual(controller._qt_hotkey_tokens, before)
+        self.assertEqual(captured, [])
+        controller._capture_hotkey_qt_event(
+            self.Qt.Key.Key_Shift.value, control | shift, "", True, False,
+            native_virtual_key=0xA1, native_scan_code=0x36)
+        for pressed in (True, False):
+            controller._capture_hotkey_qt_event(
+                self.Qt.Key.Key_0.value, control | shift, "", pressed, False,
+                native_virtual_key=0x30, native_scan_code=0x0B)
+        self.assertEqual(captured, ["rctrl+rshift+0"])
 
     def test_readable_mapping_labels_never_replace_the_stored_key_tokens(self):
         controller, model = self._make_controller()
@@ -4120,7 +2968,7 @@ class SettingsControllerTests(unittest.TestCase):
         instances = []
 
         class ImmediateCapture:
-            def __init__(self, callback, *, accept_injected=False):
+            def __init__(self, callback, *, accept_injected=False, isolated=False, on_error=None):
                 self._callback = callback
                 self.accept_injected = accept_injected
                 self.is_running = False
@@ -4150,6 +2998,40 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.hotkeyCaptureActive)
         self.assertIsNone(controller._hotkey_capture)
         self.assertIsNone(controller._pending_hotkey_capture_result)
+
+    def test_hotkey_cancel_or_child_failure_wins_over_late_start_and_result(self):
+        for failed in (False, True):
+            with self.subTest(child_failed=failed):
+                controller, _ = self._make_controller()
+                captured, errors = [], []
+                controller.hotkeyCaptured.connect(captured.append)
+                controller.hotkeyCaptureError.connect(errors.append)
+                controller._set_input_operation_state("hotkey", "starting")
+                controller._input_operation_cancel_event = threading.Event()
+                token = controller._input_operation_token
+                capture = mock.Mock()
+                if failed:
+                    controller._on_hotkey_capture_failed((token, "录入已中断"))
+                else:
+                    controller.stopHotkeyCapture()
+                controller._on_hotkey_capture_result((token, "rctrl+rshift+0"))
+                controller._on_input_operation_ready((
+                    token, "start", qt_settings_app._InputStartResult(
+                        "hotkey", True, hotkey_capture=capture,
+                    ),
+                ))
+                self.assertEqual(captured, [])
+                self.assertEqual(errors, ["录入已中断"] if failed else [])
+                self.assertEqual(controller._input_operation_phase, "idle")
+                self.assertIsNone(controller._pending_hotkey_capture_result)
+                capture.stop.assert_called_once_with()
+
+    def test_stale_hotkey_child_failure_cannot_stop_a_new_recording(self):
+        controller, _ = self._make_controller()
+        controller._set_input_operation_state("hotkey", "active")
+        with mock.patch.object(controller, "_request_input_stop") as stop:
+            controller._on_hotkey_capture_failed((controller._input_operation_token - 1, "旧错误"))
+        stop.assert_not_called()
 
     def test_hotkey_capture_ready_only_after_the_hook_is_active(self):
         controller, _ = self._make_controller()
@@ -4928,7 +3810,22 @@ class SettingsControllerTests(unittest.TestCase):
             controller.voiceRuntimeState,
             bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED,
         )
-        self.assertEqual(controller.voiceRuntimeProvider, "wetype")
+
+    def test_unknown_wetype_capture_is_shown_without_start_failure(self):
+        from ovb_rc003 import remote_selection
+        controller, _ = self._make_controller()
+        status = bridge_runtime_status.BridgeRuntimeStatus(
+            schema=bridge_runtime_status.SCHEMA_VERSION,
+            state=bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321, updated_at=time.time(),
+            voice_runtime_state=bridge_runtime_status.VOICE_RUNTIME_HOST_UNCONFIRMED,
+            voice_runtime_provider="wetype", voice_active=False)
+        for profile in (remote_selection.RC003_PROFILE,):
+            with self.subTest(profile=profile), mock.patch.object(remote_selection, "active_profile", return_value=profile):
+                text = controller._describe_runtime_status(status)
+                self.assertIn("已收到声音，未确认微信开麦", text)
+                self.assertIn("若未输入文字，请松开后重试", text)
+                self.assertNotIn("启动失败", text)
 
     def test_legacy_bridge_recommends_manual_restart_without_auto_stopping(self):
         self._bridge_status_patch.stop()
@@ -5281,7 +4178,7 @@ class SettingsControllerTests(unittest.TestCase):
         controller, _ = self._make_controller()
         self.assertEqual(
             controller.deviceOptions,
-            [device_catalog.profile_for(device_catalog.RC003_ID).display_name, "谷歌 Chromecast 遥控器"],
+            [device_catalog.profile_for(device_catalog.RC003_ID).display_name],
         )
         self.assertEqual(
             controller.selectedDeviceIndex,
@@ -5300,7 +4197,7 @@ class SettingsControllerTests(unittest.TestCase):
 
         self.assertEqual(
             controller.deviceOptions,
-            [device_catalog.profile_for(device_catalog.RC003_ID).display_name, "谷歌 Chromecast 遥控器"],
+            [device_catalog.profile_for(device_catalog.RC003_ID).display_name],
         )
         self.assertTrue(controller.isRc003Device)
         self.assertEqual(
@@ -5413,8 +4310,8 @@ class SettingsControllerTests(unittest.TestCase):
             ),
             (
                 "voice_hotkey",
-                lambda controller: controller._set_voice_hotkey_busy(True),
-                lambda controller: controller._set_voice_hotkey_busy(False),
+                lambda controller: setattr(controller, "_voice_hotkey_busy", True),
+                lambda controller: setattr(controller, "_voice_hotkey_busy", False),
             ),
             (
                 "channel_test",
@@ -5532,11 +4429,11 @@ class SettingsControllerTests(unittest.TestCase):
         model.setActionTextAt(model.index_of("power"), "escape")
         self.assertTrue(controller.settingsDirty)
 
-        controller.selectedVoiceProgramIndex = 1
+        controller.setVoiceSlotHotkey(2, "ctrl+k")
         self.assertTrue(controller.settingsDirty)
         self.assertIn("按键映射正在自动保存", controller.statusMessage)
         saved = config.load_config(config.config_path(config.config_root()))
-        self.assertEqual(saved["voice_program"]["provider"], "sogou")
+        self.assertEqual(saved["voice_slot_hotkeys"]["2"], "ctrl+k")
 
     def test_feedback_is_scoped_to_the_page_that_owns_the_action(self):
         controller, model = self._make_controller()
@@ -5772,7 +4669,7 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertTrue(controller.saveSettings())
 
         saved = config.load_config(config.config_path(config.config_root()))
-        self.assertEqual(saved["voice_trigger_mode"], "hold")
+        self.assertNotIn("voice_trigger_mode", saved)
         self.assertEqual(saved["voice_hotkey"], "ctrl+l")
         self.assertEqual(saved["voice_hotkeys"], {"hold": "ctrl+l"})
         saved_bindings = config.load_key_bindings(
@@ -5849,17 +4746,17 @@ class SettingsControllerTests(unittest.TestCase):
 
         preflight.assert_not_called()
         saved = config.load_config(config.config_path(config.config_root()))
-        self.assertEqual(saved["voice_hotkeys"], {"hold": "ralt"})
+        self.assertEqual(saved["voice_hotkeys"], {"hold": ""})
 
-    def test_save_settings_with_empty_hotkey_fails_and_reports_error(self):
+    def test_save_settings_with_invalid_hotkey_fails_and_reports_error(self):
         controller, _ = self._make_controller()
-        controller._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD] = ""
+        controller._voice_hotkey = "ctrl"
         self.assertFalse(controller.saveSettings())
         self.assertNotEqual(controller.errorMessage, "")
 
     def test_save_and_launch_never_launches_when_save_fails(self):
         controller, _ = self._make_controller()
-        controller._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD] = ""
+        controller._voice_hotkey = "ctrl"
         with mock.patch.object(bridge_launcher, "start_bridge_launch") as fake_launch:
             controller.saveAndLaunch()
             self.assertEqual(controller.bridgeLaunchPhase, "saving")
@@ -5897,15 +4794,11 @@ class SettingsControllerTests(unittest.TestCase):
             bridge_launcher,
             "launch_bridge",
             side_effect=AssertionError("GUI must not call the blocking launch wrapper"),
-        ), mock.patch.object(
-            qt_settings_app.voice_program_manager,
-            "launch_voice_program",
-        ) as launch_voice_program:
+        ):
             controller.saveAndLaunch()
             self.assertEqual(controller.bridgeLaunchPhase, "saving")
             self.assertFalse(start_launch.called)
             self._continue_save_and_launch(controller)
-        launch_voice_program.assert_not_called()
         self.assertTrue(controller.bridgeRunning)
         self.assertFalse(controller.bridgeConnected)
         self.assertEqual(controller.bridgeLaunchPhase, "waiting")
@@ -6407,63 +5300,6 @@ class SettingsControllerTests(unittest.TestCase):
         start_launch.assert_not_called()
         self.assertEqual(controller.bridgeLaunchPhase, "idle")
 
-    def test_existing_bridge_applies_the_saved_voice_program_without_restart(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        bridge_result = bridge_launcher.LaunchResult(
-            outcome=bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
-            command=("exe",),
-            exit_code=bridge_launcher.ALREADY_RUNNING_EXIT_CODE,
-        )
-        voice_result = voice_program_manager.VoiceProgramLaunchResult(
-            provider_id="sogou",
-            started=True,
-            already_running=False,
-            code="started",
-        )
-
-        with mock.patch.object(
-            bridge_launcher, "start_bridge_launch", return_value=bridge_result
-        ), mock.patch.object(
-            bridge_launcher, "in_process_bridge_running", return_value=True
-        ), mock.patch.object(
-            qt_settings_app.voice_program_manager,
-            "launch_voice_program",
-            return_value=voice_result,
-        ) as launch_voice_program:
-            controller.saveAndLaunch()
-            self._continue_save_and_launch(controller)
-
-        launch_voice_program.assert_called_once_with(controller._voice_program_settings)
-        self.assertTrue(controller.bridgeRunning)
-        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
-        self.assertIn("已启动语音程序", controller.statusMessage)
-
-    def test_existing_bridge_survives_an_unexpected_voice_program_launch_error(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        bridge_result = bridge_launcher.LaunchResult(
-            outcome=bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
-            command=("exe",),
-            exit_code=bridge_launcher.ALREADY_RUNNING_EXIT_CODE,
-        )
-
-        with mock.patch.object(
-            bridge_launcher, "start_bridge_launch", return_value=bridge_result
-        ), mock.patch.object(
-            bridge_launcher, "in_process_bridge_running", return_value=True
-        ), mock.patch.object(
-            qt_settings_app.voice_program_manager,
-            "launch_voice_program",
-            side_effect=RuntimeError("unexpected launch failure"),
-        ):
-            controller.saveAndLaunch()
-            self._continue_save_and_launch(controller)
-
-        self.assertTrue(controller.bridgeRunning)
-        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
-        self.assertIn("遥控器服务不受影响", controller.errorMessage)
-
     def test_external_bridge_winning_launch_race_gets_one_automatic_handoff(self):
         controller, _ = self._make_controller()
         bridge_result = bridge_launcher.LaunchResult(
@@ -6674,30 +5510,12 @@ class SettingsControllerTests(unittest.TestCase):
         controller.holdVoiceHotkeyText = "ctrl+l"
         model.setActionTextAt(model.index_of("mic"), "Escape")
         controller.restoreDefaults()
-        self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
+        self.assertEqual(controller.holdVoiceHotkeyText, "")
         mic_index = model.index(model.index_of("mic"), 0)
         self.assertEqual(
             model.data(mic_index, model.ActionTextRole),
             settings_ui._VOICE_HOLD_DISPLAY,
         )
-
-    def test_restore_mapping_defaults_does_not_change_voice_program_or_hotkey(self):
-        controller, model = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        controller.holdVoiceHotkeyText = "ctrl+l"
-        controller.voiceProgramLaunchElevated = True
-        power_row = model.index_of("power")
-        model.setActionTextAt(power_row, "f5")
-        model.setDisplayNoteAt(power_row, "single_click", "刷新")
-
-        controller.restoreMappingDefaults()
-
-        self.assertEqual(controller.holdVoiceHotkeyText, "ctrl+l")
-        self.assertEqual(controller.selectedVoiceProgramIndex, 1)
-        self.assertTrue(controller.voiceProgramLaunchElevated)
-        power_index = model.index(power_row, 0)
-        self.assertNotEqual(model.data(power_index, model.ActionTextRole), "f5")
-        self.assertEqual(model.data(power_index, model.SingleNoteRole), "")
 
     def test_select_button_updates_both_the_controller_and_the_model(self):
         controller, model = self._make_controller()
@@ -7135,35 +5953,8 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller._input_operation_phase, "active")
         self.assertEqual(errors, ["另一项按键输入操作正在进行，请先结束。"])
 
-    def test_hotkey_start_is_available_for_wetype(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
-
-        with mock.patch.object(
-            controller,
-            "_begin_input_operation_start",
-            return_value=True,
-        ) as begin:
-            self.assertTrue(controller.startHotkeyCapture())
-
-        begin.assert_called_once_with("hotkey", controller._start_hotkey_capture_worker)
-
-    def test_mapping_hotkey_capture_stays_available_for_wetype(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
-
-        with mock.patch.object(
-            controller,
-            "_begin_input_operation_start",
-            return_value=True,
-        ) as begin:
-            self.assertTrue(controller.startMappingHotkeyCapture())
-
-        begin.assert_called_once_with("hotkey", controller._start_hotkey_capture_worker)
-
     def test_mapping_hotkey_manual_text_is_normalized_without_voice_capture(self):
         controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
 
         with mock.patch.object(controller, "_begin_input_operation_start") as begin:
             result = controller.normalizeMappingHotkeyText(
@@ -7449,9 +6240,9 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertFalse(controller.keyDetectionActive)
         self.assertIn("没有可用的按键通道", controller.keyDetectionText)
 
-    def test_usage_guide_opens_repository_readme_and_reports_failure(self):
+    def test_usage_guide_opens_the_project_website_and_reports_failure(self):
         controller, _ = self._make_controller()
-        target = f"https://github.com/{qt_settings_app.application_update.REPOSITORY_SLUG}#readme"
+        target = qt_settings_app.application_update.WEBSITE_GUIDE_URL
         for outcome in qt_settings_app.shell_targets.ExternalTargetOutcome:
             with self.subTest(outcome=outcome), mock.patch.object(
                 qt_settings_app.shell_targets,
@@ -7549,6 +6340,24 @@ class SettingsControllerTests(unittest.TestCase):
         check.assert_not_called()
         self.assertEqual(controller.applicationUpdateState, "idle")
         self.assertFalse(controller.applicationUpdateBusy)
+
+    def test_special_edition_disables_online_update_checks(self):
+        controller, _ = self._make_controller()
+        dialogs, notices = [], []
+        controller.applicationUpdateDialogRequested.connect(
+            lambda: dialogs.append(True)
+        )
+        controller.applicationUpdateNotificationRequested.connect(notices.append)
+        with mock.patch.object(
+            qt_settings_app, "APPLICATION_UPDATE_CHECK_ENABLED", False
+        ), mock.patch.object(application_update, "check_for_update") as check:
+            self.assertFalse(controller.checkForApplicationUpdateOnStartup())
+            self.assertFalse(controller.checkForApplicationUpdate())
+        check.assert_not_called()
+        self.assertEqual(controller.applicationUpdateState, "idle")
+        self.assertFalse(controller.applicationUpdateBusy)
+        self.assertEqual((dialogs, notices), ([], []))
+        self.assertIn("已停用更新检查", controller.statusMessage)
 
     def test_automatic_update_notifies_without_dialog_or_clearing_other_feedback(self):
         controller, _ = self._make_controller()
@@ -8043,96 +6852,6 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(controller.statusMessage, "")
         self.assertIn("no handler registered", controller.errorMessage)
 
-    def test_installed_sogou_settings_use_manual_tray_guidance(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        executable = Path(
-            r"C:\Program Files\SogouInput\sogou_voice_assistant.exe"
-        )
-        target = voice_program_manager.VoiceProgramSettingsTarget(
-            "sogou",
-            "搜狗语音输入",
-            "sogou_manual",
-            str(executable),
-        )
-        with mock.patch.object(
-            qt_settings_app.voice_program_manager,
-            "resolve_voice_program_settings_target",
-            return_value=target,
-        ):
-            controller.openVoiceProgramSettings()
-
-        self.assertEqual(controller.errorMessage, "")
-        self.assertIn("展开隐藏图标", controller.statusMessage)
-        self.assertIn("右键搜狗语音图标", controller.statusMessage)
-
-    def test_missing_sogou_voice_opens_the_ai_toolbox(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        toolbox = Path(r"C:\Program Files\SogouInput\SOGOUSmartAssistant.exe")
-        target = voice_program_manager.VoiceProgramSettingsTarget(
-            "sogou",
-            "搜狗语音输入",
-            "sogou_toolbox",
-            str(toolbox),
-            "--from=menutool",
-        )
-        with mock.patch.object(
-            qt_settings_app.voice_program_manager,
-            "resolve_voice_program_settings_target",
-            return_value=target,
-        ), mock.patch.object(
-            qt_settings_app.voice_program_manager,
-            "open_voice_program_settings",
-        ) as open_settings:
-            controller.openVoiceProgramSettings()
-
-        open_settings.assert_called_once_with(toolbox, "--from=menutool")
-        self.assertEqual(controller.errorMessage, "")
-        self.assertIn("请手动安装", controller.statusMessage)
-
-    def test_missing_sogou_toolbox_uses_the_status_bar(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 1
-        target = voice_program_manager.VoiceProgramSettingsTarget(
-            "sogou",
-            "搜狗语音输入",
-            "missing",
-        )
-        with mock.patch.object(
-            qt_settings_app.voice_program_manager,
-            "resolve_voice_program_settings_target",
-            return_value=target,
-        ):
-            controller.openVoiceProgramSettings()
-
-        self.assertEqual(controller.errorMessage, "")
-        self.assertIn("AI 工具箱中手动安装", controller.statusMessage)
-
-    def test_open_wetype_settings_uses_the_installed_settings_program(self):
-        controller, _ = self._make_controller()
-        controller.selectedVoiceProgramIndex = 2
-        executable = Path(r"C:\Program Files\Tencent\WeType\wetype_update.exe")
-        target = voice_program_manager.VoiceProgramSettingsTarget(
-            "wetype",
-            "微信输入法",
-            "executable",
-            str(executable),
-            "-showsetting",
-        )
-        with mock.patch.object(
-            qt_settings_app.voice_program_manager,
-            "resolve_voice_program_settings_target",
-            return_value=target,
-        ), mock.patch.object(
-            qt_settings_app.voice_program_manager,
-            "open_voice_program_settings",
-        ) as open_settings:
-            controller.openVoiceProgramSettings()
-
-        open_settings.assert_called_once_with(executable, "-showsetting")
-        self.assertIn("已打开微信输入法设置", controller.statusMessage)
-
     def test_select_and_persist_output_endpoint_succeeds_and_updates_options(self):
         controller, _ = self._make_controller()
         persisted = []
@@ -8271,6 +6990,131 @@ class SettingsControllerTests(unittest.TestCase):
         )
         save_config.assert_not_called()
         self.assertEqual(controller._config, original_config)
+
+    # -- saved profiles carry the voice mode ------------------------------
+
+    def test_voice_profiles_rows_carry_the_automatic_mode_tag(self):
+        controller, _ = self._make_controller()
+        self.assertTrue(controller._persist_voice_config_fields({
+            "voice_input_source": config.VOICE_INPUT_SOURCE_LOCAL,
+            "voice_local_input_device": "USB 麦克风",
+        }))
+
+        saved = controller.mappingPresetAction("save", "", "会议")
+        self.assertTrue(saved["ok"], saved)
+        row = next(item for item in controller.voiceProfiles
+                   if item["id"] == saved["id"])
+        self.assertEqual(row["name"], "会议")
+        self.assertEqual(row["mode_tag"], "模式2 · USB 麦克风")
+        self.assertEqual(row["label"], "会议（模式2 · USB 麦克风）")
+        self.assertEqual(row["voice_input_source"],
+                         config.VOICE_INPUT_SOURCE_LOCAL)
+        self.assertEqual(row["voice_local_input_device"], "USB 麦克风")
+        self.assertEqual(row["voice_conflicts"], [])
+        self.assertEqual(row["voice_conflict_text"], "")
+
+        # 模式1 never stores a device name: it always means the remote itself.
+        self.assertTrue(controller._persist_voice_config_fields({
+            "voice_input_source": config.VOICE_INPUT_SOURCE_REMOTE,
+            "voice_local_input_device": "USB 麦克风",
+        }))
+        remote = controller.mappingPresetAction("save", "", "遥控器")
+        self.assertTrue(remote["ok"], remote)
+        remote_row = next(item for item in controller.voiceProfiles
+                          if item["id"] == remote["id"])
+        self.assertEqual(remote_row["label"], "遥控器（模式1）")
+        self.assertEqual(remote_row["voice_local_input_device"], "")
+
+    def test_mode_1_profile_flags_and_refuses_voice_keys_it_cannot_fire(self):
+        controller, _ = self._make_controller()
+        self.assertTrue(controller._persist_voice_config_fields({
+            "voice_input_source": config.VOICE_INPUT_SOURCE_REMOTE,
+            "voice_local_input_device": "",
+        }))
+        bindings = copy.deepcopy(controller._bindings)
+        bindings["bindings"]["ok"] = {"kind": "voice_hold_2", "keys": []}
+        identity = app_profiles.AppProfileStore(controller._config_root).create(
+            "旧布局", app_profiles.snapshot(bindings, controller._selected_device_id()),
+            voice_input_source=config.VOICE_INPUT_SOURCE_REMOTE)
+        controller._refresh_mapping_presets()
+        before_ok = copy.deepcopy(controller._bindings["bindings"]["ok"])
+
+        row = next(item for item in controller.voiceProfiles
+                   if item["id"] == identity)
+        self.assertEqual(len(row["voice_conflicts"]), 1)
+        self.assertIn("模式1 只能用遥控器的话筒键", row["voice_conflict_text"])
+
+        result = controller.mappingPresetAction("apply", identity, "")
+        self.assertFalse(result["ok"])
+        self.assertIn("请先把这些按键上的语音操作改掉", result["message"])
+        self.assertIn(row["voice_conflicts"][0], result["message"])
+        # A rejected apply must leave the live layout untouched.
+        self.assertEqual(controller._bindings["bindings"]["ok"], before_ok)
+
+    def test_applying_a_profile_restores_its_voice_mode_and_microphone(self):
+        controller, _ = self._make_controller()
+        self.assertTrue(controller._persist_voice_config_fields({
+            "voice_input_source": config.VOICE_INPUT_SOURCE_LOCAL,
+            "voice_local_input_device": "USB 麦克风",
+        }))
+        saved = controller.mappingPresetAction("save", "", "会议")
+        self.assertTrue(saved["ok"], saved)
+        self.assertTrue(controller._persist_voice_config_fields({
+            "voice_input_source": config.VOICE_INPUT_SOURCE_REMOTE,
+            "voice_local_input_device": "",
+        }))
+
+        applied = controller.mappingPresetAction("apply", saved["id"], "")
+        self.assertTrue(applied["ok"], applied)
+        self.assertEqual(config.voice_input_source(controller._config),
+                         config.VOICE_INPUT_SOURCE_LOCAL)
+        self.assertEqual(config.voice_local_input_device(controller._config),
+                         "USB 麦克风")
+        self.assertIn("语音模式已切换", applied["message"])
+        self.assertTrue(next(row for row in controller.voiceProfiles
+                             if row["id"] == saved["id"])["applied"])
+
+    def test_voice_short_press_dismiss_toggle_persists_and_notifies(self):
+        controller, _ = self._make_controller()
+        changed = []
+        controller.voiceShortPressDismissChanged.connect(
+            lambda: changed.append(controller.voiceShortPressDismiss)
+        )
+        self.assertFalse(controller.voiceShortPressDismiss, "默认必须关闭")
+
+        controller.setVoiceShortPressDismiss(True)
+
+        self.assertTrue(controller.voiceShortPressDismiss)
+        self.assertEqual(changed, [True])
+        persisted = config.load_config(config.config_path(controller._config_root))
+        self.assertTrue(persisted["voice_short_press_dismiss"])
+
+        controller.setVoiceShortPressDismiss(True)
+        self.assertEqual(changed, [True], "值未变化时不应重复保存或发信号")
+
+    def test_export_all_mapping_presets_writes_a_library_backup(self):
+        controller, _ = self._make_controller()
+        first = controller.mappingPresetAction("save", "", "工作")
+        self.assertTrue(first["ok"], first)
+        second = controller.mappingPresetAction("copy", first["id"], "工作 副本")
+        self.assertTrue(second["ok"], second)
+
+        export = Path(self._tmpdir.name) / "library.json"
+        result = controller.exportAllMappingPresets(export.as_uri())
+        self.assertTrue(result["ok"], result)
+        document = json.loads(export.read_text(encoding="utf-8"))
+        self.assertEqual(document["format"], app_profiles.LIBRARY_FORMAT)
+        self.assertEqual(document["schema_version"],
+                         app_profiles.LIBRARY_SCHEMA_VERSION)
+        self.assertEqual({entry["id"] for entry in document["profiles"]},
+                         {first["id"], second["id"]})
+        self.assertEqual(document["global"]["mapping"]["bindings"]["ok"],
+                         app_profiles.snapshot(controller._bindings)["bindings"]["ok"])
+        self.assertNotIn("physical_bindings", document["global"]["mapping"])
+
+        rejected = controller.exportAllMappingPresets("https://example.com/library.json")
+        self.assertFalse(rejected["ok"])
+        self.assertIn("本地", rejected["message"])
 
 
 @unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
@@ -9030,7 +7874,7 @@ class DiagnosticsControllerTests(unittest.TestCase):
             self.assertTrue(diag.vbCableTestRunning)
             self.assertTrue(self._pump_until(lambda: not diag.vbCableTestRunning))
 
-        restart.assert_called_once_with(launch_voice_program_on_start=False)
+        restart.assert_called_once_with()
         self.assertEqual(diag.vbCableTestStatus, "pass")
         self.assertIn("自动恢复", diag.vbCableTestMessage)
         self.assertFalse(diag.vbCableBridgeRecoveryNeeded)
@@ -9183,7 +8027,7 @@ class DiagnosticsControllerTests(unittest.TestCase):
         settings_controller = self._make_settings_controller()
         diag = self.DiagnosticsController(settings_controller, self._config_root)
         self._pump_until(lambda: not diag.isRefreshing)
-        settings_controller._set_voice_hotkey_busy(True)
+        settings_controller._voice_hotkey_busy = True
 
         with mock.patch.object(
             windows_diagnostics, "check_vb_cable_loopback_isolated"
@@ -9883,7 +8727,7 @@ result = {
     "hotkey_before_stop_completed": hotkey_before_stop_completed,
     "recording_before_stop_completed": recording_before_stop_completed,
     "pending_before_stop_completed": pending_before_stop_completed,
-    "saved_voice_hotkey": saved_config.get("voice_hotkeys", {}).get("hold"),
+    "saved_voice_hotkey": saved_config.get("voice_slot_hotkeys", {}).get("1"),
     "voice_save_status": voice_save_status,
     "voice_feedback_on_device": voice_feedback_on_device,
     "voice_feedback_on_voice": voice_feedback_on_voice,
@@ -10243,7 +9087,7 @@ def click_item(item):
     QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, point)
     render(window, app, 3)
 
-target = f"https://github.com/{u.REPOSITORY_SLUG}#readme"
+target = u.WEBSITE_GUIDE_URL
 with mock.patch.object(m.shell_targets, "open_external_target", return_value=
         m.shell_targets.ExternalTargetResult(m.shell_targets.ExternalTargetOutcome.OPENED, target)) as opener:
     click_item(usage_link)
@@ -10352,6 +9196,7 @@ release = u.ApplicationRelease(
 )
 controller._application_update_startup_attempted = False
 controller._background_task_runner = lambda target, _name: target()
+m.APPLICATION_UPDATE_CHECK_ENABLED = True
 u.claim_daily_update_check = lambda _cache: True
 u.check_for_update = lambda _version: u.ApplicationUpdateCheck(
     u.UpdateCheckOutcome.UPDATE_AVAILABLE, u.parse_application_version(m.__version__), release)
@@ -10917,7 +9762,7 @@ result["voice_sections"] = all(
     find_child(window, name) is not None
     for name in (
         "audioPrerequisiteSection",
-        "voiceProgramSection",
+        "voiceKeySection",
         "voiceTestSection",
     )
 )
@@ -11515,14 +10360,6 @@ def render(window, app, count=10):
     return image
 
 
-def wait_for_voice_hotkey_idle(controller, app, timeout=3.0):
-    deadline = time.monotonic() + timeout
-    while controller.voiceHotkeyBusy and time.monotonic() < deadline:
-        app.processEvents()
-        time.sleep(0.01)
-    assert not controller.voiceHotkeyBusy
-
-
 def bounds(window, name):
     item = find_child(window, name)
     assert item is not None, name + " missing"
@@ -11669,8 +10506,6 @@ capture_page(
         "photoSidebar",
     ),
 )
-controller._replace_voice_program_settings(dict(controller._voice_program_settings, provider="custom"))
-wait_for_voice_hotkey_idle(controller, app)
 capture_page(
     2,
     "voice",
@@ -11678,9 +10513,8 @@ capture_page(
     (
         "audioPrerequisiteSection",
         "audioPrerequisiteSectionTitle",
-        "voiceProgramSection",
-        "voiceProgramSectionTitle",
-        "voiceProgramCustomPathRow",
+        "voiceKeySection",
+        "voiceKeySectionTitle",
         "voiceTestSection",
         "voiceTestSectionTitle",
     ),
@@ -11690,8 +10524,6 @@ voice_row_names = (
     "virtualAudioRow",
     "outputEndpointRow",
     "microphonePrivacyRow",
-    "voiceProgramSelectionRow",
-    "voiceProgramCustomPathRow",
     "voiceHotkeyRow",
     "soundChannelTestRow",
 )
@@ -11706,9 +10538,7 @@ result["voice_columns"] = {
         name: bounds(window, name)
         for name in (
             "endpointCombo",
-            "voiceProgramCombo",
-            "voiceProgramCustomPathField",
-            "holdVoiceHotkeyField",
+            "voiceSlotHotkeyField",
         )
     },
     "right_controls": {
@@ -11716,14 +10546,12 @@ result["voice_columns"] = {
         for name in (
             "applyVirtualAudioButton",
             "openMicrophonePrivacyButton",
-            "browseVoiceProgramButton",
             "recordVoiceHotkeyButton",
             "testVbCableChannelButton",
         )
     },
     "left_controls": {
         "installVirtualAudioButton": bounds(window, "installVirtualAudioButton"),
-        "voiceProgramElevatedCheckBox": bounds(window, "voiceProgramElevatedCheckBox"),
     },
     "descriptions": {
         name: bounds(window, name)
@@ -11748,16 +10576,6 @@ result["voice_recovery_editor"] = {
 }
 diagnostics_controller._set_vb_cable_bridge_recovery_needed(False)
 render(window, app)
-
-controller.selectedVoiceProgramIndex = 2
-wait_for_voice_hotkey_idle(controller, app)
-render(window, app)
-result["voice_provider_actions"] = {
-    name: bounds(window, name)
-    for name in (
-        "openVoiceProgramSettingsButton",
-    )
-}
 
 mapping_button = find_child(window, "mappingTabButton")
 tab_bar.setProperty("currentIndex", 2)
@@ -11913,7 +10731,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("root.flat && root.activeFocus", self.compact_button_qml)
         self.assertIn("自定义按键映射已可用。确认管理员权限，清理旧组件。", self.main_qml)
         self.assertIn('objectName: "removeHidHelperButton"', self.device_qml)
-        self.assertIn("本机所有无线麦版本都不能使用自定义按键映射", self.main_qml)
+        self.assertIn("本机所有MiOpention版本都不能使用自定义按键映射", self.main_qml)
         self.assertIn(
             "SettingsController.feedbackPageIndex === tabBar.currentIndex",
             self.main_qml,
@@ -11978,7 +10796,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.settings_section_title_qml,
         )
         self.assertEqual(self.device_qml.count("SettingsSectionTitle {"), 2)
-        self.assertEqual(self.voice_qml.count("SettingsSectionTitle {"), 3)
+        self.assertEqual(self.voice_qml.count("SettingsSectionTitle {"), 4)
         for object_name in (
             "devicePrerequisiteSectionTitle",
             "desktopBehaviorSectionTitle",
@@ -11986,7 +10804,8 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             self.assertIn(f'objectName: "{object_name}"', self.device_qml)
         for object_name in (
             "audioPrerequisiteSectionTitle",
-            "voiceProgramSectionTitle",
+            "voiceKeySectionTitle",
+            "voiceProfileSectionTitle",
             "voiceTestSectionTitle",
         ):
             self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
@@ -12002,11 +10821,17 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertNotIn("comboMapping", self.tokens_qml)
 
     def test_all_selectors_reuse_one_selected_option_delegate(self):
-        self.assertEqual(self.voice_qml.count("SelectionComboBox {"), 4)
+        # The voice page carries three selectors (output endpoint, voice mode,
+        # local microphone) and every one of them reuses the shared decorated
+        # delegate instead of rolling its own item delegate.
+        self.assertEqual(self.voice_qml.count("SelectionComboBox {"), 3)
         self.assertIn(
             "recommendedIndex: SettingsController.recommendedEndpointIndex",
             self.voice_qml,
         )
+        for object_name in ("voiceInputSourceCombo", "localMicrophoneCombo"):
+            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
+        self.assertNotIn("delegate: ItemDelegate {", self.voice_qml)
         self.assertIn(
             "font.weight: index === root.effectiveIndex ? Font.DemiBold : Font.Normal",
             self.selection_combo_qml,
@@ -12018,10 +10843,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("displayText: decoratedText(currentIndex, currentText)", self.selection_combo_qml)
         self.assertEqual(self.buttons_qml.count("SelectionComboBox {"), 0)
         self.assertNotIn("SettingsController.comboModifierOptions", self.buttons_qml)
-        self.assertIn(
-            "model: SettingsController.voiceProgramOptions",
-            self.voice_qml,
-        )
+        self.assertNotIn("SettingsController.voiceProgramOptions", self.voice_qml)
 
     def test_log_export_has_one_formal_entry_point(self):
         self.assertNotIn("SettingsController.exportLogs(", self.voice_qml)
@@ -12129,9 +10951,8 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         )
         self.assertEqual(
             self.device_qml.count("descriptionNeverElide: true"),
-            1,
+            2,
         )
-        self.assertIn("descriptionNeverElide: SettingsController.isRc003Device", self.device_qml)
         self.assertIn(
             "Math.max(\n                root.stateColumnWidth",
             self.inline_settings_row_qml,
@@ -12175,7 +10996,7 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             "相当于自动点击一次",
             "默认隐藏到通知区域；需要彻底结束时可改为完全退出",
             "登录后自动在后台运行",
-            "打开无线麦后自动连接遥控器",
+            "打开MiOpention后自动连接遥控器",
             "设置右上角关闭按钮的行为",
             "正在检查蓝牙设备",
             "正在检查按键",
@@ -12390,7 +11211,10 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertNotIn("ToolTip", self.dialog_close_button_qml)
         self.assertIn("renderType: Text.QtRendering", self.icon_glyph_qml)
         self.assertEqual(self.buttons_qml.count("DialogCloseButton {"), 2)
-        self.assertEqual(self.voice_qml.count("SettingsDialog {"), 2)
+        # Voice page: driver confirm, bridge-test confirm, profile name,
+        # profile delete and the profile manager; the three file pickers reuse
+        # Qt's own FileDialog.
+        self.assertEqual(self.voice_qml.count("SettingsDialog {"), 5)
 
     def test_tooltips_are_compact_and_follow_each_truncated_text(self):
         self.assertIn("ToolTip {", self.compact_tooltip_qml)
@@ -12404,17 +11228,23 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         for inset in ("leftInset", "rightInset", "topInset", "bottomInset"):
             self.assertIn(f"{inset}: 0", self.compact_tooltip_qml)
         self.assertIn("maximumTextWidth: 260", self.compact_tooltip_qml)
-        self.assertEqual(self.buttons_qml.count("CompactToolTip {"), 3)
+        # Five section titles plus the elided Interception driver status
+        # message, which needs a tooltip of its own to stay readable.
+        self.assertEqual(self.buttons_qml.count("CompactToolTip {"), 6)
         for title_id in (
             "primaryGestureTitle",
             "doubleGestureTitle",
             "longGestureTitle",
+            "injectModeTitle",
+            "interceptionDriverTitle",
         ):
             self.assertIn(f"id: {title_id}", self.buttons_qml)
         for title_id in (
             "primaryGestureTitle",
             "doubleGestureTitle",
             "longGestureTitle",
+            "injectModeTitle",
+            "interceptionDriverTitle",
         ):
             title_start = self.buttons_qml.index(f"id: {title_id}")
             tooltip_start = self.buttons_qml.index("CompactToolTip {", title_start)
@@ -12440,6 +11270,70 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("globalStatusHover.hovered", self.main_qml)
         self.assertIn("globalStatusText.truncated", self.main_qml)
 
+    def test_buttons_editor_exposes_a_per_button_injection_backend(self):
+        self.assertIn('objectName: "actionEditorInjectModeCombo"', self.buttons_qml)
+        self.assertIn("model: SettingsController.injectModeOptions", self.buttons_qml)
+        self.assertIn(
+            "SettingsController.buttonInjectMode(buttonIdValue)", self.buttons_qml
+        )
+        self.assertIn(
+            "SettingsController.setButtonInjectMode(buttonId, injectMode)",
+            self.buttons_qml,
+        )
+        self.assertIn("injectMode !== originalInjectMode", self.buttons_qml)
+        # One derived property surfaces the missing driver, the per-action
+        # block reason, and the "not an ordinary key action" case alike.
+        self.assertIn(
+            "readonly property string injectModeHintText", self.buttons_qml
+        )
+        self.assertIn(
+            "visible: actionEditor.injectModeHintText.length > 0", self.buttons_qml
+        )
+        self.assertIn('objectName: "actionEditorInjectModeHint"', self.buttons_qml)
+        # The hint reflects the real reason, never a fixed "driver not installed".
+        self.assertIn(
+            "SettingsController.interceptionUnavailableHint", self.buttons_qml
+        )
+        self.assertIn("injectModeBlockReason", self.buttons_qml)
+        self.assertNotIn(
+            "未安装 Interception 驱动，仅可用 SendInput", self.buttons_qml
+        )
+        self.assertIn(
+            "option.available === false", self.buttons_qml
+        )
+
+    def test_buttons_editor_exposes_explicit_interception_driver_install_buttons(self):
+        self.assertIn(
+            'objectName: "actionEditorInterceptionDriverTitle"', self.buttons_qml
+        )
+        self.assertIn(
+            'objectName: "actionEditorInterceptionInstallButton"', self.buttons_qml
+        )
+        self.assertIn(
+            'objectName: "actionEditorInterceptionUninstallButton"', self.buttons_qml
+        )
+        self.assertIn(
+            'objectName: "actionEditorInterceptionDriverMessage"', self.buttons_qml
+        )
+        self.assertIn(
+            "SettingsController.installInterceptionDriver()", self.buttons_qml
+        )
+        self.assertIn(
+            "SettingsController.uninstallInterceptionDriver()", self.buttons_qml
+        )
+        # The buttons are disabled unless a pinned official installer ships with
+        # this build, and the reason is surfaced to the user.
+        self.assertIn(
+            "enabled: SettingsController.interceptionInstallerAvailable", self.buttons_qml
+        )
+        self.assertIn(
+            "SettingsController.interceptionInstallerUnavailableReason", self.buttons_qml
+        )
+        self.assertIn('qsTr("安装驱动")', self.buttons_qml)
+        self.assertIn('qsTr("卸载驱动")', self.buttons_qml)
+        # Launching the vendor installer is never reported as a silent success.
+        self.assertIn("root.interceptionDriverMessage = result.message", self.buttons_qml)
+
     def test_icon_glyph_has_windows_10_font_fallback(self):
         self.assertIn('Qt.fontFamilies().indexOf("Segoe Fluent Icons")', self.icon_glyph_qml)
         self.assertIn('Qt.fontFamilies().indexOf("Segoe MDL2 Assets")', self.icon_glyph_qml)
@@ -12454,64 +11348,42 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("enabled: !SettingsController.bridgeLaunchBusy", self.device_qml)
 
     def test_voice_page_states_real_windows_boundaries_without_fake_grants(self):
-        for object_name in (
-            "openMicrophonePrivacyButton",
-            "openVoiceProgramSettingsButton",
-        ):
-            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
-        self.assertNotIn('objectName: "openSoundInputSettingsButton"', self.voice_qml)
+        self.assertIn('objectName: "openMicrophonePrivacyButton"', self.voice_qml)
         self.assertIn('titleText: qsTr("麦克风权限")', self.voice_qml)
         self.assertNotIn('stateText: qsTr("待确认")', self.voice_qml)
-        self.assertIn(
-            'qsTr("请录入按住型快捷键")',
-            self.voice_qml,
-        )
-        self.assertIn(
-            'qsTr("刷新时会打开微信设置")',
-            self.voice_qml,
-        )
-        self.assertIn(
-            'qsTr("自动读取按住型快捷键")',
-            self.voice_qml,
-        )
-        self.assertIn(
-            'qsTr("自动读取开关型快捷键")',
-            self.voice_qml,
-        )
         self.assertNotIn('? qsTr("无需设置")', self.voice_qml)
         self.assertIn("SettingsController.hotkeyCaptureReady", self.voice_qml)
         self.assertIn('qsTr("准备中")', self.voice_qml)
         self.assertIn('qsTr("正在准备…")', self.voice_qml)
         self.assertIn('? qsTr("录入中")', self.voice_qml)
-        self.assertIn(
-            'SettingsController.voiceHotkeySaveState === "retry"',
-            self.voice_qml,
-        )
         self.assertIn('qsTr("点击“安装音频”")', self.voice_qml)
         self.assertIn('qsTr("请重新选择端点")', self.voice_qml)
         self.assertIn('qsTr("点击“重新检查”")', self.voice_qml)
         self.assertIn('qsTr("请手动验证")', self.voice_qml)
         self.assertNotIn('text: qsTr("语音试说")', self.voice_qml)
-        self.assertIn('qsTr("退出后点“重新检测”")', self.voice_qml)
         self.assertNotIn('qsTr("需处理")', self.voice_qml)
         self.assertNotIn('qsTr("待完成")', self.voice_qml)
         for misleading_claim in (
             "已授权",
-            "无线麦需要管理员权限",
+            "MiOpention需要管理员权限",
             "VB-CABLE 安装成功",
         ):
             self.assertNotIn(misleading_claim, self.voice_qml)
-        self.assertNotIn('objectName: "voiceProgramSpecificRow"', self.voice_qml)
-        self.assertNotIn('objectName: "voiceProgramLaunchText"', self.voice_qml)
-        self.assertNotIn('objectName: "speakTestDialog"', self.voice_qml)
+        # The rewrite retired every provider-specific row, dialog, and grant.
+        for retired in (
+            'objectName: "openVoiceProgramSettingsButton"',
+            'objectName: "openSoundInputSettingsButton"',
+            'objectName: "voiceProgramSpecificRow"',
+            'objectName: "voiceProgramLaunchText"',
+            'objectName: "speakTestDialog"',
+        ):
+            self.assertNotIn(retired, self.voice_qml)
 
-    def test_voice_program_state_does_not_treat_an_idle_window_as_failure(self):
+    def test_voice_slot_state_does_not_treat_an_unsaved_slot_as_failure(self):
+        self.assertNotIn("voiceProgramStatusCode", self.voice_qml)
         self.assertNotIn("running_not_ready", self.voice_qml)
-        self.assertIn(
-            'SettingsController.voiceProgramStatusCode === "running"',
-            self.voice_qml,
-        )
         self.assertIn("tokens.successColor", self.voice_qml)
+        self.assertIn('? qsTr("待录入") : qsTr("已保存")', self.voice_qml)
 
     def test_device_and_voice_guidance_use_the_shared_page_navigation(self):
         self.assertIn("signal openButtonsRequested()", self.device_qml)
@@ -12590,7 +11462,11 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("actionEditor.buttonId", self.buttons_qml)
         self.assertEqual(
             self.buttons_qml.count("model: SettingsController.secondaryActionOptionsFor(actionEditor.buttonId)"),
-            2,
+            1,
+        )
+        self.assertEqual(
+            self.buttons_qml.count("model: SettingsController.longPressActionOptionsFor(actionEditor.buttonId)"),
+            1,
         )
         self.assertEqual(self.buttons_qml.count("cardId: buttonId"), 2)
         self.assertIn('objectName: "actionEditorDialog"', self.buttons_qml)
@@ -12608,8 +11484,8 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertNotIn("ListView {", self.buttons_qml)
         self.assertNotIn('objectName: "voiceSettingsPanel"', self.buttons_qml)
         self.assertNotIn('objectName: "voiceProgramDialog"', self.buttons_qml)
-        self.assertIn('objectName: "voiceProgramCombo"', self.voice_qml)
-        self.assertIn('objectName: "holdVoiceHotkeyField"', self.voice_qml)
+        self.assertIn('objectName: "voiceSlotHotkeyField"', self.voice_qml)
+        self.assertIn('objectName: "recordVoiceHotkeyButton"', self.voice_qml)
         self.assertIn("SettingsController.restoreMappingDefaults()", self.buttons_qml)
         self.assertIn('qsTr("检测真实按键")', self.buttons_qml)
         self.assertNotIn('objectName: "saveMappingButton"', self.buttons_qml)
@@ -12625,43 +11501,45 @@ class SettingsShellSourceContractTests(unittest.TestCase):
 
         self.assertLess(switch_index, single_index)
         self.assertLess(single_index, actions_index)
-        self.assertEqual(switcher_source.count("Layout.preferredWidth: 1"), 2)
-        self.assertIn("text: SettingsController.deviceOptions[0]", switcher_source)
-        self.assertIn("text: SettingsController.deviceOptions[1]", switcher_source)
-        self.assertIn("highlighted: SettingsController.isRc003Device", switcher_source)
-        self.assertIn("highlighted: !SettingsController.isRc003Device", switcher_source)
+        # The bar is a Logi Options+ style chip strip: a global chip, one chip
+        # per saved application, then "+" to add another.
+        self.assertIn('"mappingChip_global"', switcher_source)
+        self.assertIn('"mappingChip_" + (index - 1)', switcher_source)
+        self.assertIn('objectName: "addMappingAppButton"', switcher_source)
+        self.assertIn("SettingsController.selectMappingEditTarget(", switcher_source)
+        self.assertNotIn("SettingsController.deviceOptions[0]", switcher_source)
+        self.assertNotIn("SettingsController.deviceOptions[1]", switcher_source)
+        self.assertNotIn('objectName: "rc003DeviceButton"', self.buttons_qml)
+        self.assertNotIn('objectName: "futureDeviceButton"', self.buttons_qml)
         self.assertNotIn('objectName: "comboMappingList"', self.buttons_qml)
         self.assertNotIn("model: SettingsController.comboRows", self.buttons_qml)
         self.assertNotIn('objectName: "comboActionEditor_" + buttonId', self.buttons_qml)
 
     def test_voice_hotkey_field_is_owned_by_the_voice_page(self):
         self.assertIn('placeholderText: qsTr("尚未录入")', self.voice_qml)
-        self.assertIn(
-            'qsTr("请录入按住型快捷键")',
-            self.voice_qml,
-        )
-        self.assertIn(
-            'qsTr("语音按键，录入%1快捷键").arg(root.voiceHotkeyModeLabel)',
-            self.voice_qml,
-        )
-        self.assertNotIn('qsTr("微信语音无需设置快捷键")', self.voice_qml)
+        self.assertIn('objectName: "voiceSlotHotkeyField"', self.voice_qml)
         self.assertIn('objectName: "recordVoiceHotkeyButton"', self.voice_qml)
-        self.assertNotIn("windowsDictationSelected", self.voice_qml)
-        self.assertIn('objectName: "openVoiceProgramSettingsButton"', self.voice_qml)
+        self.assertIn(
+            "SettingsController.formatHotkeyText(",
+            self.voice_qml,
+        )
         self.assertIn(
             "if (!SettingsController.startHotkeyCapture())",
             self.voice_qml,
         )
+        self.assertNotIn("windowsDictationSelected", self.voice_qml)
+        self.assertNotIn("voiceProgramOptions", self.voice_qml)
+        self.assertNotIn('objectName: "voiceSlotHotkeyField"', self.buttons_qml)
         self.assertNotIn('objectName: "holdVoiceHotkeyField"', self.buttons_qml)
 
-    def test_voice_program_section_has_no_redundant_note_only_row(self):
+    def test_voice_key_section_has_no_redundant_note_only_row(self):
         self.assertNotIn('objectName: "voiceProgramSpecificRow"', self.voice_qml)
         self.assertNotIn('objectName: "voiceProgramLaunchText"', self.voice_qml)
         self.assertNotIn("voiceProgramLaunchDescription", self.voice_qml)
         voice_hotkey_block = self.voice_qml.split(
             'objectName: "voiceHotkeyRow"', 1
         )[1].split('objectName: "voiceTestSection"', 1)[0]
-        self.assertIn("showDivider: false", voice_hotkey_block)
+        self.assertIn("showDivider: true", voice_hotkey_block)
 
     def test_voice_rows_use_the_shared_fixed_action_column(self):
         self.assertIn(
@@ -12675,24 +11553,20 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         )
 
     def test_conflicting_audio_work_locks_direct_writes_but_mapping_page_has_no_save_control(self):
-        self.assertIn(
-            "readonly property bool endpointPreflightBusy:",
-            self.voice_qml,
-        )
         self.assertIn("readonly property bool configurationWriteBusy:", self.voice_qml)
         for busy_source in (
             "DiagnosticsController.driverActionRunning",
             "DiagnosticsController.vbCableTestRunning",
             "SettingsController.bridgeLaunchBusy",
-            "root.endpointPreflightBusy",
+            "SettingsController.endpointPreflightBusy",
         ):
             self.assertIn(busy_source, self.voice_qml)
         self.assertGreaterEqual(
             self.voice_qml.count("!root.configurationWriteBusy"),
-            9,
+            6,
         )
         self.assertIn(
-            "&& !SettingsController.settingsSaveBusy",
+            "&& !root.voiceHotkeyBusy",
             self.voice_qml,
         )
         self.assertIn(
@@ -12878,41 +11752,44 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
             self.assertIn(f'"{check_id}"', self.voice_qml)
         self.assertIn("DiagnosticsController.refreshDiagnostics()", self.device_qml)
 
-    def test_voice_page_has_device_specific_recording_rows_and_provider_content(self):
+    def test_voice_page_has_per_slot_hotkey_rows_without_provider_content(self):
         for object_name in (
             "audioPrerequisiteSection",
-            "rc003RemoteRecordingModeRow",
-            "remoteRecordingModeRow",
-            "voiceProgramSection",
+            "voiceKeySection",
             "voiceTestSection",
         ):
             self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
-        self.assertIn("visible: SettingsController.isRc003Device", self.voice_qml)
-        self.assertIn("visible: !SettingsController.isRc003Device", self.voice_qml)
-        rc003_recording_block = self.voice_qml.split(
-            'objectName: "rc003RemoteRecordingModeRow"', 1
-        )[1].split('objectName: "remoteRecordingModeRow"', 1)[0]
-        self.assertIn('titleText: qsTr("按键模式")', rc003_recording_block)
-        self.assertIn('descriptionText: qsTr("仅支持按住型")', rc003_recording_block)
-        self.assertNotIn("SelectionComboBox", rc003_recording_block)
-        self.assertIn('objectName: "voiceProgramCombo"', self.voice_qml)
-        self.assertIn('objectName: "voiceProgramCustomPathRow"', self.voice_qml)
-        self.assertIn('objectName: "recordVoiceHotkeyButton"', self.voice_qml)
-        self.assertIn('objectName: "openVoiceProgramSettingsButton"', self.voice_qml)
-        self.assertNotIn("voiceProgramWindowsDictationSelected", self.voice_qml)
+        self.assertIn('objectName: "voiceSlotHotkeyRepeater"', self.voice_qml)
+        self.assertIn('objectName: "voiceHotkeyRow"', self.voice_qml)
+        self.assertIn("model: root.voiceSlots", self.voice_qml)
         self.assertIn(
-            "SettingsController.voiceProgramCustomSelected",
+            "titleText: SettingsController.voiceSlotLabel(slot)",
             self.voice_qml,
         )
-        self.assertNotIn("selectedVoiceProgramIndex ===", self.voice_qml)
-        self.assertIn(
-            "SettingsController.refreshVoiceHotkeyFromProvider()", self.voice_qml
-        )
-        self.assertIn(
-            "SettingsController.loadVoiceHotkeyFromProvider()", self.voice_qml
-        )
-        self.assertNotIn('objectName: "voiceProgramStatusRefreshTimer"', self.voice_qml)
+        self.assertIn('objectName: "voiceSlotHotkeyField"', self.voice_qml)
+        self.assertIn('objectName: "recordVoiceHotkeyButton"', self.voice_qml)
         self.assertIn("readonly property bool voiceHotkeyBusy", self.voice_qml)
+        # The rewrite retired every provider-specific control and the
+        # per-device recording-mode rows.
+        for retired in (
+            'objectName: "voiceProgramSection"',
+            'objectName: "voiceProgramCombo"',
+            'objectName: "voiceProgramCustomPathRow"',
+            'objectName: "openVoiceProgramSettingsButton"',
+            'objectName: "rc003RemoteRecordingModeRow"',
+            'objectName: "remoteRecordingModeRow"',
+        ):
+            self.assertNotIn(retired, self.voice_qml)
+        for retired_source in (
+            "visible: SettingsController.isRc003Device",
+            "visible: !SettingsController.isRc003Device",
+            "voiceProgramWindowsDictationSelected",
+            "selectedVoiceProgramIndex ===",
+            "SettingsController.refreshVoiceHotkeyFromProvider()",
+            "SettingsController.loadVoiceHotkeyFromProvider()",
+            'objectName: "voiceProgramStatusRefreshTimer"',
+        ):
+            self.assertNotIn(retired_source, self.voice_qml)
 
     def test_voice_audio_rows_auto_save_and_keep_manual_privacy_only(self):
         for object_name in (
@@ -12942,6 +11819,45 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertNotIn('objectName: "openSoundInputSettingsButton"', self.voice_qml)
         self.assertNotIn('text: qsTr("声音输入")', self.voice_qml)
 
+    def test_voice_page_offers_the_saved_profile_library(self):
+        for object_name in (
+            "voiceProfileSection",
+            "voiceProfileHintRow",
+            "manageVoiceProfilesButton",
+            "voiceProfileManagerDialog",
+            "voiceProfileListScroll",
+            "voiceProfileList",
+            "voiceProfileDialogMessage",
+            "closeVoiceProfileManagerButton",
+            "voiceProfileRepeater",
+            "voiceProfileLabel",
+            "applyVoiceProfileButton",
+            "updateVoiceProfileButton",
+            "renameVoiceProfileButton",
+            "copyVoiceProfileButton",
+            "exportVoiceProfileButton",
+            "deleteVoiceProfileButton",
+            "saveVoiceProfileButton",
+            "exportAllVoiceProfilesButton",
+            "importVoiceProfileButton",
+            "voiceProfileNameDialog",
+            "voiceProfileDeleteDialog",
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
+        self.assertIn("voiceProfileManagerDialog.open()", self.voice_qml)
+        # The profile cards live in the manager dialog, not inline on the page.
+        inline_section = self.voice_qml.split('objectName: "voiceProfileSection"')[1]
+        inline_section = inline_section.split('objectName: "voiceTestSection"')[0]
+        self.assertNotIn("voiceProfileRepeater", inline_section)
+        self.assertNotIn("deleteVoiceProfileButton", inline_section)
+        self.assertIn("SettingsController.voiceProfiles", self.voice_qml)
+        self.assertIn("SettingsController.mappingPresetAction(", self.voice_qml)
+        self.assertIn("SettingsController.exportAllMappingPresets(", self.voice_qml)
+        self.assertIn("删除后无法撤销", self.voice_qml)
+        # Deleting a profile must always go through the confirmation dialog.
+        self.assertIn('"delete", voiceProfileDeleteDialog.pendingProfileId',
+                      self.voice_qml)
+
     def test_voice_channel_check_keeps_safe_service_recovery(self):
         for object_name in (
             "bridgeTestConfirmDialog",
@@ -12964,6 +11880,11 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertIn('text: qsTr("恢复内置默认")', self.buttons_qml)
         self.assertIn("SettingsController.restoreMappingDefaults()", self.buttons_qml)
         self.assertIn("并立即自动保存", self.buttons_qml)
+        # Removing an application chip is destructive too, so it must confirm
+        # first instead of deleting on a single stray click.
+        self.assertIn('objectName: "removeMappingAppConfirmDialog"', self.buttons_qml)
+        self.assertIn("removeMappingAppConfirmDialog.open()", self.buttons_qml)
+        self.assertIn("SettingsController.removeMappingAppProfile(", self.buttons_qml)
         detect_index = self.buttons_qml.index('objectName: "detectRealKeyButton"')
         note_index = self.buttons_qml.index('objectName: "voiceGestureRestrictionText"')
         self.assertLess(detect_index, note_index)
@@ -13239,7 +12160,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         self.assertTrue(data["recording_before_stop_completed"])
         self.assertEqual(data["pending_before_stop_completed"], "ctrl+shift+f8")
         self.assertEqual(data["saved_voice_hotkey"], "ctrl+shift+f8")
-        self.assertIn("快捷键已保存到无线麦", data["voice_save_status"])
+        self.assertIn("语音设置已自动保存", data["voice_save_status"])
         self.assertFalse(data["voice_feedback_on_device"])
         self.assertTrue(data["voice_feedback_on_voice"])
         self.assertTrue(data["mapping_dirty_on_buttons"])
@@ -13444,12 +12365,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
         data = style_results["Basic"]
         self.assertEqual(
             data["device_options"],
-            [
-                device_catalog.profile_for(device_catalog.RC003_ID).display_name,
-                device_catalog.profile_for(
-                    device_catalog.CHROMECAST_ID
-                ).display_name,
-            ],
+            [device_catalog.profile_for(device_catalog.RC003_ID).display_name],
         )
         self.assertTrue(data["rc003_visible"])
         self.assertEqual(data["mapping_page_title"], "按键映射")
@@ -13893,7 +12809,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 )
 
                 voice_items = data["pages"]["voice"]["items"]
-                # Custom program rows can exceed this compact viewport. The
+                # The voice page must not overflow this compact viewport: the
                 # visible scroll area must not cover the status bar, and the
                 # final controls must remain reachable by scrolling.
                 self.assertTrue(data["voice_scroll"]["clip"])
@@ -13901,23 +12817,15 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                 self.assertLessEqual(data["voice_scrolled_end"]["bottom"], data["voice_scroll"]["bottom"] + 1)
                 self.assertLessEqual(
                     voice_items["audioPrerequisiteSection"]["bottom"],
-                    voice_items["voiceProgramSection"]["y"] + 1,
+                    voice_items["voiceKeySection"]["y"] + 1,
                 )
                 self.assertLessEqual(
-                    voice_items["voiceProgramSection"]["bottom"],
+                    voice_items["voiceKeySection"]["bottom"],
                     voice_items["voiceTestSection"]["y"] + 1,
-                )
-                self.assertGreaterEqual(
-                    voice_items["voiceProgramCustomPathRow"]["y"],
-                    voice_items["voiceProgramSection"]["y"],
-                )
-                self.assertLessEqual(
-                    voice_items["voiceProgramCustomPathRow"]["bottom"],
-                    voice_items["voiceProgramSection"]["bottom"] + 1,
                 )
                 for section_name, title_name in (
                     ("audioPrerequisiteSection", "audioPrerequisiteSectionTitle"),
-                    ("voiceProgramSection", "voiceProgramSectionTitle"),
+                    ("voiceKeySection", "voiceKeySectionTitle"),
                     ("voiceTestSection", "voiceTestSectionTitle"),
                 ):
                     self.assertGreaterEqual(
@@ -13950,10 +12858,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                     self.assertAlmostEqual(column["width"], 96, delta=1)
                     self.assertLessEqual(column["right"], reference_action["x"] + 1)
 
-                for control in (
-                    *voice_columns["right_controls"].values(),
-                    *data["voice_provider_actions"].values(),
-                ):
+                for control in voice_columns["right_controls"].values():
                     self.assertTrue(control["visible"])
                     self.assertAlmostEqual(control["x"], reference_action["x"], delta=1)
                     self.assertAlmostEqual(control["width"], 92, delta=1)
@@ -13979,25 +12884,6 @@ class OffscreenQmlLoadTests(unittest.TestCase):
                     self.assertAlmostEqual(editor["x"], editors[0]["x"], delta=1)
                     self.assertGreaterEqual(editor["width"], 130)
                     self.assertLessEqual(editor["right"], reference_state["x"] + 1)
-                # Nearby program/shortcut editors form a compact group;
-                # endpoint names and paths retain flexible long fields.
-                self.assertAlmostEqual(
-                    editor_map["voiceProgramCombo"]["width"],
-                    editor_map["holdVoiceHotkeyField"]["width"],
-                    delta=1,
-                )
-                self.assertLessEqual(
-                    voice_columns["left_controls"]["voiceProgramElevatedCheckBox"]["right"],
-                    reference_state["x"] + 1,
-                )
-                self.assertLess(
-                    editor_map["voiceProgramCombo"]["right"],
-                    voice_columns["left_controls"]["voiceProgramElevatedCheckBox"]["x"],
-                )
-                self.assertGreaterEqual(
-                    editor_map["holdVoiceHotkeyField"]["width"],
-                    130,
-                )
 
     def _legacy_settings_shell_fits_supported_logical_viewports_without_horizontal_overflow(self):
         import json
@@ -14328,7 +13214,7 @@ class FakeHotkeyCapture:
     start_calls = 0
     stop_calls = 0
 
-    def __init__(self, on_captured, *, accept_injected=False):
+    def __init__(self, on_captured, *, accept_injected=False, isolated=False, on_error=None):
         self.on_captured = on_captured
         self.accept_injected = accept_injected
         self.is_running = False
@@ -14544,7 +13430,7 @@ assert combo.property("visible")
 assert double_combo.property("visible") and long_combo.property("visible")
 assert int(combo.property("count")) == len(controller.primaryActionOptionsFor("mic"))
 assert int(double_combo.property("count")) == len(controller.secondaryActionOptionsFor("mic"))
-assert int(long_combo.property("count")) == len(controller.secondaryActionOptionsFor("mic"))
+assert int(long_combo.property("count")) == len(controller.longPressActionOptionsFor("mic"))
 assert not double_combo.property("enabled") and not long_combo.property("enabled")
 assert combo.property("selectTextByMouse")
 assert double_combo.property("selectTextByMouse")
@@ -14651,9 +13537,12 @@ current_option_state = {
 }
 assert current_option_state["highlighted"]
 assert current_option_state["font_weight"] >= 600
+grouped_index = list(
+    controller.primaryActionOptionsFor("mic")
+).index("Escape")
 grouped_option = _find_child_by_object_name(
     window,
-    "actionEditorPrimaryCombo_option_1",
+    "actionEditorPrimaryCombo_option_" + str(grouped_index),
 )
 assert grouped_option is not None
 assert int(grouped_option.property("groupHeaderHeight")) > 0
@@ -14784,7 +13673,7 @@ for invalid, reason in (("Ctrl+A+A", "一个普通键"), ("Ctrl+vk_00", "无效"
     assert manual_field.property("text") == invalid
     assert reason in recorder.property("manualErrorText")
     assert editor.property("primaryText") == "Win + L"
-    assert model.to_display_map()["mic"] == "按住说话"
+    assert model.to_display_map()["mic"] == "语音一"
 manual_field.setProperty("text", "lctrl+[")
 QMetaObject.invokeMethod(recorder, "commitManualShortcut", Qt.ConnectionType.DirectConnection)
 _wait_until(window, app, lambda: not recorder.property("visible"), "corrected capture did not close")
@@ -14794,13 +13683,13 @@ _wait_until(window, app, lambda: controller.hotkeyCaptureReady, "capture not rea
 controller._on_hotkey_capture_result((controller._input_operation_token, "lctrl+left_bracket"))
 _wait_until(window, app, lambda: not recorder.property("visible"), "captured bracket did not close")
 assert combo.property("editText") == "左 Ctrl + ["
-assert model.to_display_map()["mic"] == "按住说话"
+assert model.to_display_map()["mic"] == "语音一"
 
 # Choose real preset rows through each visible ComboBox popup. The editable
 # field and backing model must change as soon as the popup activates the row;
 # clicking the dialog's "完成" button is deliberately deferred until after
 # every assertion below.
-assert model.to_display_map()["mic"] == "按住说话"
+assert model.to_display_map()["mic"] == "语音一"
 assert double_combo.property("visible") and long_combo.property("visible")
 
 _select_combo_option(
@@ -14873,7 +13762,7 @@ for ch in typed:
 
 assert combo.property("editText") == typed
 assert editor.property("primaryText") == typed
-assert model.to_display_map()["mic"] == "按住说话"
+assert model.to_display_map()["mic"] == "语音一"
 for _ in range(3):
     window.grabWindow()
     app.processEvents()
@@ -14948,9 +13837,10 @@ _wait_until(window, app, lambda: not editor.property("visible"), "legacy editor 
 assert not controller.mappingDirty
 assert legacy_mapping_path.read_bytes() == legacy_before
 
-future_device_button = _find_child_by_object_name(window, "futureDeviceButton")
-assert future_device_button is not None
-assert future_device_button.property("enabled")
+add_app_button = _find_child_by_object_name(window, "addMappingAppButton")
+assert add_app_button is not None
+assert add_app_button.property("enabled")
+assert _find_child_by_object_name(window, "mappingChip_global") is not None
 assert _find_child_by_object_name(window, "comboActionEditor_up") is None
 
 print(json.dumps({
@@ -15134,10 +14024,9 @@ tab_bar.setProperty("currentIndex", 1)
 image = render()
 sample_control(results, image, "restoreMappingDefaultsButton")
 
-controller._replace_voice_program_settings(dict(controller._voice_program_settings, provider="custom"))
 tab_bar.setProperty("currentIndex", 2)
 image = render()
-sample_control(results, image, "holdVoiceHotkeyField")
+sample_control(results, image, "voiceSlotHotkeyField")
 
 print(json.dumps(results))
 """
@@ -15165,7 +14054,7 @@ class RenderedContrastTests(unittest.TestCase):
     _LABELS = {
         "deviceTabButton": "「设备」tab label",
         "restoreMappingDefaultsButton": "「恢复内置默认」button",
-        "holdVoiceHotkeyField": "语音按键 TextField",
+        "voiceSlotHotkeyField": "语音快捷键 TextField",
     }
 
     def test_tab_button_plain_button_and_text_field_are_all_readable(self):
@@ -15290,8 +14179,8 @@ _render(window, app)
 mapping_list = _find(window, "mappingList")
 actions_panel = _find(window, "mappingActionsPanel")
 view_switcher = _find(window, "mappingViewSwitcher")
-rc003_device_button = _find(window, "rc003DeviceButton")
-future_device_button = _find(window, "futureDeviceButton")
+global_chip = _find(window, "mappingChip_global")
+add_app_button = _find(window, "addMappingAppButton")
 mapping_lines = _find(window, "mappingLines")
 active_mapping_line = _find(window, "activeMappingLine")
 left_cards = _find(window, "leftMappingCards")
@@ -15302,7 +14191,7 @@ photo_image = _find(window, "photoImage")
 assert mapping_list is not None, "mappingList not found"
 assert actions_panel is not None
 assert view_switcher is not None
-assert rc003_device_button is not None and future_device_button is not None
+assert global_chip is not None and add_app_button is not None
 assert mapping_lines is not None and active_mapping_line is not None
 assert left_cards is not None and right_cards is not None
 assert photo_sidebar is not None, "photoSidebar not found"
@@ -15310,9 +14199,8 @@ assert photo_frame is not None and photo_frame.property("visible"), "photoFrame 
 assert photo_image is not None and photo_image.property("visible"), "photoImage not visible"
 assert mapping_list.property("count") == 13
 assert mapping_list.property("visible")
-assert rc003_device_button.property("highlighted")
-assert rc003_device_button.property("enabled")
-assert future_device_button.property("enabled")
+assert global_chip.property("objectName") == "mappingChip_global"
+assert add_app_button.property("enabled")
 
 for _ in range(100):
     if photo_image.property("paintedWidth") > 0 and photo_image.property("paintedHeight") > 0:
@@ -15445,13 +14333,13 @@ results_out = {
         "text": str(validation_error.property("text")),
     },
     "view_switcher": _geometry(view_switcher),
-    "device_track": {
-        "current": _geometry(rc003_device_button),
-        "future": _geometry(future_device_button),
-        "current_text": str(rc003_device_button.property("text")),
-        "future_text": str(future_device_button.property("text")),
-        "current_highlighted": bool(rc003_device_button.property("highlighted")),
-        "future_enabled": bool(future_device_button.property("enabled")),
+    "mapping_chips": {
+        "global": _geometry(global_chip),
+        "add": _geometry(add_app_button),
+        "global_object_name": str(global_chip.property("objectName")),
+        "add_text": str(add_app_button.property("text")),
+        "global_active": bool(global_chip.property("active")),
+        "add_enabled": bool(add_app_button.property("enabled")),
     },
     "actions_panel": _geometry(actions_panel),
     "mapping_list": _geometry(mapping_list),
@@ -15673,14 +14561,15 @@ class ButtonsPageMappingCardTests(unittest.TestCase):
                 data["view_switcher"]["bottom"], data["mapping_list"]["y"] + 1
             )
             self.assertLessEqual(data["mapping_list"]["bottom"], data["actions_panel"]["y"] + 1)
-            self.assertEqual(data["device_track"]["current_text"], "小米遥控器2 Pro")
-            self.assertEqual(data["device_track"]["future_text"], "谷歌 Chromecast 遥控器")
-            self.assertTrue(data["device_track"]["current_highlighted"])
-            self.assertTrue(data["device_track"]["future_enabled"])
-            self.assertAlmostEqual(
-                data["device_track"]["current"]["width"],
-                data["device_track"]["future"]["width"],
-                delta=1,
+            self.assertEqual(
+                data["mapping_chips"]["global_object_name"], "mappingChip_global"
+            )
+            self.assertEqual(data["mapping_chips"]["add_text"], "+")
+            self.assertTrue(data["mapping_chips"]["global_active"])
+            self.assertTrue(data["mapping_chips"]["add_enabled"])
+            self.assertLessEqual(
+                data["mapping_chips"]["global"]["right"],
+                data["mapping_chips"]["add"]["x"] + 1,
             )
             self.assertLess(data["left_cards"]["x"], data["photo"]["sidebar"]["x"])
             self.assertLess(data["photo"]["sidebar"]["x"], data["right_cards"]["x"])

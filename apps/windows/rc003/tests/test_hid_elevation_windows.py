@@ -1233,17 +1233,17 @@ class InstalledHelperTests(unittest.TestCase):
                 Path(raw) / "_internal" / hid_elevation_windows.HELPER_EXE_NAME,
             )
 
-    def test_versioned_distribution_uses_program_files_directory(self):
+    def test_versioned_distribution_uses_english_runtime_directory(self):
         with tempfile.TemporaryDirectory() as raw:
             executable = (
-                Path(raw) / "无线麦 win版 1.0.51-candidate.51.exe"
+                Path(raw) / "MiOpention 1.0.51-candidate.51.exe"
             )
             self.assertEqual(
                 hid_elevation_windows.bundled_helper_path(
                     frozen=True,
                     executable=str(executable),
                 ),
-                Path(raw) / "程序文件" / hid_elevation_windows.HELPER_EXE_NAME,
+                Path(raw) / "app" / hid_elevation_windows.HELPER_EXE_NAME,
             )
 
     def test_unknown_frozen_executable_does_not_offer_a_helper(self):

@@ -35,7 +35,6 @@ if not SRC_ROOT.is_dir():
     raise SystemExit(f"required build source directory is missing: {SRC_ROOT}")
 REPO_ROOT = RC003_ROOT.parents[2]
 REMOTE_PHOTO = REPO_ROOT / "Resources" / "RC003-remote-photo.png"
-CHROMECAST_PHOTO = REPO_ROOT / "Resources" / "Chromecast-remote-photo.png"
 QML_SOURCE_DIR = SRC_ROOT / "ovb_rc003" / "qml"
 APP_ICON_DIR = SRC_ROOT / "ovb_rc003" / "assets" / "icons"
 APP_ICON = APP_ICON_DIR / "remote-mic.ico"
@@ -68,6 +67,20 @@ DEVICE_PROFILES_DIR = REPO_ROOT / "device-profiles"
 # extraction) so the frozen build's optional driver-helper page works fully
 # offline on the end-user machine.
 VB_CABLE_BUNDLE_ZIP = RC003_ROOT / "build" / "third_party" / "VBCABLE_Driver_Pack45.zip"
+# Interception's user-mode shim (interception.dll).  The kernel driver is a
+# separate one-time machine-wide administrator install; this DLL is only the
+# client the frozen app loads when a user switches a button to the optional
+# Interception backend.  build/fetch-interception.ps1 (run by
+# build-candidate.ps1 before this spec) writes the hash-verified x64 copy here.
+INTERCEPTION_DLL = RC003_ROOT / "build" / "third_party" / "interception" / "interception.dll"
+# The official Interception command-line installer, shipped alongside the DLL in
+# the same pinned release.  It is bundled ONLY so the settings window can offer
+# an explicit, user-clicked, UAC-elevated install/uninstall of the kernel driver
+# (see interception_driver_install.py); the app never runs it on its own and
+# never treats a launched process as a completed install.
+INTERCEPTION_INSTALLER = (
+    RC003_ROOT / "build" / "third_party" / "interception" / "install-interception.exe"
+)
 FRIDA_ASSET_DIR = SRC_ROOT / "ovb_rc003" / "frida_assets"
 VERSION_FILE = SRC_ROOT / "ovb_rc003" / "VERSION"
 HID_HELPER_NAME = "RemoteMicRC003HidHelper"
@@ -175,9 +188,6 @@ datas.append((str(VERSION_FILE), "ovb_rc003"))
 # checkout may still degrade if a user deletes the file after startup, but a
 # frozen candidate is incomplete without the real button-layout reference.
 datas.append((str(REMOTE_PHOTO), "Resources"))
-if not CHROMECAST_PHOTO.is_file():
-    raise SystemExit(f"required Chromecast photo is missing: {CHROMECAST_PHOTO}")
-datas.append((str(CHROMECAST_PHOTO), "Resources"))
 if QML_SOURCE_DIR.is_dir():
     # XRBM-030: the settings window's entire QML source tree is made of real
     # files on disk, not a Python module - PyInstaller's Analysis never
@@ -224,6 +234,19 @@ if VB_CABLE_BUNDLE_ZIP.is_file():
     # this spec ever runs for a real candidate build; this spec itself stays
     # defensive/optional, matching the existing photo/qml pattern above.
     datas.append((str(VB_CABLE_BUNDLE_ZIP), "vb_cable_bundle"))
+if INTERCEPTION_DLL.is_file():
+    # Placed at the payload root so interception_runtime_windows.py finds it
+    # under sys._MEIPASS/interception.dll.  Optional here for exactly the same
+    # reason as the VB-CABLE bundle above: fetch-interception.ps1 in
+    # build-candidate.ps1 is the gate for a real candidate build, while a bare
+    # `pyinstaller` invocation simply yields a build without the optional
+    # Interception backend (SendInput stays available).
+    datas.append((str(INTERCEPTION_DLL), "."))
+if INTERCEPTION_INSTALLER.is_file():
+    # Payload root, so interception_driver_install.py finds it under
+    # sys._MEIPASS/install-interception.exe - same sys._MEIPASS-relative lookup
+    # as interception.dll above, and optional for the same reason.
+    datas.append((str(INTERCEPTION_INSTALLER), "."))
 datas.append((str(FRIDA_GADGET_ARCHIVE), "ovb_rc003/frida_assets"))
 
 hiddenimports = [
@@ -260,47 +283,26 @@ hiddenimports = [
     "ovb_rc003.qt_settings_app",  # XRBM-030
     "ovb_rc003.windows_diagnostics",  # XRBM-031
     "ovb_rc003.vb_cable_bundle",  # XRBM-031
-    "ovb_rc003.voice_hotkey_sync_windows",
-    "ovb_rc003.voice_program_manager",
     "ovb_rc003.ble_transport_winrt",
+    "ovb_rc003.ble_candidate_probe_process",
     "ovb_rc003.raw_input_windows",
     "ovb_rc003.audio_playback",
     "ovb_rc003.win32_input",
     "ovb_rc003.connection_supervisor",
-    "ovb_rc003.doubao_rpc",
     "ovb_rc003.frida_compat",
     "ovb_rc003.frida_hid_tap_runtime",
     "ovb_rc003.frida_hid_tap_injector",
     "ovb_rc003.hid_elevation_windows",
     "ovb_rc003.hid_helper_consumers",
     "ovb_rc003.product_identity",
-    # Chromecast Remote runs several child-process and lazy-import paths.
-    # Keep the whole first-party closure explicit: the contract test below
-    # derives this inventory from every chromecast_*.py source file, so a new
-    # runtime module cannot silently miss the frozen application.
-    "ovb_rc003.chromecast_attach_diagnostics_windows",
-    "ovb_rc003.chromecast_buttons",
-    "ovb_rc003.chromecast_channel",
-    "ovb_rc003.chromecast_client",
-    "ovb_rc003.chromecast_runtime",
-    "ovb_rc003.chromecast_device_windows",
-    "ovb_rc003.chromecast_diagnostics_windows",
-    "ovb_rc003.chromecast_doubao_handsfree",
-    "ovb_rc003.chromecast_etw_windows",
-    "ovb_rc003.chromecast_gadget_windows",
-    "ovb_rc003.chromecast_hid_tap_windows",
-    "ovb_rc003.chromecast_hid_worker",
-    "ovb_rc003.chromecast_host_activity",
-    "ovb_rc003.chromecast_observation",
-    "ovb_rc003.chromecast_pipe_windows",
-    "ovb_rc003.chromecast_voice",
-    "ovb_rc003.chromecast_voice_host",
+    # The bridge runs several lazy-import paths; keep the shared first-party
+    # closure explicit so a new runtime module cannot silently miss the frozen
+    # application.
+    "ovb_rc003.pipe_windows",
+    "ovb_rc003.gadget_windows",
+    "ovb_rc003.voice_preferences",
     "ovb_rc003.voice_audio_session",
     "ovb_rc003.voice_shortcut_session",
-    "ovb_rc003.chromecast_voice_receiver",
-    "ovb_rc003.chromecast_wetype_finish",
-    "ovb_rc003.chromecast_wetype_toggle",
-    "ovb_rc003.chromecast_worker",
     "ovb_rc003.single_instance",  # XRBM-021: imported lazily inside
     # __main__.py's _run_bridge(), same as the other lazily-imported
     # modules above.
@@ -462,7 +464,6 @@ HELPER_EXCLUDES = (
     "ovb_rc003.app", "ovb_rc003.qt_settings_app", "ovb_rc003.ble_transport_winrt",
     "ovb_rc003.audio_playback", "ovb_rc003.windows_diagnostics",
     "ovb_rc003.settings_ui", "ovb_rc003.key_mapping",
-    "ovb_rc003.voice_hotkey_sync_windows", "ovb_rc003.voice_program_manager",
 )
 helper_native_imports = import_closure(
     RC003_ROOT, ["ovb_rc003.hid_elevation_windows", "ovb_rc003.frida_hid_tap_injector"],

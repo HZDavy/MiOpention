@@ -603,7 +603,7 @@ ApplicationWindow {
                 kind: bodyKind
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
-                text: qsTr("移除后，本机所有无线麦版本都不能使用自定义按键映射。")
+                text: qsTr("移除后，本机所有MiOpention版本都不能使用自定义按键映射。")
             }
 
             RowLayout {
@@ -922,6 +922,19 @@ ApplicationWindow {
             Layout.fillHeight: true
             spacing: 0
 
+            UiLabel {
+                objectName: "configurationWarning"
+                tokens: window.tokens
+                kind: noteKind
+                Layout.fillWidth: true
+                Layout.leftMargin: tokens.pageHorizontalPadding
+                Layout.rightMargin: tokens.pageHorizontalPadding
+                Layout.topMargin: visible ? tokens.pageVerticalPadding : 0
+                visible: SettingsController.configurationReadOnly
+                text: SettingsController.configurationError
+                wrapMode: Text.WordWrap
+            }
+
             StackLayout {
                 id: pageStack
                 Layout.fillWidth: true
@@ -946,6 +959,7 @@ ApplicationWindow {
                     active: tabBar.currentIndex === 1 || status === Loader.Ready
                     sourceComponent: Component {
                         ButtonsPage {
+                            enabled: !SettingsController.configurationReadOnly
                             tokens: window.tokens
                             backTabTarget: voiceTabButton
                             tabTarget: deviceTabButton
@@ -958,6 +972,7 @@ ApplicationWindow {
                     active: tabBar.currentIndex === 2 || status === Loader.Ready
                     sourceComponent: Component {
                         VoicePage {
+                            enabled: !SettingsController.configurationReadOnly
                             tokens: window.tokens
                             backTabTarget: voiceTabButton
                             tabTarget: deviceTabButton

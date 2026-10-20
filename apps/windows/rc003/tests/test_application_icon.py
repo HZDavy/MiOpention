@@ -14,11 +14,20 @@ _GENERATOR = _RC003_ROOT / "build" / "generate-app-icon.py"
 
 
 class ApplicationIconTests(unittest.TestCase):
-    def test_state_icons_keep_the_existing_brand_blue(self):
+    def test_state_icons_use_the_blue_rounded_square_brand_mark(self):
         for name in ("remote-mic-connected.svg", "remote-mic-unavailable.svg"):
             content = (_ICON_DIR / name).read_text(encoding="utf-8")
-            self.assertIn('stroke="#4AA8FF"', content)
+            self.assertIn('rx="5.4"', content, "图标必须是圆角矩形底")
+            self.assertIn('stroke="#FFFFFF"', content, "遥控器线稿必须是白色")
             self.assertNotIn("currentColor", content)
+        connected = (_ICON_DIR / "remote-mic-connected.svg").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('fill="#2F6BFF"', connected, "连接状态使用品牌蓝底")
+        unavailable = (_ICON_DIR / "remote-mic-unavailable.svg").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('fill="#98A2B3"', unavailable, "离线状态使用灰底以示区别")
 
     def test_qt_icon_is_applied_to_the_application_and_native_window(self):
         calls = []

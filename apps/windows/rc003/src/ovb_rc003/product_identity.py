@@ -12,13 +12,16 @@ from pathlib import Path, PurePath
 from typing import Any
 
 
-DISPLAY_NAME = "无线麦"
-WINDOWS_EDITION_NAME = "win版"
-WINDOWS_PRODUCT_NAME = f"{DISPLAY_NAME} {WINDOWS_EDITION_NAME}"
+DISPLAY_NAME = "MiOpention"
+WINDOWS_PRODUCT_NAME = DISPLAY_NAME
+# Older releases shipped as ``MiOpention+ win版 <version>.exe`` and then
+# ``MiOpention+ <version>.exe``. Startup entries and helper lookups must keep
+# recognising them so an upgrade does not strand an installed旧版.
+LEGACY_WINDOWS_PRODUCT_NAMES = ("MiOpention+ win版", "MiOpention+")
 LEGACY_WINDOWS_EXECUTABLE_NAME = "RemoteMicRC003.exe"
-WINDOWS_RUNTIME_DIRECTORY_NAME = "程序文件"
-WINDOWS_DOCUMENTATION_DIRECTORY_NAME = "说明与许可"
-WINDOWS_PORTABLE_README_NAME = "使用说明.txt"
+WINDOWS_RUNTIME_DIRECTORY_NAME = "app"
+WINDOWS_DOCUMENTATION_DIRECTORY_NAME = "docs"
+WINDOWS_PORTABLE_README_NAME = "README.txt"
 HID_HELPER_EXECUTABLE_NAME = "RemoteMicRC003HidHelper.exe"
 HID_HELPER_FILE_DESCRIPTION = f"{DISPLAY_NAME} 权限助手"
 WINDOWS_INTERNAL_NAME = "RemoteMicRC003"
@@ -29,8 +32,10 @@ _VERSION_PATTERN = re.compile(
     r"(?P<patch>0|[1-9][0-9]*)"
     r"(?:-(?P<suffix>[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*))?"
 )
+_PRESENTATION_NAMES = (WINDOWS_PRODUCT_NAME, *LEGACY_WINDOWS_PRODUCT_NAMES)
 _WINDOWS_EXECUTABLE_PATTERN = re.compile(
-    rf"{re.escape(WINDOWS_PRODUCT_NAME)} (?P<version>.+)\.exe",
+    rf"(?:{'|'.join(re.escape(name) for name in _PRESENTATION_NAMES)}) "
+    rf"(?P<version>.+)\.exe",
     re.IGNORECASE,
 )
 _WINDOWS_VERSION_COMPONENT_MAX = 65_535

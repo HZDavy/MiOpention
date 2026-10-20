@@ -27,7 +27,6 @@ from ovb_rc003.settings_ui import (
     describe_launch_result,
     describe_log_open_result,
     normalize_mapping_hotkey_text,
-    voice_hotkey_for_trigger_mode,
 )
 
 
@@ -91,8 +90,12 @@ class DisplayRoundTripTests(unittest.TestCase):
         self.assertEqual(flattened, settings_ui._PRESET_KEY_COMBOS)
         self.assertEqual(
             settings_ui.ACTION_OPTION_GROUP_STARTS,
-            frozenset(group_options[0] for _, group_options in settings_ui.ACTION_OPTION_GROUPS),
+            frozenset(group_options[0] for _, group_options in settings_ui.ACTION_OPTION_GROUPS)
+            | {next(iter(settings_ui.LONG_PRESS_ACTION_LABELS.values()))},
         )
+        for label in settings_ui.LONG_PRESS_ACTION_LABELS.values():
+            self.assertNotIn(label, flattened)
+            self.assertEqual(settings_ui.ACTION_OPTION_GROUP_BY_LABEL[label], "鼠标长按")
         self.assertNotIn("lctrl+win", flattened)
         self.assertNotIn("ralt", flattened)
         self.assertNotIn("ralt+space", flattened)
@@ -130,7 +133,7 @@ class DisplayRoundTripTests(unittest.TestCase):
 
     def test_reference_open_app_labels_round_trip_to_semantic_actions(self):
         expected = {
-            "打开无线麦": key_mapping.ActionKind.OPEN_REMOTE_MIC,
+            "打开MiOpention": key_mapping.ActionKind.OPEN_REMOTE_MIC,
             "打开 Codex": key_mapping.ActionKind.OPEN_CODEX,
             "打开 Claude": key_mapping.ActionKind.OPEN_CLAUDE,
             "打开 cmux 终端": key_mapping.ActionKind.OPEN_CMUX,
@@ -218,7 +221,7 @@ class DisplayRoundTripTests(unittest.TestCase):
                 "single_click",
                 _VOICE_HOLD_DISPLAY,
             ),
-            "单击：只有实体话筒键支持“按住说话”",
+            "",
         )
         self.assertEqual(
             settings_ui.button_action_validation_message(
@@ -261,18 +264,6 @@ class DisplayRoundTripTests(unittest.TestCase):
             hotkey.HotkeySpec.parse("win")
 
 
-class VoiceTriggerPresetTests(unittest.TestCase):
-    def test_trigger_modes_have_matching_physical_shortcuts(self):
-        self.assertEqual(
-            voice_hotkey_for_trigger_mode(key_mapping.VoiceTriggerMode.TOGGLE),
-            "ralt+space",
-        )
-        self.assertEqual(
-            voice_hotkey_for_trigger_mode(key_mapping.VoiceTriggerMode.HOLD),
-            "ralt",
-        )
-
-
 class EndpointDisplayTests(unittest.TestCase):
     def test_endpoint_with_host_api_round_trips(self):
         endpoint = audio_output.AudioEndpoint(name="Speakers", host_api="Windows WASAPI")
@@ -301,17 +292,17 @@ class EndpointDisplayTests(unittest.TestCase):
 
 class BuildSaveModelTests(unittest.TestCase):
     def setUp(self):
-        self.base_config = {"voice_hotkey": "ralt", "voice_trigger_mode": "hold"}
+        self.base_config = {"voice_hotkey": "ralt"}
         self.base_bindings = {"schema_version": 1, "bindings": {}}
 
-    def test_untouched_legacy_keys_keep_order_for_both_devices_and_all_gestures(self):
+    def test_untouched_legacy_keys_keep_order_for_all_gestures(self):
         modifier_vks = (0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5)
         rejected_vks = (0x00, 0xFF, 0x01, 0x02, 0x04, 0x05, 0x06, 0xE5, 0xE7)
         key_lists = [[f"vk_{vk:02x}"] for vk in (*modifier_vks, *rejected_vks)]
         for vk in modifier_vks:
             key_lists.extend(([f"vk_{vk:02x}", "shift"], ["shift", f"vk_{vk:02x}"]))
         key_lists.append(["shift", "ctrl", "f8"])
-        for profile in (device_catalog.RC003_ID, device_catalog.CHROMECAST_ID):
+        for profile in (device_catalog.RC003_ID,):
             for gesture in ("single_click", "double_click", "long_press"):
                 for keys in key_lists:
                     original = {"kind": "key_combo", "keys": keys}
@@ -332,7 +323,7 @@ class BuildSaveModelTests(unittest.TestCase):
                             _, saved = build_save_model(
                                 button_display_map=primary,
                                 secondary_display_map=secondary,
-                                hotkey_text="ralt", trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+                                hotkey_text="ralt", 
                                 endpoint_display_text="", base_config=self.base_config,
                                 base_bindings=base, selected_device_profile=profile,
                             )
@@ -358,7 +349,6 @@ class BuildSaveModelTests(unittest.TestCase):
         new_config, new_bindings = build_save_model(
             button_display_map={"mic": _VOICE_HOLD_DISPLAY, "power": "escape"},
             hotkey_text="ralt",
-            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -372,7 +362,6 @@ class BuildSaveModelTests(unittest.TestCase):
         new_config, _ = build_save_model(
             button_display_map={"mic": _VOICE_HOLD_DISPLAY},
             hotkey_text="ralt",
-            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -384,7 +373,6 @@ class BuildSaveModelTests(unittest.TestCase):
         new_config, new_bindings = build_save_model(
             button_display_map={"mic": "escape", "power": "escape"},
             hotkey_text="win+h",
-            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -398,32 +386,81 @@ class BuildSaveModelTests(unittest.TestCase):
         new_config, new_bindings = build_save_model(
             button_display_map={"power": "escape"},
             hotkey_text="win+h",
-            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
         )
         self.assertNotIn("mic", new_bindings["bindings"])
 
+    def test_per_button_inject_mode_is_stamped_onto_every_saved_action(self):
+        base = {
+            "schema_version": 1,
+            "bindings": {"power": {"kind": "key_combo", "keys": ["escape"]}},
+        }
+        _config, saved = build_save_model(
+            button_display_map={"power": "escape"},
+            secondary_display_map={"power": {"long_press": "f5"}},
+            hotkey_text="ralt",
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=base,
+            button_inject_modes={"power": "interception"},
+        )
+        self.assertEqual(saved["bindings"]["power"]["inject_mode"], "interception")
+        self.assertEqual(
+            saved["secondary_bindings"]["power"]["long_press"]["inject_mode"],
+            "interception",
+        )
+
+    def test_voice_button_keeps_its_inject_mode_choice(self):
+        # A voice slot is stored as a freshly built action; the per-button
+        # backend must survive that rebuild or the editor reverts to SendInput
+        # the next time the settings window is opened.
+        _config, saved = build_save_model(
+            button_display_map={"power": "语音二"},
+            hotkey_text="ralt",
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=self.base_bindings,
+            button_inject_modes={"power": "interception"},
+        )
+        self.assertTrue(saved["bindings"]["power"]["kind"].startswith("voice"))
+        self.assertEqual(saved["bindings"]["power"]["inject_mode"], "interception")
+
+    def test_default_inject_mode_keeps_the_legacy_payload_unchanged(self):
+        _config, saved = build_save_model(
+            button_display_map={"power": "escape"},
+            hotkey_text="ralt",
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=self.base_bindings,
+            button_inject_modes={"power": "sendinput"},
+        )
+        self.assertEqual(
+            saved["bindings"]["power"],
+            {"kind": "key_combo", "keys": ["escape"]},
+        )
+        self.assertNotIn("inject_mode", saved["bindings"]["power"])
+
     def test_restore_defaults_state_saves_without_raising(self):
         defaults = default_display_state()
+        # A fresh install records nothing; the untouched voice slots are a valid
+        # saved state and only become injectable once the user records a chord.
         new_config, new_bindings = build_save_model(
             button_display_map=defaults.button_display_map,
             hotkey_text=defaults.hotkey_text,
-            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
         )
         self.assertEqual(new_bindings["bindings"]["mic"]["kind"], "voice_hold")
-        self.assertEqual(new_config["voice_hotkey"], "ralt")
+        self.assertEqual(new_config["voice_hotkey"], "")
 
     def test_invalid_hotkey_raises_with_no_button_id(self):
         with self.assertRaises(SettingsValidationError) as ctx:
             build_save_model(
                 button_display_map={},
                 hotkey_text="ctrl",  # a single generic modifier is invalid
-                trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
                 endpoint_display_text="",
                 base_config=self.base_config,
                 base_bindings=self.base_bindings,
@@ -435,15 +472,14 @@ class BuildSaveModelTests(unittest.TestCase):
             build_save_model(
                 button_display_map={"menu": "a+b"},  # two non-modifier keys
                 hotkey_text="win+h",
-                trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
                 endpoint_display_text="",
                 base_config=self.base_config,
                 base_bindings=self.base_bindings,
             )
         self.assertEqual(ctx.exception.button_id, "menu")
 
-    def test_invalid_key_chords_are_rejected_for_both_remotes_and_all_gestures(self):
-        for profile in (device_catalog.RC003_ID, device_catalog.CHROMECAST_ID):
+    def test_invalid_key_chords_are_rejected_for_the_remote_and_all_gestures(self):
+        for profile in (device_catalog.RC003_ID,):
             for gesture in ("single_click", "double_click", "long_press"):
                 for text in ("Ctrl+A+A", "Ctrl+[+left_bracket", "Ctrl+vk_00", "Ctrl+numpad_left"):
                     with self.subTest(profile=profile, gesture=gesture, text=text):
@@ -451,7 +487,7 @@ class BuildSaveModelTests(unittest.TestCase):
                             build_save_model(
                                 button_display_map={"power": text if gesture == "single_click" else "escape"},
                                 secondary_display_map={"power": {gesture: text}} if gesture != "single_click" else {},
-                                hotkey_text="ralt", trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
+                                hotkey_text="ralt", 
                                 endpoint_display_text="", base_config=self.base_config,
                                 base_bindings=self.base_bindings, selected_device_profile=profile,
                                 validate_voice_hotkeys=False,
@@ -468,7 +504,6 @@ class BuildSaveModelTests(unittest.TestCase):
             build_save_model(
                 button_display_map={"back": "not_a_key"},
                 hotkey_text="win+h",
-                trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
                 endpoint_display_text="",
                 base_config=self.base_config,
                 base_bindings=self.base_bindings,
@@ -480,7 +515,6 @@ class BuildSaveModelTests(unittest.TestCase):
         new_config, new_bindings = build_save_model(
             button_display_map={"volume_mute": ""},
             hotkey_text="win+h",
-            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -491,20 +525,18 @@ class BuildSaveModelTests(unittest.TestCase):
         new_config, _ = build_save_model(
             button_display_map={},
             hotkey_text="win+h",
-            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
             endpoint_display_text="Speakers — Windows WASAPI",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
         )
         self.assertEqual(new_config["output_endpoint_name"], "Speakers")
         self.assertEqual(new_config["output_endpoint_host_api"], "Windows WASAPI")
-        self.assertEqual(new_config["voice_trigger_mode"], "hold")
+        self.assertNotIn("voice_trigger_mode", new_config)
 
     def test_only_the_hold_shortcut_is_saved(self):
         new_config, _ = build_save_model(
             button_display_map={"mic": _VOICE_HOLD_DISPLAY},
             hotkey_text="ignored-active-alias",
-            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -517,7 +549,6 @@ class BuildSaveModelTests(unittest.TestCase):
         new_config, _ = build_save_model(
             button_display_map={},
             hotkey_text="lalt+space",
-            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -525,34 +556,47 @@ class BuildSaveModelTests(unittest.TestCase):
         )
         self.assertEqual(new_config["voice_hotkeys"]["hold"], "")
 
-    def test_blank_active_voice_shortcut_is_rejected(self):
+    def test_blank_voice_slot_is_saved_but_stays_inert(self):
+        # An unrecorded slot must not block saving; it simply persists as empty
+        # and the runtime refuses to inject that chord until the user records one.
+        new_config, new_bindings = build_save_model(
+            button_display_map={"mic": _VOICE_HOLD_DISPLAY},
+            hotkey_text="",
+            endpoint_display_text="",
+            base_config=self.base_config,
+            base_bindings=self.base_bindings,
+            voice_hotkeys={"toggle": "lalt+space", "hold": ""},
+        )
+        self.assertEqual(new_bindings["bindings"]["mic"]["kind"], "voice_hold")
+        self.assertEqual(new_config["voice_hotkey"], "")
+        self.assertEqual(new_config["voice_slot_hotkeys"]["1"], "")
+
+    def test_blank_recorded_voice_shortcut_is_rejected(self):
         with self.assertRaises(SettingsValidationError) as ctx:
             build_save_model(
                 button_display_map={"mic": _VOICE_HOLD_DISPLAY},
                 hotkey_text="",
-                trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
                 endpoint_display_text="",
                 base_config=self.base_config,
                 base_bindings=self.base_bindings,
-                voice_hotkeys={"toggle": "lalt+space", "hold": ""},
+                voice_slot_hotkeys={"1": "ctrl+not_a_key"},
             )
-        self.assertEqual(ctx.exception.button_id, "mic")
-        self.assertIn("按住说话", ctx.exception.message)
+        self.assertIsNone(ctx.exception.button_id)
+        self.assertIn("语音一", ctx.exception.message)
 
     def test_mic_hold_mapping_selects_the_hold_shortcut(self):
         new_config, _ = build_save_model(
             button_display_map={"mic": _VOICE_HOLD_DISPLAY, "up": "Escape"},
             hotkey_text="ignored-active-alias",
-            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
             voice_hotkeys={"toggle": "lalt+space", "hold": "ctrl+l"},
         )
-        self.assertEqual(new_config["voice_trigger_mode"], "hold")
+        self.assertNotIn("voice_trigger_mode", new_config)
         self.assertEqual(new_config["voice_hotkey"], "ctrl+l")
 
-    def test_non_mic_primary_voice_is_rejected(self):
+    def test_two_buttons_cannot_share_one_voice_slot(self):
         with self.assertRaises(SettingsValidationError) as ctx:
             build_save_model(
                 button_display_map={
@@ -560,13 +604,12 @@ class BuildSaveModelTests(unittest.TestCase):
                     "up": _VOICE_HOLD_DISPLAY,
                 },
                 hotkey_text="ralt+space",
-                trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
                 endpoint_display_text="",
                 base_config=self.base_config,
                 base_bindings=self.base_bindings,
             )
         self.assertEqual(ctx.exception.button_id, "up")
-        self.assertIn("只有实体话筒键", ctx.exception.message)
+        self.assertIn("语音一", ctx.exception.message)
 
     def test_secondary_voice_action_is_rejected(self):
         with self.assertRaises(SettingsValidationError) as ctx:
@@ -576,7 +619,6 @@ class BuildSaveModelTests(unittest.TestCase):
                     "up": {"double_click": _VOICE_HOLD_DISPLAY}
                 },
                 hotkey_text="ralt+space",
-                trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
                 endpoint_display_text="",
                 base_config=self.base_config,
                 base_bindings=self.base_bindings,
@@ -591,7 +633,6 @@ class BuildSaveModelTests(unittest.TestCase):
                 "mic": {"double_click": "Escape", "long_press": ""}
             },
             hotkey_text="ralt+space",
-            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -614,7 +655,6 @@ class BuildSaveModelTests(unittest.TestCase):
         _, new_bindings = build_save_model(
             button_display_map={"mic": _VOICE_HOLD_DISPLAY},
             hotkey_text="ralt",
-            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=base_bindings,
@@ -637,7 +677,6 @@ class BuildSaveModelTests(unittest.TestCase):
         _, new_bindings = build_save_model(
             button_display_map={"mic": _VOICE_HOLD_DISPLAY},
             hotkey_text="ralt",
-            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=base_bindings,
@@ -654,7 +693,6 @@ class BuildSaveModelTests(unittest.TestCase):
                 "mic": {"double_click": "Return", "long_press": ""}
             },
             hotkey_text="ralt+space",
-            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -668,7 +706,6 @@ class BuildSaveModelTests(unittest.TestCase):
         new_config, new_bindings = build_save_model(
             button_display_map={"mic": "Escape", "up": "方向上"},
             hotkey_text="",
-            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -679,8 +716,8 @@ class BuildSaveModelTests(unittest.TestCase):
             path = Path(tmp) / "config.json"
             config.save_config(path, new_config)
             reloaded = config.load_config(path)
-        self.assertEqual(reloaded["voice_hotkey"], "ralt")
-        self.assertEqual(reloaded["voice_hotkeys"], {"hold": "ralt"})
+        self.assertEqual(reloaded["voice_hotkey"], "")
+        self.assertEqual(reloaded["voice_hotkeys"], {"hold": ""})
 
     def test_does_not_mutate_base_dicts(self):
         base_config_copy = dict(self.base_config)
@@ -688,7 +725,6 @@ class BuildSaveModelTests(unittest.TestCase):
         build_save_model(
             button_display_map={"power": "escape"},
             hotkey_text="win+h",
-            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -700,7 +736,6 @@ class BuildSaveModelTests(unittest.TestCase):
         new_config, new_bindings = build_save_model(
             button_display_map={"power": "escape"},
             hotkey_text="win+h",
-            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -713,7 +748,6 @@ class BuildSaveModelTests(unittest.TestCase):
         new_config, _ = build_save_model(
             button_display_map={},
             hotkey_text="win+h",
-            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -731,7 +765,6 @@ class BuildSaveModelTests(unittest.TestCase):
                 }
             },
             hotkey_text="win+h",
-            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -752,7 +785,6 @@ class BuildSaveModelTests(unittest.TestCase):
                 "power": {"double_click": "", "long_press": "禁用"}
             },
             hotkey_text="win+h",
-            trigger_mode=key_mapping.VoiceTriggerMode.TOGGLE,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -777,7 +809,6 @@ class BuildSaveModelTests(unittest.TestCase):
             button_display_map={"power": "escape"},
             secondary_display_map={},
             hotkey_text="ralt",
-            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -795,7 +826,6 @@ class BuildSaveModelTests(unittest.TestCase):
                 }
             },
             hotkey_text="ralt",
-            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -833,7 +863,6 @@ class BuildSaveModelTests(unittest.TestCase):
                 }
             },
             hotkey_text="ralt",
-            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -863,7 +892,6 @@ class BuildSaveModelTests(unittest.TestCase):
                 "unknown_button": {"single_click": "忽略"},
             },
             hotkey_text="ralt",
-            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=self.base_bindings,
@@ -888,7 +916,6 @@ class BuildSaveModelTests(unittest.TestCase):
         _, new_bindings = build_save_model(
             button_display_map={},
             hotkey_text="ralt",
-            trigger_mode=key_mapping.VoiceTriggerMode.HOLD,
             endpoint_display_text="",
             base_config=self.base_config,
             base_bindings=base_bindings,
@@ -915,17 +942,15 @@ class DefaultDisplayStateTests(unittest.TestCase):
         state = default_display_state()
         self.assertNotIn("volume_mute", state.button_display_map)
 
-    def test_hotkey_defaults_to_hold_shortcut(self):
+    def test_hotkey_defaults_to_no_recorded_shortcut(self):
         state = default_display_state()
-        self.assertEqual(state.hotkey_text, "ralt")
-
-    def test_trigger_mode_defaults_to_hold_label(self):
-        state = default_display_state()
-        self.assertEqual(state.trigger_mode_label, "按住说话")
+        # No fabricated wake shortcut: 语音一 starts empty until the user
+        # records one.
+        self.assertEqual(state.hotkey_text, "")
 
     def test_defaults_keep_only_the_hold_shortcut(self):
         state = default_display_state()
-        self.assertEqual(state.voice_hotkeys, {"hold": "ralt"})
+        self.assertEqual(state.voice_hotkeys, {"hold": ""})
 
 
 class DescribeLaunchResultTests(unittest.TestCase):

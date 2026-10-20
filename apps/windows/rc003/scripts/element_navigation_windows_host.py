@@ -2043,8 +2043,21 @@ def _run_windows(
             }
         )
         _CACHE_TTL_SECONDS = 15.0
+        # A cached snapshot whose window rect and anchor elements still match
+        # stays usable even when the change watcher reports the window dirty.
+        # Chromium-style windows repaint continuously, so without this the
+        # toggle always paid for a full accessibility pass and the target app
+        # stuttered exactly when the overlay was requested.
+        _ALIGNED_CACHE_REUSE_SECONDS = 60.0
         _PREWARM_BUDGET_SECONDS = 1.5
         _BROAD_FALLBACK_RESCAN_BUDGET_SECONDS = 0.25
+        # First-paint budget for a cold scan. A cache miss used to run a
+        # complete, unbounded accessibility enumeration before the overlay
+        # could appear, which is what made the first press on a heavy window
+        # feel like "nothing happens for a while". We now commit a partial
+        # result as soon as this budget is spent and let the existing
+        # background refresh fill in the rest.
+        _SCAN_BUDGET_SECONDS = 1.0
         _SCROLL_BURST_SECONDS = 0.35
         _IDLE_REFRESH_POLL_SECONDS = 0.05
 
@@ -2664,15 +2677,24 @@ def _run_windows(
                 return False, False, empty
             return True, partial, empty
 
-        def _cache_is_reusable(self, hwnd: int) -> bool:
+        def _cache_is_reusable(
+            self,
+            hwnd: int,
+            *,
+            ignore_dirty: bool = False,
+            max_age: Optional[float] = None,
+        ) -> bool:
             if (
                 hwnd != self.hwnd
                 or not self.all_targets
                 or time.perf_counter() - self.cache_timestamp
-                > self._CACHE_TTL_SECONDS
+                > (self._CACHE_TTL_SECONDS if max_age is None else max_age)
             ):
                 return False
-            if dirty_windows.state(hwnd, window_process_id(hwnd)) is not None:
+            if (
+                not ignore_dirty
+                and dirty_windows.state(hwnd, window_process_id(hwnd)) is not None
+            ):
                 return False
             try:
                 root = auto.ControlFromHandle(hwnd)
@@ -3093,6 +3115,22 @@ def _run_windows(
             process_id = window_process_id(hwnd)
             watcher_changed = dirty_windows.watch(hwnd, process_id)
             used_cache = not watcher_changed and self._cache_is_reusable(hwnd)
+            if not used_cache and self._cache_is_reusable(
+                hwnd,
+                ignore_dirty=True,
+                max_age=self._ALIGNED_CACHE_REUSE_SECONDS,
+            ):
+                # The watcher reports a dirty window whenever the app repaints,
+                # which is permanent for Chromium-style renderers and animated
+                # apps. The cached geometry still matches, so show the overlay
+                # from it immediately and let the idle background refresh fix
+                # any drift instead of stalling the toggle on a full scan.
+                used_cache = True
+                if (
+                    time.perf_counter() - self.cache_timestamp
+                    > self._CACHE_TTL_SECONDS
+                ):
+                    self._request_background_refresh()
             if used_cache:
                 with self._post_lock:
                     if expected_generation != self._generation:
@@ -3105,9 +3143,23 @@ def _run_windows(
             else:
                 committed, _partial, _empty = self._enumerate(
                     hwnd,
+                    deadline=started + self._SCAN_BUDGET_SECONDS,
+                    allow_partial=True,
                     should_cancel=lambda: self._generation != expected_generation,
                     expected_generation=expected_generation,
+                    commit_empty=False,
                 )
+                if not committed:
+                    # Either the budget ran out before a single usable target
+                    # was found, or the generation changed. Retry with a
+                    # complete enumeration so a genuinely heavy window still
+                    # produces a correct target set (a generation change makes
+                    # the retry a no-op).
+                    committed, _partial, _empty = self._enumerate(
+                        hwnd,
+                        should_cancel=lambda: self._generation != expected_generation,
+                        expected_generation=expected_generation,
+                    )
                 if not committed:
                     previous_process_id = (
                         window_process_id(self.hwnd) if self.hwnd > 0 else 0

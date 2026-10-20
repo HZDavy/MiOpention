@@ -22,8 +22,9 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 APP_ID = "RemoteMic"
 PRODUCT_ID = "RC003"
@@ -31,7 +32,7 @@ PRODUCT_ID = "RC003"
 CONFIG_FILENAME = "config.json"
 KEY_BINDINGS_FILENAME = "key_bindings.json"
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 VOICE_HOTKEY_SOURCE_DEFAULT = "default"
 VOICE_HOTKEY_SOURCE_AUTO = "auto"
@@ -50,14 +51,24 @@ VALID_CLOSE_BEHAVIORS = frozenset(
     {CLOSE_BEHAVIOR_HIDE_TO_TRAY, CLOSE_BEHAVIOR_QUIT}
 )
 
+# 语音输入源：模式1 用遥控器麦克风，模式2 用本机麦克风。
+VOICE_INPUT_SOURCE_REMOTE = "remote"
+VOICE_INPUT_SOURCE_LOCAL = "local"
+VOICE_INPUT_SOURCES = (
+    VOICE_INPUT_SOURCE_REMOTE,
+    VOICE_INPUT_SOURCE_LOCAL,
+)
+
 RUNTIME_LEGACY_VOICE_MODE_KEY = "_legacy_voice_trigger_mode"
 RUNTIME_REMOVED_VOICE_BINDINGS_KEY = "_removed_voice_bindings"
 RUNTIME_REMOVED_WINDOWS_DICTATION_KEY = "_removed_windows_dictation"
+RUNTIME_READ_ONLY_KEY = "_configuration_read_only"
 _RUNTIME_ONLY_KEYS = frozenset(
     {
         RUNTIME_LEGACY_VOICE_MODE_KEY,
         RUNTIME_REMOVED_VOICE_BINDINGS_KEY,
         RUNTIME_REMOVED_WINDOWS_DICTATION_KEY,
+        RUNTIME_READ_ONLY_KEY,
     }
 )
 
@@ -94,6 +105,44 @@ class ConfigTransactionError(RuntimeError):
     """Raised when a paired settings save also fails to roll back."""
 
 
+class ConfigReadOnlyError(ValueError):
+    """A preview of unreadable settings must never replace the saved files."""
+
+
+@dataclass(frozen=True)
+class SettingsLoadIssue:
+    filename: str
+    error_type: str
+    message: str
+
+
+_SETTINGS_READ_ERRORS = (
+    OSError, ValueError, TypeError, AttributeError, RecursionError, ConfigPrivacyError,
+)
+
+
+def _settings_load_issue(filename: str, error: Exception) -> SettingsLoadIssue:
+    from . import remote_selection, remote_settings
+
+    if isinstance(error, json.JSONDecodeError):
+        message = "JSON 内容不完整或格式错误。"
+    elif isinstance(error, UnicodeError):
+        message = "文件编码无法读取。"
+    elif isinstance(error, OSError):
+        message = "文件无法读取。"
+    elif isinstance(error, ConfigPrivacyError):
+        message = "含有不支持保存的设备信息。"
+    elif isinstance(error, (remote_selection.SelectionError, remote_settings.RemoteSettingsError)):
+        message = str(error)  # These validators contain fixed messages only.
+    elif isinstance(error, ConfigFormatError) and str(error) in {
+        "录音方式不受支持。", "最长录音时间不受支持。",
+    }:
+        message = str(error)
+    else:
+        message = "配置内容格式不正确。"
+    return SettingsLoadIssue(filename, type(error).__name__, message)
+
+
 def config_root() -> Path:
     from . import dev_session
     if dev_session.is_isolated():
@@ -113,12 +162,6 @@ def key_bindings_path(root: Path = None) -> Path:  # type: ignore[assignment]
 
 
 def default_config() -> Dict[str, Any]:
-    from . import key_mapping, voice_hotkey_sync_windows, voice_program_manager
-
-    voice_program = voice_program_manager.normalize_voice_program_settings({})
-    provider_hotkeys = voice_hotkey_sync_windows.default_hotkeys_by_provider()
-    current_hotkey = provider_hotkeys[str(voice_program["provider"])]["hold"]
-
     return {
         "schema_version": SCHEMA_VERSION,
         # Existing installations predate multi-device selection and must
@@ -127,19 +170,24 @@ def default_config() -> Dict[str, Any]:
         # RC003's upstream decoder applies a 10 dB speech gain before the
         # 16 kHz PCM is sent to the virtual microphone.
         "gain_db": 10.0,
-        # Remote-side gesture, distinct from the input method's hold shortcut.
-        "remote_recording_mode": "hold",
         "remote_recording_limit_seconds": 120,
-        "retry_delay": 5.0,
+        "retry_delay": 2.0,
         "max_retry_delay": 60.0,
-        "voice_shortcut_enabled": True,
-        "voice_hotkey": current_hotkey,
-        # Kept fixed for backwards compatibility with older builds. RC003's
-        # supported product path is now hold-to-talk only.
-        "voice_trigger_mode": "hold",
-        "voice_hotkeys": {"hold": current_hotkey},
-        "voice_hotkeys_by_provider": provider_hotkeys,
-        "voice_program": voice_program,
+        "voice_hotkey": "",
+        "voice_hotkeys": {"hold": ""},
+        # Per hold-to-talk slot host shortcut. Empty until the user records
+        # one; nothing is injected while a slot is empty.
+        "voice_slot_hotkeys": {"1": "", "2": ""},
+        # 语音输入源。模式1（remote）用遥控器自带麦克风：只有话筒键能触发、
+        # 只有语音1 生效、只支持按住说话（短按不惊动输入法）。模式2（local）
+        # 改用本机麦克风，语音1/2 可以绑任意按键，短按锁存和长按都支持。
+        "voice_input_source": VOICE_INPUT_SOURCE_REMOTE,
+        # 模式2 使用本机哪个录音设备；空值表示尚未选择，模式2 保持静默。
+        "voice_local_input_device": "",
+        # 模式1 的短按补偿（可选，默认关闭）。模式1 按下即注入，短按同样会让
+        # 输入法弹出一次；打开后松手时会立刻补发一次相同快捷键，相当于双击，
+        # 让输入法把刚弹出的面板关掉。长按不受影响。
+        "voice_short_press_dismiss": False,
         # Empty until the user explicitly picks one in settings; voice fails
         # closed while this is empty (see audio_output.resolve_selected_endpoint).
         # Both fields together disambiguate endpoints that share a display
@@ -188,34 +236,113 @@ def _assert_no_forbidden_keys(data: Dict[str, Any]) -> None:
 
 
 def load_config(path: Path) -> Dict[str, Any]:
+    return _normalize_loaded_config(_read_settings_document(path))
+
+
+def _normalize_loaded_config(stored: dict) -> Dict[str, Any]:
     from . import remote_selection, remote_settings
     config = default_config()
-    if path.is_file():
-        with path.open("r", encoding="utf-8-sig") as handle:
-            stored = json.load(handle)
-        if not isinstance(stored, dict):
-            raise ConfigFormatError("config.json root must be a JSON object")
-        _assert_no_forbidden_keys(stored)
+    if stored:
         stored = remote_settings.project(stored, remote_settings.CONFIG_FIELDS,
                                          remote_selection.active_key(stored))
         # Normalize the persisted voice fields before merging defaults. A
         # shallow merge would otherwise make a newly introduced default look
         # like an explicitly saved top-level/nested shortcut and could hide
         # the old value that is actually present in the file.
-        _normalize_voice_program(stored)
         _normalize_voice_hotkey(stored)
+        _normalize_voice_input_source(stored)
         _normalize_desktop_behavior(stored)
+        # Fields retired by schema 18 stay readable in an old record so the file
+        # opens and its live settings survive, but they must not leak into the
+        # runtime view (or ride back to disk at the top level on the next save).
+        for field in remote_settings.CONFIG_RETIRED_FIELDS:
+            stored.pop(field, None)
         config.update(stored)
-    _normalize_voice_program(config)
     _normalize_voice_hotkey(config)
+    _normalize_voice_input_source(config)
     _normalize_desktop_behavior(config)
     if remote_selection.KEY in config:
         config[remote_selection.KEY] = remote_selection.normalize(config[remote_selection.KEY])
     profile = remote_selection.active_profile(config)
     if profile:
         config["selected_device_profile"] = profile
-    _normalize_remote_recording_mode(config, profile)
+    _normalize_remote_recording_limit(config)
     return config
+
+
+def _preview_config(path: Path) -> Dict[str, Any]:
+    """Best-effort display only. Never repair or write the original document."""
+    from . import remote_selection, remote_settings
+
+    try:
+        stored = _read_settings_document(path)
+        try:
+            active = remote_selection.active_key(stored)
+        except remote_selection.SelectionError:
+            stored.pop(remote_selection.KEY, None)
+            # An unknown owner cannot borrow any device's private settings.
+            if remote_settings.STORE in stored:
+                for field in remote_settings.CONFIG_FIELDS:
+                    stored.pop(field, None)
+            stored.pop(remote_settings.STORE, None)
+            active = ""
+        try:
+            stored = remote_settings.project(stored, remote_settings.CONFIG_FIELDS, active)
+        except remote_settings.RemoteSettingsError:
+            store = stored.get(remote_settings.STORE)
+            try:
+                # An unrelated broken record must not hide a valid selected
+                # record in this read-only preview. The original stays intact.
+                if (not isinstance(store, dict) or type(store.get("schema")) is not int
+                        or store["schema"] != 1 or not isinstance(store.get("records"), dict)):
+                    raise remote_settings.RemoteSettingsError("invalid preview store")
+                preview = dict(stored)
+                preview[remote_settings.STORE] = {
+                    "schema": 1,
+                    "records": {active: store["records"][active]} if active in store["records"] else {},
+                    "unassigned": {} if active else store.get("unassigned", {}),
+                }
+                stored = remote_settings.project(preview, remote_settings.CONFIG_FIELDS, active)
+            except remote_settings.RemoteSettingsError:
+                for field in remote_settings.CONFIG_FIELDS:
+                    stored.pop(field, None)
+        stored.pop(remote_settings.STORE, None)
+        stored.pop(remote_settings.OWNER, None)
+        from .voice_preferences import LIMITS, DEFAULT_LIMIT
+        stored.pop("remote_recording_mode", None)
+        limit = stored.get("remote_recording_limit_seconds", DEFAULT_LIMIT)
+        if type(limit) is not int or limit not in LIMITS:
+            stored["remote_recording_limit_seconds"] = DEFAULT_LIMIT
+        return _normalize_loaded_config(stored)
+    except _SETTINGS_READ_ERRORS:
+        return default_config()
+
+
+def load_window_settings(root: Path) -> tuple[dict, dict, tuple[SettingsLoadIssue, ...]]:
+    """Open the settings shell even when the strict runtime loaders reject data.
+
+    Preview values remain process-local and are write-protected as a pair.
+    The bridge and all other consumers retain the strict loaders above/below.
+    """
+    from . import remote_selection
+
+    issues = []
+    try:
+        settings = load_config(config_path(root))
+    except _SETTINGS_READ_ERRORS as error:
+        issues.append(_settings_load_issue(CONFIG_FILENAME, error))
+        settings = _preview_config(config_path(root))
+    try:
+        bindings = (_load_key_bindings_for_selection(key_bindings_path(root), settings)
+                    if issues else load_key_bindings(key_bindings_path(root)))
+    except _SETTINGS_READ_ERRORS as error:
+        issues.append(_settings_load_issue(KEY_BINDINGS_FILENAME, error))
+        bindings = default_key_bindings(remote_selection.active_profile(settings))
+        bindings["bindings"] = {}  # Do not present fallback actions as saved mappings.
+    if issues:
+        settings[RUNTIME_READ_ONLY_KEY] = True
+        bindings[RUNTIME_READ_ONLY_KEY] = True
+    return settings, bindings, tuple(issues)
 
 
 def save_config(path: Path, config: Dict[str, Any]) -> None:
@@ -225,10 +352,10 @@ def save_config(path: Path, config: Dict[str, Any]) -> None:
         persisted[remote_selection.KEY] = remote_selection.normalize(persisted[remote_selection.KEY])
     _assert_no_forbidden_keys(persisted)
     _normalize_voice_hotkey(persisted)
-    _normalize_voice_program(persisted)
+    _normalize_voice_input_source(persisted)
     _normalize_desktop_behavior(persisted)
     profile = remote_selection.active_profile(persisted)
-    _normalize_remote_recording_mode(persisted, profile)
+    _normalize_remote_recording_limit(persisted)
     persisted = _without_runtime_only_keys(persisted)
     latest = _read_settings_document(path)
     if remote_settings.STORE in latest and remote_selection.active_key(latest) != persisted.get(remote_settings.OWNER):
@@ -240,13 +367,11 @@ def save_config(path: Path, config: Dict[str, Any]) -> None:
     _save_json_atomic(path, persisted)
 
 
-def _normalize_remote_recording_mode(document, profile):
-    from .remote_selection import CHROMECAST_PROFILE
-    from .chromecast_voice import LIMITS, DEFAULT_LIMIT
-    mode = document.get("remote_recording_mode", "hold")
-    if mode not in ("hold", "toggle"):
-        raise ConfigFormatError("录音方式不受支持。")
-    document["remote_recording_mode"] = mode if profile == CHROMECAST_PROFILE else "hold"
+def _normalize_remote_recording_limit(document):
+    from .voice_preferences import LIMITS, DEFAULT_LIMIT
+    # The per-device recording gesture (hold/toggle) is gone in schema 18;
+    # drop any legacy value so it can never be reinterpreted.
+    document.pop("remote_recording_mode", None)
     limit = document.get("remote_recording_limit_seconds", DEFAULT_LIMIT)
     if type(limit) is not int or limit not in LIMITS:
         raise ConfigFormatError("最长录音时间不受支持。")
@@ -285,27 +410,25 @@ def save_config_and_load(path: Path, config_data: Dict[str, Any]) -> Dict[str, A
 
 
 def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
-    """Normalize legacy voice settings into provider-scoped hold shortcuts."""
+    """Normalize the voice shortcut settings.
+
+    The shortcut is no longer tied to any input method: it is the single hold
+    shortcut the user recorded, mirrored into the legacy scalar and the
+    per-slot table. A legacy ``voice_hotkeys["hold"]`` value backfills slot 1
+    when that slot is still empty, so an old installation keeps the key it was
+    actually using. The provider tables of older schemas are dropped.
+    """
 
     current = str(config.get("voice_hotkey", "")).strip().lower()
-    from . import key_mapping, voice_hotkey_sync_windows, voice_program_manager
-
-    provider_settings = voice_program_manager.normalize_voice_program_settings(
-        config.get("voice_program")
-    )
-    provider_id = str(provider_settings["provider"])
-    config["voice_program"] = provider_settings
+    from . import key_mapping
 
     raw_mode = str(config.get("voice_trigger_mode", "hold")).strip().lower()
     raw_mode_hotkeys = config.get("voice_hotkeys")
     if not isinstance(raw_mode_hotkeys, dict):
         raw_mode_hotkeys = {}
-    saved_hold_hotkey = str(raw_mode_hotkeys.get("hold", "")).strip()
-    explicit_current_override = bool(
-        current and saved_hold_hotkey and current != saved_hold_hotkey
-    )
+    saved_hold_hotkey = str(raw_mode_hotkeys.get("hold", "")).strip().lower()
 
-    if raw_mode == key_mapping.VoiceTriggerMode.TOGGLE.value:
+    if raw_mode == "toggle":
         config[RUNTIME_LEGACY_VOICE_MODE_KEY] = raw_mode
         # Never reinterpret a toggle shortcut as hold-to-talk. Use the
         # separately stored hold shortcut when available. Otherwise retain
@@ -315,200 +438,133 @@ def _normalize_voice_hotkey(config: Dict[str, Any]) -> None:
     elif saved_hold_hotkey and not current:
         current = saved_hold_hotkey
 
-    if not current:
-        current = key_mapping.voice_hotkey_for_trigger_mode(
-            key_mapping.VoiceTriggerMode.HOLD
-        )
-
-    raw_provider_hotkeys = config.get("voice_hotkeys_by_provider")
-    has_provider_hotkeys = isinstance(raw_provider_hotkeys, dict)
-    if not has_provider_hotkeys:
-        # These two repairs apply only to the old global field. They must not
-        # rewrite WeType's real native Ctrl+Win default after schema 7.
-        if current in {"lctrl+win", "lctrl+lwin"}:
-            current = key_mapping.LEGACY_HOLD_VOICE_HOTKEY
-        if current == "lalt":
-            current = key_mapping.LEGACY_HOLD_VOICE_HOTKEY
-        raw_provider_hotkeys = {}
-
-    provider_hotkeys = voice_hotkey_sync_windows.default_hotkeys_by_provider()
-    for candidate_provider in voice_program_manager.VOICE_PROGRAM_PROVIDER_ORDER:
-        raw_entry = raw_provider_hotkeys.get(candidate_provider)
-        if not isinstance(raw_entry, dict):
-            continue
-        candidate = str(raw_entry.get("hold", "")).strip().lower()
-        source = str(raw_entry.get("source", "")).strip().lower()
-        if source not in VALID_VOICE_HOTKEY_SOURCES:
-            source = VOICE_HOTKEY_SOURCE_MANUAL
-        validation = (
-            voice_hotkey_sync_windows.validate_provider_hotkey(
-                candidate_provider,
-                candidate,
-            )
-            if candidate
-            else None
-        )
-        if validation is None or not validation.ok:
-            source = VOICE_HOTKEY_SOURCE_DEFAULT
-        provider_hotkeys[candidate_provider] = {
-            "hold": validation.hotkey if validation is not None and validation.ok else "",
-            "source": source,
-        }
-
-    # This provider has no historical scalar shortcut.  Selecting it in an
-    # older configuration must not inherit the previous input method's key.
-    if (
-        not (provider_id == voice_program_manager.VOICE_PROGRAM_CHATTERFLY
-             and provider_id not in raw_provider_hotkeys)
-        and (
-            explicit_current_override
-            or not has_provider_hotkeys
-            or provider_id not in raw_provider_hotkeys
-        )
-    ):
-        validation = voice_hotkey_sync_windows.validate_provider_hotkey(
-            provider_id,
-            current,
-        )
-        provider_hotkeys[provider_id] = {
-            "hold": validation.hotkey if validation.ok else "",
-            "source": VOICE_HOTKEY_SOURCE_MANUAL,
-        }
-
-    current = provider_hotkeys[provider_id]["hold"]
-
-    # Additive per-provider field; never migrate a held shortcut into a toggle.
-    for toggle_provider in ("wetype", "sogou", "doubao_ime"):
-        entry = raw_provider_hotkeys.get(toggle_provider, {})
-        if isinstance(entry, dict) and "toggle" in entry:
-            result = voice_hotkey_sync_windows.validate_provider_hotkey(toggle_provider, entry.get("toggle", ""))
-            provider_hotkeys[toggle_provider]["toggle"] = result.hotkey if result.ok else ""
-            toggle_source = str(entry.get("toggle_source", VOICE_HOTKEY_SOURCE_DEFAULT)).strip().lower()
-            provider_hotkeys[toggle_provider]["toggle_source"] = (toggle_source if result.ok and
-                toggle_source in VALID_VOICE_HOTKEY_SOURCES else VOICE_HOTKEY_SOURCE_DEFAULT)
+    # These repairs only apply to the old global field, which used to name the
+    # shortcut that woke an input method; the per-slot recordings are already
+    # validated and must never be rewritten behind the user's back.
+    if current in {"lctrl+win", "lctrl+lwin"}:
+        current = key_mapping.LEGACY_HOLD_VOICE_HOTKEY
+    if current == "lalt":
+        current = key_mapping.LEGACY_HOLD_VOICE_HOTKEY
 
     config["schema_version"] = SCHEMA_VERSION
-    config["voice_trigger_mode"] = key_mapping.VoiceTriggerMode.HOLD.value
+    # The per-provider trigger-mode selector is gone in schema 18; drop the
+    # legacy key instead of pinning it to a value.
+    config.pop("voice_trigger_mode", None)
     config["voice_hotkey"] = current
     config["voice_hotkeys"] = {"hold": current}
-    config["voice_hotkeys_by_provider"] = provider_hotkeys
+    config["voice_slot_hotkeys"] = _normalize_voice_slot_hotkeys(config, current)
     config.pop("voice_release_finish_tap_enabled", None)
+    # The input-method (provider) layer is gone in schema 18: quietly drop the
+    # legacy provider tables so an old installation never resurrects them.
+    config.pop("voice_program", None)
+    config.pop("voice_hotkeys_by_provider", None)
+    config.pop("chatterfly_voice_functions", None)
 
 
-def voice_hotkey_trigger_for_settings(config_data, provider_id=None):
-    """UI selection only; the legacy runtime mirrors remain held shortcuts."""
-    provider = provider_id or config_data.get("voice_program", {}).get("provider")
-    return "toggle" if provider in ("wetype", "sogou", "doubao_ime") and config_data.get("remote_recording_mode") == "toggle" else "hold"
+def _normalize_voice_slot_hotkeys(
+    config: Dict[str, Any], fallback: str = ""
+) -> Dict[str, str]:
+    """Normalize the per-slot hold shortcuts.
 
+    Every slot keeps exactly the shortcut the user recorded; an empty entry
+    stays empty, except that slot 1 backfills from the legacy scalar when it is
+    still empty. Only slots 1 and 2 exist, so a legacy slot 3 is dropped."""
 
-def voice_hotkey_for_provider(
-    config_data: Dict[str, Any], provider_id: object, *, trigger="hold"
-) -> str:
-    """Return one provider's normalized hold shortcut without changing selection."""
+    from . import hotkey as hotkey_module, win32_keys
 
-    from . import voice_hotkey_sync_windows
-
-    provider = str(provider_id).strip().lower()
-    entries = config_data.get("voice_hotkeys_by_provider")
-    if isinstance(entries, dict):
-        entry = entries.get(provider)
-        if isinstance(entry, dict):
-            candidate = str(entry.get(trigger, "")).strip().lower()
-            if candidate:
-                validation = voice_hotkey_sync_windows.validate_provider_hotkey(
-                    provider,
-                    candidate,
-                )
-                return validation.hotkey if validation.ok else ""
+    def _valid(candidate: object) -> str:
+        text = str(candidate).strip().lower()
+        if not text:
             return ""
-    return "" if trigger == "toggle" else voice_hotkey_sync_windows.default_hotkey(provider)
+        try:
+            parsed = hotkey_module.HotkeySpec.parse(text)
+            win32_keys.resolve_vk_codes(tuple(parsed.modifiers) + (parsed.key,))
+        except (hotkey_module.HotkeyParseError, win32_keys.UnknownKeyTokenError):
+            return ""
+        return text
+
+    raw = config.get("voice_slot_hotkeys")
+    result: Dict[str, str] = {"1": "", "2": ""}
+    if isinstance(raw, dict):
+        for slot in (1, 2):
+            result[str(slot)] = _valid(raw.get(str(slot), ""))
+    if not result["1"]:
+        result["1"] = _valid(fallback)
+    return result
 
 
-def voice_hotkey_source_for_provider(
-    config_data: Dict[str, Any], provider_id: object, *, trigger="hold"
-) -> str:
-    provider = str(provider_id).strip().lower()
-    entries = config_data.get("voice_hotkeys_by_provider")
+def voice_slot_hotkey(config_data: Dict[str, Any], slot: int) -> str:
+    """Return one hold-to-talk slot's host shortcut.
+
+    The slot resolves purely from what the user recorded on the voice page, so an
+    empty slot stays empty instead of inheriting a legacy ``voice_hotkey`` mirror
+    or a provider default.
+    """
+
+    try:
+        slot_number = int(slot)
+    except (TypeError, ValueError):
+        return ""
+    entries = config_data.get("voice_slot_hotkeys")
     if isinstance(entries, dict):
-        entry = entries.get(provider)
-        if isinstance(entry, dict):
-            source = str(entry.get("toggle_source" if trigger == "toggle" else "source", "")).strip().lower()
-            if source not in VALID_VOICE_HOTKEY_SOURCES:
-                return VOICE_HOTKEY_SOURCE_DEFAULT
-            candidate = str(entry.get(trigger, "")).strip().lower()
-            if source in {
-                VOICE_HOTKEY_SOURCE_AUTO,
-                VOICE_HOTKEY_SOURCE_MANUAL,
-            }:
-                from . import voice_hotkey_sync_windows
-
-                validation = voice_hotkey_sync_windows.validate_provider_hotkey(
-                    provider,
-                    candidate,
-                )
-                if not validation.ok:
-                    return VOICE_HOTKEY_SOURCE_DEFAULT
-            return source
-    return VOICE_HOTKEY_SOURCE_DEFAULT
+        candidate = str(entries.get(str(slot_number), "")).strip().lower()
+        if candidate:
+            return candidate
+    return ""
 
 
-def set_voice_hotkey_for_provider(
-    config_data: Dict[str, Any],
-    provider_id: object,
-    shortcut: str,
-    *,
-    source: object = None,
-    trigger="hold",
-) -> None:
-    """Update one provider and keep legacy current-provider mirrors coherent."""
+def voice_input_source(config_data: Dict[str, Any]) -> str:
+    """Return the effective voice input source.
 
-    from . import voice_program_manager
+    模式1 (``remote``) uses the remote's own microphone: only the physical mic
+    key triggers it, only 语音1 is valid, and it is hold-to-talk only. 模式2
+    (``local``) uses a microphone plugged into this PC, so either voice slot may
+    sit on any button and both the tap latch and the hold work.
+    """
 
-    provider = str(provider_id).strip().lower()
-    if trigger not in ("hold", "toggle") or trigger == "toggle" and provider not in ("wetype", "sogou", "doubao_ime"):
-        raise ValueError("unsupported voice shortcut trigger")
-    normalized = str(shortcut).strip().lower()
-    entries = config_data.get("voice_hotkeys_by_provider")
-    next_entries = dict(entries) if isinstance(entries, dict) else {}
-    existing = next_entries.get(provider)
-    existing_source = (
-        str(existing.get("toggle_source" if trigger == "toggle" else "source", "")).strip().lower()
-        if isinstance(existing, dict)
-        else ""
-    )
-    resolved_source = str(source or "").strip().lower()
-    if resolved_source not in VALID_VOICE_HOTKEY_SOURCES:
-        resolved_source = (
-            existing_source
-            if existing_source in VALID_VOICE_HOTKEY_SOURCES
-            else VOICE_HOTKEY_SOURCE_MANUAL
-        )
-    next_entries[provider] = dict(existing) if isinstance(existing, dict) else {}
-    next_entries[provider].update({trigger: normalized,
-        "toggle_source" if trigger == "toggle" else "source": resolved_source})
-    config_data["voice_hotkeys_by_provider"] = next_entries
-    current_provider = str(
-        voice_program_manager.normalize_voice_program_settings(
-            config_data.get("voice_program")
-        )["provider"]
-    )
-    if provider == current_provider and trigger == "hold":
-        config_data["voice_hotkey"] = normalized
-        config_data["voice_hotkeys"] = {"hold": normalized}
+    value = config_data.get("voice_input_source", VOICE_INPUT_SOURCE_REMOTE)
+    if isinstance(value, str) and value.strip().casefold() in VOICE_INPUT_SOURCES:
+        return value.strip().casefold()
+    return VOICE_INPUT_SOURCE_REMOTE
 
 
-def _normalize_voice_program(config: Dict[str, Any]) -> None:
-    from . import voice_program_manager
+def voice_local_input_device(config_data: Dict[str, Any]) -> str:
+    """Return the 模式2 recording device name, or "" when none is chosen."""
 
-    raw = config.get("voice_program")
-    if (
-        isinstance(raw, dict)
-        and str(raw.get("provider", "")).strip().lower()
-        == voice_program_manager.LEGACY_VOICE_PROGRAM_WINDOWS_DICTATION
-    ):
-        config[RUNTIME_REMOVED_WINDOWS_DICTATION_KEY] = True
-    config["voice_program"] = voice_program_manager.normalize_voice_program_settings(
-        raw
+    value = config_data.get("voice_local_input_device", "")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def voice_short_press_dismiss(config_data: Dict[str, Any]) -> bool:
+    """Return whether 模式1 turns a short press into a double click.
+
+    Disabled by default because several input methods do not need it: pressing
+    the voice hotkey twice quickly would reopen or toggle something unrelated.
+    """
+
+    return bool(config_data.get("voice_short_press_dismiss", False))
+
+
+def _normalize_voice_input_source(config: Dict[str, Any]) -> None:
+    """Coerce the voice input source to a supported value.
+
+    An unknown or missing value falls back to 模式1 (the remote microphone):
+    that is the behaviour every existing installation already has, so an old
+    or hand-edited file must never silently switch the audio source.
+    """
+
+    source = config.get("voice_input_source", VOICE_INPUT_SOURCE_REMOTE)
+    if not isinstance(source, str) or source.strip().casefold() not in VOICE_INPUT_SOURCES:
+        source = VOICE_INPUT_SOURCE_REMOTE
+    else:
+        source = source.strip().casefold()
+    config["voice_input_source"] = source
+    device = config.get("voice_local_input_device", "")
+    if not isinstance(device, str):
+        device = ""
+    config["voice_local_input_device"] = device.strip()
+    config["voice_short_press_dismiss"] = bool(
+        config.get("voice_short_press_dismiss", False)
     )
 
 
@@ -577,8 +633,12 @@ def default_key_bindings(profile: str = "xiaomi-rc003") -> Dict[str, Any]:
 
 
 def load_key_bindings(path: Path) -> Dict[str, Any]:
-    from . import remote_settings, remote_selection
     selected = _read_settings_document(Path(path).with_name(CONFIG_FILENAME))
+    return _load_key_bindings_for_selection(path, selected)
+
+
+def _load_key_bindings_for_selection(path: Path, selected: dict) -> Dict[str, Any]:
+    from . import remote_settings, remote_selection
     profile = remote_selection.active_profile(selected) or remote_selection.RC003_PROFILE
     bindings = default_key_bindings(profile)
     if path.is_file():
@@ -616,12 +676,7 @@ def load_key_bindings(path: Path) -> Dict[str, Any]:
     _normalize_semantic_actions(bindings)
     _normalize_secondary_bindings(bindings)
     _normalize_combo_bindings(bindings)
-    _normalize_display_notes(bindings, profile)
-    if profile == remote_selection.CHROMECAST_PROFILE:
-        from . import remote_layout
-        valid_buttons = set(remote_layout.button_order(profile))
-        for field in ("bindings", "secondary_bindings"):
-            bindings[field] = {key: value for key, value in bindings[field].items() if key in valid_buttons}
+    _normalize_display_notes(bindings)
     bindings["schema_version"] = SCHEMA_VERSION
     return bindings
 
@@ -643,10 +698,7 @@ def normalize_voice_product_boundary(
         bindings[RUNTIME_REMOVED_VOICE_BINDINGS_KEY] = {}
         return {}
     legacy_mode = str(
-        config_data.get(
-            RUNTIME_LEGACY_VOICE_MODE_KEY,
-            config_data.get("voice_trigger_mode", "hold"),
-        )
+        config_data.get(RUNTIME_LEGACY_VOICE_MODE_KEY, "hold")
     ).strip().lower()
     removed: Dict[str, str] = {}
     for button_id, raw_action in list(primary.items()):
@@ -662,11 +714,6 @@ def normalize_voice_product_boundary(
             else:
                 removed[button_id] = action.kind.value
         elif action.kind == key_mapping.ActionKind.VOICE_TOGGLE:
-            removed[button_id] = action.kind.value
-        elif (
-            action.kind == key_mapping.ActionKind.VOICE_HOLD
-            and button_id != "mic"
-        ):
             removed[button_id] = action.kind.value
 
     secondary = bindings.get("secondary_bindings")
@@ -827,13 +874,12 @@ def _normalize_physical_bindings(bindings: Dict[str, Any]) -> None:
     }
 
 
-def _normalize_display_notes(bindings: Dict[str, Any], profile: str = "xiaomi-rc003") -> None:
+def _normalize_display_notes(bindings: Dict[str, Any]) -> None:
     """Keep optional display-only labels separate from executable actions."""
 
-    from . import device_profile, key_mapping, remote_layout
+    from . import device_profile, key_mapping
 
-    valid_buttons = (set(remote_layout.button_order(profile)) if profile == "chromecast-remote"
-                     else device_profile.ALL_BUTTON_IDS)
+    valid_buttons = set(device_profile.ALL_BUTTON_IDS)
 
     raw_notes = bindings.get("display_notes")
     if not isinstance(raw_notes, dict):
@@ -897,10 +943,9 @@ def switch_remote_settings(config_file: Path, bindings_file: Path, selection: di
     merged = default_key_bindings(remote_selection.active_profile(settings))
     merged.update(bindings)
     bindings = merged
-    _normalize_voice_program(settings)
     _normalize_voice_hotkey(settings)
-    profile = remote_selection.active_profile(settings)
-    _normalize_remote_recording_mode(settings, profile)
+    _normalize_voice_input_source(settings)
+    _normalize_remote_recording_limit(settings)
     active = remote_selection.active_key(settings)
     settings = remote_settings.pack(_without_runtime_only_keys(settings), remote_settings.CONFIG_FIELDS, active)
     bindings = remote_settings.pack(_without_runtime_only_keys(bindings), remote_settings.BINDING_FIELDS, active)
@@ -946,6 +991,8 @@ def save_settings_pair(
 
     if Path(config_file).absolute() == Path(bindings_file).absolute():
         raise ValueError("paired settings paths must be distinct")
+    _assert_settings_writable(config_data)
+    _assert_settings_writable(bindings_data)
     _assert_no_forbidden_keys(config_data)
     _assert_no_forbidden_keys(bindings_data)
 
@@ -974,11 +1021,17 @@ def _save_json_atomic(path: Path, data: Dict[str, Any]) -> None:
 
 
 def _without_runtime_only_keys(data: Dict[str, Any]) -> Dict[str, Any]:
+    _assert_settings_writable(data)
     return {
         key: value
         for key, value in data.items()
         if key not in _RUNTIME_ONLY_KEYS
     }
+
+
+def _assert_settings_writable(data: dict) -> None:
+    if data.get(RUNTIME_READ_ONLY_KEY):
+        raise ConfigReadOnlyError("配置读取异常，原文件已保留；修复后请重新打开MiOpention。")
 
 
 def _save_bytes_atomic(path: Path, content: bytes) -> None:

@@ -1,8 +1,8 @@
 """Opt-in local permission/clipboard metadata. No input or clipboard content access.
 
 Only the diagnostic writer and explicitly started receiver own this sampler.
-Provider name candidates come from voice_program_manager; they are evidence,
-never authorization to control a process or proof of an input delivery failure.
+Process samples are evidence, never authorization to control a process or proof
+of an input delivery failure.
 """
 from __future__ import annotations
 
@@ -124,16 +124,11 @@ def clipboard_metadata() -> dict:
         return dict(status='query_failed', sequence=None)
 
 
-def _voice_candidates():
-    from .voice_program_manager import diagnostic_voice_processes
-    return diagnostic_voice_processes()
-
-
 class EnvironmentSampler:
     """Refresh roles on foreground change or every five seconds, never on key callbacks."""
     def __init__(self, *, processes=None, security=None, clipboard=None, clock=None, response=None):
         from .voice_response_diagnostics_windows import ResponseSampler
-        self.processes = processes or _voice_candidates
+        self.processes = processes or (lambda: [])
         self.security = security or process_security
         self.clipboard = clipboard or clipboard_metadata
         self.clock = clock or time.monotonic

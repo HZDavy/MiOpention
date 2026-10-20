@@ -172,23 +172,6 @@ Item {
             return "unselected"
         if (!SettingsController.activeRemoteReady)
             return "pending"
-        if (!SettingsController.isRc003Device) {
-            if (SettingsController.remoteSelectionBusy)
-                return "checking"
-            if (SettingsController.chromecastSetupError)
-                return "setup_failed"
-            if (valueIn(SettingsController.rawInputState, [
-                    "chromecast_sensitive_logging_disabled", "chromecast_sensitive_logging_enable_failed"]))
-                return "setup_failed"
-            if (SettingsController.rawInputState === "chromecast_input_payload_unavailable")
-                return "input_incomplete"
-            if (SettingsController.rawInputState === "chromecast_permission_cancelled")
-                return "authorization_cancelled"
-            if (!SettingsController.bridgeRunning)
-                return "service_stopped"
-            return SettingsController.buttonReceiverUsable
-                ? "ready" : (SettingsController.rawInputState === "starting" ? "checking" : "error")
-        }
         if (SettingsController.hidHelperRepairBusy)
             return "checking"
         if (SettingsController.hidHelperIssueVisible) {
@@ -202,6 +185,10 @@ Item {
                 ? "disabled" : "permission"
         }
         if (SettingsController.bridgeRunning) {
+            if (SettingsController.hidTapState === "authorization_cancelled")
+                return "source_authorization_cancelled"
+            if (SettingsController.hidTapState === "authorization_failed")
+                return "source_authorization_failed"
             if (SettingsController.hidTapState === "unavailable_gadget_not_verified")
                 return "component_unavailable"
             if (SettingsController.hidTapState === "selected_device_shared_host")
@@ -270,8 +257,8 @@ Item {
         switch (buttonReceiverStateCode()) {
         case "unselected": return qsTr("请先选择设备")
         case "pending": return qsTr("接收尚未接入")
-        case "setup_failed": return qsTr("启用未完成")
-        case "authorization_cancelled": return qsTr("授权已取消")
+        case "source_authorization_cancelled": return qsTr("授权已取消")
+        case "source_authorization_failed": return qsTr("授权未完成")
         case "checking": return qsTr("正在检查")
         case "cleanup": return qsTr("点击“完成清理”")
         case "recovering": return qsTr("正在恢复")
@@ -281,7 +268,6 @@ Item {
         case "version": return qsTr("请安装兼容版")
         case "component_unavailable": return qsTr("按键组件不完整")
         case "restart_computer": return qsTr("请重启电脑一次")
-        case "input_incomplete": return qsTr("按键数据不完整")
         case "shared_host": return qsTr("按键来源待区分")
         case "waiting_remote": return qsTr("未连接")
         case "unpaired": return qsTr("请先配对遥控器")
@@ -313,14 +299,14 @@ Item {
     }
 
     function bridgeStateText() {
+        if (sourceAuthorizationRetryAvailable())
+            return qsTr("等待按键授权")
         if (SettingsController.activeRemoteKey && !SettingsController.activeRemoteReady)
             return qsTr("接收尚未接入")
         if (SettingsController.bridgeReconnectBusy)
             return qsTr("连接中")
         if (SettingsController.bridgeLaunchBusy)
             return qsTr("启动中")
-        if (valueIn(buttonReceiverStateCode(), ["setup_failed", "authorization_cancelled"]))
-            return qsTr("请先完成启用")
         if (bridgeNeedsRestartAction())
             return qsTr("点击“重启服务”")
         const receiverCode = buttonReceiverStateCode()
@@ -361,7 +347,7 @@ Item {
     }
 
     function bridgeNeedsRestartAction() {
-        if (valueIn(buttonReceiverStateCode(), ["setup_failed", "authorization_cancelled"]))
+        if (sourceAuthorizationRetryAvailable())
             return false
         if (!SettingsController.bridgeRunning)
             return false
@@ -378,6 +364,8 @@ Item {
     }
 
     function bridgeActionVisible() {
+        if (sourceAuthorizationRetryAvailable())
+            return true
         if (!SettingsController.bridgeRunning)
             return true
         if (SettingsController.bridgeLaunchBusy
@@ -397,12 +385,16 @@ Item {
             return qsTr("启动中…")
         if (!SettingsController.bridgeRunning)
             return qsTr("启动服务")
+        if (sourceAuthorizationRetryAvailable())
+            return qsTr("重新授权")
         if (bridgeNeedsRestartAction())
             return qsTr("重启服务")
         return qsTr("重新连接")
     }
 
     function bridgeStateColor() {
+        if (sourceAuthorizationRetryAvailable())
+            return tokens.errorColor
         if (bridgeNeedsRestartAction())
             return tokens.errorColor
         if (SettingsController.bridgeConnectionState === "retry_wait")
@@ -421,6 +413,11 @@ Item {
                 || !SettingsController.bridgeRunning)
             return tokens.voiceAccent
         return tokens.disabledText
+    }
+
+    function sourceAuthorizationRetryAvailable() {
+        return SettingsController.isRc003Device && SettingsController.bridgeRunning
+            && valueIn(SettingsController.hidTapState, ["authorization_cancelled", "authorization_failed"])
     }
 
     RemoteDeviceDialog {
@@ -485,6 +482,7 @@ Item {
                     }, CompactButton {
                         id: selectRemoteButton
                         objectName: "selectRemoteButton"
+                        enabled: !SettingsController.configurationReadOnly
                         tokens: root.tokens
                         Layout.fillWidth: true
                         compactMinimumWidth: tokens.buttonWidth4Chars
@@ -504,6 +502,7 @@ Item {
                             ? qsTr("检查中…") : qsTr("重新检查")
                         enabled: !DiagnosticsController.isRefreshing
                             && !DiagnosticsController.vbCableTestRunning
+                            && !SettingsController.configurationReadOnly
                         onClicked: {
                             DiagnosticsController.refreshDiagnostics()
                             if (!SettingsController.isRc003Device)
@@ -523,14 +522,10 @@ Item {
                         && (SettingsController.hidHelperRepairVisible
                             || SettingsController.hidHelperRemovalVisible)
                     editorColumnWidth: root.deviceActionColumnWidth
-                    descriptionText: SettingsController.rawInputState
-                            === "chromecast_input_payload_unavailable"
-                        ? qsTr("Windows 没有提供完整按键数据；可尝试重启电脑一次，仍失败请导出日志")
-                        : root.buttonReceiverStateCode() === "setup_failed"
-                        ? (SettingsController.chromecastSetupError
-                            || qsTr("设备准备失败，请在“选择设备”中重新使用此设备"))
-                        : root.buttonReceiverStateCode() === "authorization_cancelled"
-                        ? qsTr("管理员授权已取消，请在“选择设备”中重新使用此设备")
+                    descriptionText: root.buttonReceiverStateCode() === "source_authorization_cancelled"
+                        ? qsTr("未完成管理员授权，点击“重新授权”后确认 Windows 提示")
+                        : root.buttonReceiverStateCode() === "source_authorization_failed"
+                        ? qsTr("未取得按键权限；确认当前账号可授权后点击“重新授权”")
                         : root.buttonReceiverStateCode() === "restart_computer"
                         ? qsTr("旧按键组件未释放，重启后重新打开程序")
                         : root.buttonReceiverStateCode() === "component_unavailable"
@@ -538,8 +533,7 @@ Item {
                         : root.buttonReceiverStateCode() === "recovering"
                         ? qsTr("按键设备尚未就绪，正在自动重试")
                         : qsTr("让遥控器按键在电脑上生效")
-                    descriptionNeverElide: SettingsController.isRc003Device
-                        || root.buttonReceiverStateCode() === "input_incomplete"
+                    descriptionNeverElide: true
                     stateText: root.buttonReceiverStateText()
                     stateColor: root.buttonReceiverStateColor()
 
@@ -557,6 +551,7 @@ Item {
                         highlighted: true
                         enabled: !SettingsController.hidHelperRepairBusy
                             && !SettingsController.bridgeLaunchBusy
+                            && !SettingsController.configurationReadOnly
                         onClicked: root.enableHidHelperRequested()
                     }, CompactButton {
                         objectName: "removeHidHelperButton"
@@ -566,6 +561,7 @@ Item {
                         text: qsTr("移除权限")
                         enabled: !SettingsController.hidHelperRepairBusy
                             && !SettingsController.bridgeLaunchBusy
+                            && !SettingsController.configurationReadOnly
                         onClicked: root.removeHidHelperRequested()
                     }]
 
@@ -599,6 +595,7 @@ Item {
                         text: root.bridgeActionText()
                         highlighted: true
                         enabled: !SettingsController.bridgeLaunchBusy
+                            && !SettingsController.configurationReadOnly
                             && (SettingsController.bridgeRunning || !SettingsController.activeRemoteKey
                                 || SettingsController.activeRemoteReady)
                             && !SettingsController.bridgeReconnectBusy
@@ -610,7 +607,7 @@ Item {
                         onClicked: {
                             if (!SettingsController.bridgeRunning)
                                 SettingsController.startBridge()
-                            else if (root.bridgeNeedsRestartAction())
+                            else if (root.sourceAuthorizationRetryAvailable() || root.bridgeNeedsRestartAction())
                                 SettingsController.restartBridge()
                             else if (root.bridgeReconnectActionAvailable())
                                 SettingsController.reconnectBridgeNow()
@@ -686,6 +683,7 @@ Item {
 
                 SettingsListRow {
                     objectName: "launchAtLoginRow"
+                    enabled: !SettingsController.configurationReadOnly
                     tokens: root.tokens
                     titleText: qsTr("随 Windows 启动")
                     descriptionText: qsTr("登录后后台运行")
@@ -705,6 +703,7 @@ Item {
 
                 SettingsListRow {
                     objectName: "launchBridgeOnAppStartRow"
+                    enabled: !SettingsController.configurationReadOnly
                     tokens: root.tokens
                     titleText: qsTr("启动程序时自动运行服务")
                     descriptionText: qsTr("自动连接遥控器")
@@ -757,6 +756,7 @@ Item {
                     CompactSwitch {
                         id: diagnosticTraceSwitch
                         objectName: "diagnosticTraceSwitch"
+                        enabled: !SettingsController.configurationReadOnly
                         tokens: root.tokens
                         checked: SettingsController.diagnosticTraceEnabled
                         Accessible.name: qsTr("诊断日志")
@@ -770,6 +770,7 @@ Item {
 
                 SettingsListRow {
                     objectName: "closeBehaviorRow"
+                    enabled: !SettingsController.configurationReadOnly
                     tokens: root.tokens
                     titleText: qsTr("关闭窗口时隐藏到任务栏")
                     descriptionText: qsTr("保留右下角图标；关闭此项则完全退出")

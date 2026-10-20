@@ -106,9 +106,14 @@ $nonAttributionReferenceExemptRelativePaths = @(
 $elevationMarkers = @("runas", "ShellExecute", "IsUserAnAdmin", "RequireAdministrator", "PrivilegesRequired=admin")
 # Exact reviewed markers only; branding, paths and autostart remain checked.
 $reviewedElevationMarkers = @{
-    "src/ovb_rc003/chromecast_pipe_windows.py" = @("runas", "ShellExecute")
-    "scripts/sogou_normal_submit_test.py" = @("IsUserAnAdmin")
-    "scripts/sogou_stop_probe.py" = @("IsUserAnAdmin")
+    "src/ovb_rc003/pipe_windows.py" = @("runas", "ShellExecute")
+    # Source-only one-shot HID worker; fixed launcher and authenticated pipe.
+    "src/ovb_rc003/hid_source_injector.py" = @("runas", "ShellExecute")
+    # Runs the bundled, SHA-256-pinned THIRD-PARTY Interception installer with
+    # Windows' own "runas"/UAC verb, only from an explicit user click in the
+    # button editor (never on startup, never silently). The desktop process
+    # stays asInvoker; branding/autostart are still scanned here.
+    "src/ovb_rc003/interception_driver_install.py" = @("runas", "ShellExecute")
 }
 $autostartMarkers = @("CurrentVersion\Run", "userstartup")
 
@@ -177,12 +182,6 @@ $brandingCheckExemptRelativePaths = @(
     # that the elevation reference is exactly the one disclosed vendor-launch
     # call, not a self-elevation of this project's own process.
     "src/ovb_rc003/vb_cable_bundle.py",
-    # Optional voice-program management may request UAC only for the
-    # user-selected third-party voice application. Its CurrentVersion\Run
-    # access is read-only discovery of Sogou's existing component entry; it
-    # never writes autostart. It also never elevates Remote Mic itself and
-    # remains disabled unless the user selects a provider.
-    "src/ovb_rc003/voice_program_manager.py",
     # ATTRIBUTION.md documents the disclosed "runas"/UAC vendor launch.
     # The concise README no longer contains an elevation implementation
     # marker, so it stays subject to the normal scanner rules.
@@ -197,7 +196,6 @@ $autostartCheckExemptRelativePaths = @(
     "tests/test_build_artifacts.py",
     "tests/test_boundary_scan_replay.py",
     "build/check-public-boundary.ps1",
-    "src/ovb_rc003/voice_program_manager.py",
     "src/ovb_rc003/startup_windows.py",
     "installer/RemoteMicRC003Setup.iss"
 )

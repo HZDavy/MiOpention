@@ -51,8 +51,6 @@ VOICE_EVENT_EXTRA_INFO = voice_key_physicalizer_windows.VOICE_EVENT_EXTRA_INFO
 _VOICE_EVENT_CONFIRM_TIMEOUT_SECONDS = 1.0
 _VOICE_RELEASE_SETTLE_TIMEOUT_SECONDS = 0.08
 _VOICE_RELEASE_SETTLE_POLL_SECONDS = 0.005
-_WETYPE_VOICE_EDGE_GAP_SECONDS = 0.08
-_STALE_LWIN_RECHECK_SECONDS = 0.05
 # Per-process provenance, not an authorization/security boundary. Keep outside
 # the legacy voice-physicalizer marker namespace and within ULONG_PTR on x86.
 _INPUT_EVENT_EXTRA_INFO = 0xA7000000 | int.from_bytes(os.urandom(3), "little")
@@ -179,10 +177,10 @@ _EXTENDED_KEYS = frozenset(
     }
 )
 
-# Modifier VK codes are intentionally emitted as physical scan-code events.
-# This keeps generic modifiers on their left-side physical key and preserves
-# left/right identity for directional modifiers. The boolean records whether
-# the scan code carries the E0 extended prefix.
+# Keys whose physical identity needs an explicit choice. MapVirtualKey can
+# return the keypad variant for navigation keys and SysRq for PrintScreen.
+# Generic modifiers keep their left-side identity; directional modifiers keep
+# their exact side. The boolean records the E0 extended prefix.
 _PHYSICAL_SCAN_CODES = {
     win32_keys.VK_CODES["pageup"]: (0x49, True),
     win32_keys.VK_CODES["pagedown"]: (0x51, True),
@@ -190,6 +188,13 @@ _PHYSICAL_SCAN_CODES = {
     win32_keys.VK_CODES["down"]: (0x50, True),
     win32_keys.VK_CODES["left"]: (0x4B, True),
     win32_keys.VK_CODES["right"]: (0x4D, True),
+    win32_keys.VK_CODES["home"]: (0x47, True),
+    win32_keys.VK_CODES["end"]: (0x4F, True),
+    win32_keys.VK_CODES["insert"]: (0x52, True),
+    win32_keys.VK_CODES["delete"]: (0x53, True),
+    win32_keys.VK_CODES["apps"]: (0x5D, True),
+    win32_keys.VK_CODES["numpad_divide"]: (0x35, True),
+    win32_keys.VK_CODES["print_screen"]: (0x37, True),
     win32_keys.VK_CODES["ctrl"]: (0x1D, False),
     win32_keys.VK_CODES["lctrl"]: (0x1D, False),
     win32_keys.VK_CODES["rctrl"]: (0x1D, True),
@@ -202,6 +207,48 @@ _PHYSICAL_SCAN_CODES = {
     win32_keys.VK_CODES["win"]: (0x5B, True),
     win32_keys.VK_CODES["rwin"]: (0x5C, True),
 }
+
+# Preserve the existing virtual-key delivery for consumer controls. Their
+# mapped scan codes are not a compatibility guarantee for media commands.
+_MULTIMEDIA_VK_CODES = frozenset(
+    {
+        win32_keys.VK_CODES[name]
+        for name in (
+            "volume_mute",
+            "volume_down",
+            "volume_up",
+            "media_next",
+            "media_previous",
+            "media_stop",
+            "media_play_pause",
+            "browser_back",
+            "browser_forward",
+        )
+    }
+)
+
+# The physical codes a real keyboard emits for those consumer controls. They
+# are all E0-prefixed entries of scan-code set 1. SendInput keeps sending the
+# virtual key (see _MULTIMEDIA_VK_CODES), but the Interception backend can only
+# inject raw scan codes, so it needs these to reproduce the same key at all.
+_MULTIMEDIA_SCAN_CODES = {
+    win32_keys.VK_CODES["volume_mute"]: (0x20, True),
+    win32_keys.VK_CODES["volume_down"]: (0x2E, True),
+    win32_keys.VK_CODES["volume_up"]: (0x30, True),
+    win32_keys.VK_CODES["media_next"]: (0x19, True),
+    win32_keys.VK_CODES["media_previous"]: (0x10, True),
+    win32_keys.VK_CODES["media_stop"]: (0x24, True),
+    win32_keys.VK_CODES["media_play_pause"]: (0x22, True),
+    win32_keys.VK_CODES["browser_back"]: (0x6A, True),
+    win32_keys.VK_CODES["browser_forward"]: (0x69, True),
+}
+
+# A scan-only keypad digit follows NumLock and can become a navigation key.
+# Keep the requested VK while adding its physical code to the event.
+_NUMPAD_NUMERIC_VK_CODES = frozenset(
+    [win32_keys.VK_CODES[f"numpad{digit}"] for digit in range(10)]
+    + [win32_keys.VK_CODES["numpad_decimal"]]
+)
 
 RawSender = Callable[[Sequence[Tuple[int, bool]]], int]
 MouseEvent = Tuple[int, int]
@@ -266,6 +313,48 @@ def _require_windows() -> None:
         )
 
 
+def _virtual_key_to_scan_code(vk: int) -> int:
+    """Return a scan code with its E0 prefix, or 0 for a safe VK fallback."""
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+    except Exception:
+        return 0
+    try:
+        user32.MapVirtualKeyW.argtypes = (wintypes.UINT, wintypes.UINT)
+        user32.MapVirtualKeyW.restype = wintypes.UINT
+        # MAPVK_VK_TO_VSC_EX retains E0/E1. KEYEVENTF_EXTENDEDKEY represents
+        # E0 only; special E1 sequences (such as Pause) retain VK delivery.
+        scan_code = int(user32.MapVirtualKeyW(vk, 4))
+        if scan_code & 0xFF and scan_code >> 8 in (0, 0xE0):
+            return scan_code
+        return 0
+    except Exception:
+        return 0
+
+
+def physical_scan_code(vk: int) -> Optional[Tuple[int, bool]]:
+    """Return ``(scan_code, is_extended)`` for one VK, or ``None``.
+
+    Used by the optional Interception backend, which can only inject raw
+    scan codes (never a bare virtual key). ``None`` means the key has no
+    stable physical code and must stay on ``SendInput``.
+
+    Consumer controls keep their virtual-key delivery in the ``SendInput``
+    path (see ``_MULTIMEDIA_VK_CODES``) but still report the code a real
+    keyboard emits, so the Interception backend can reproduce them too.
+    """
+
+    physical = _PHYSICAL_SCAN_CODES.get(vk)
+    if physical is not None:
+        return physical
+    if vk in _MULTIMEDIA_VK_CODES:
+        return _MULTIMEDIA_SCAN_CODES.get(vk)
+    mapped = _virtual_key_to_scan_code(vk)
+    if mapped:
+        return (mapped & 0xFF, mapped >> 8 == 0xE0)
+    return None
+
+
 def _build_input_array(events: Sequence[Tuple[int, bool]]):
     array = (INPUT * len(events))()
     for index, (vk, key_up) in enumerate(events):
@@ -273,13 +362,19 @@ def _build_input_array(events: Sequence[Tuple[int, bool]]):
         if vk in _EXTENDED_KEYS:
             flags |= _KEYEVENTF_EXTENDEDKEY
         physical_scan = _PHYSICAL_SCAN_CODES.get(vk)
+        if physical_scan is None and vk not in _MULTIMEDIA_VK_CODES:
+            mapped_scan = _virtual_key_to_scan_code(vk)
+            if mapped_scan:
+                physical_scan = (mapped_scan & 0xFF, mapped_scan >> 8 == 0xE0)
         if physical_scan is not None:
             scan_code, is_extended = physical_scan
-            flags |= _KEYEVENTF_SCANCODE
+            use_scan_code = vk not in _NUMPAD_NUMERIC_VK_CODES
+            if use_scan_code:
+                flags |= _KEYEVENTF_SCANCODE
             if is_extended:
                 flags |= _KEYEVENTF_EXTENDEDKEY
             keybd_input = KEYBDINPUT(
-                wVk=0,
+                wVk=0 if use_scan_code else vk,
                 wScan=scan_code,
                 dwFlags=flags,
                 time=0,
@@ -298,7 +393,7 @@ def _build_input_array(events: Sequence[Tuple[int, bool]]):
 
 
 def _build_virtual_key_input_array(events: Sequence[Tuple[int, bool]]):
-    """Build wVk-based keyboard events for a configured WeType shortcut."""
+    """Build wVk-based keyboard events for a configured shortcut."""
 
     array = (INPUT * len(events))()
     for index, (vk, key_up) in enumerate(events):
@@ -898,6 +993,30 @@ def send_mouse_button_click(
         )
 
 
+def send_mouse_button_down(
+    button: str, *, _sender: Optional[MouseSender] = None,
+    _button_down_query: Optional[MouseButtonDownQuery] = None,
+) -> None:
+    """Start a hold; uncertain delivery retains the caller's cleanup duty."""
+    sender = _sender or _real_send_mouse_input_batch
+    event = _mouse_button_event(button, key_up=False)
+    query = _button_down_query
+    if query is None and _sender is None:
+        query = _real_mouse_button_is_down
+    if query is not None and query(button):
+        raise MouseButtonInUseError(f"mouse {button} is already held")
+    try:
+        sent = sender([event])
+    except Win32InputUnavailableError:
+        raise
+    except Exception as exc:
+        complete = _best_effort_mouse_release(button, sender)
+        raise _delivery_error_type(complete)(f"mouse {button} down failed") from exc
+    if sent != 1:
+        complete = sent == 0 or _best_effort_mouse_release(button, sender)
+        raise _delivery_error_type(complete)(f"mouse {button} down was not delivered")
+
+
 def send_mouse_button_up(
     button: str, *, _sender: Optional[MouseSender] = None
 ) -> None:
@@ -1046,66 +1165,6 @@ def _ensure_tracked_hold_available(vk_codes: Sequence[int]) -> None:
             "physical keyboard tracking is unavailable for held key(s): "
             f"{formatted}"
         )
-
-
-def _verified_lwin_is_up(*, settle_seconds: float = 0.0) -> bool:
-    """Observe LWin twice on the Raw-only Chromecast input path."""
-
-    lwin = win32_keys.VK_CODES["lwin"]
-    before = voice_key_physicalizer_windows.snapshot_health()
-    if before.active or before.draining:
-        return False
-    try:
-        desktop_before = _real_key_state_query_context()
-        if desktop_before is None:
-            return False
-        if _real_async_key_state_observation(lwin) is not False:
-            return False
-        if settle_seconds:
-            time.sleep(settle_seconds)
-            if _real_async_key_state_observation(lwin) is not False:
-                return False
-        if _real_key_state_query_context() != desktop_before:
-            return False
-    except Exception:
-        return False
-    after = voice_key_physicalizer_windows.snapshot_health()
-    if (
-        after.active
-        or after.draining
-        or after.generation != before.generation
-        or after.installation_epoch != before.installation_epoch
-        or after.callback_entries != before.callback_entries
-    ):
-        return False
-    return True
-
-
-def _reconcile_stale_wetype_lwin_owner() -> bool:
-    """Clear a missed Raw LWin UP only after independent Windows checks."""
-
-    raw_snapshot = raw_input_windows.snapshot_stale_lwin_owner()
-    if raw_snapshot is None:
-        return False
-    lwin = win32_keys.VK_CODES["lwin"]
-    if not _verified_lwin_is_up(settle_seconds=_STALE_LWIN_RECHECK_SECONDS):
-        return False
-    if not raw_input_windows.clear_stale_lwin_owner_if_unchanged(raw_snapshot):
-        return False
-    trace = _diagnostic_trace
-    if trace is not None and trace.enabled:
-        try:
-            trace.emit(
-                "input_physical_state_reconciled",
-                vk=lwin,
-                owner_count=1,
-                age_ms=raw_snapshot.age_ms,
-                windows_down=False,
-                reason="stale_raw_lwin_owner",
-            )
-        except Exception:
-            pass
-    return True
 
 
 def send_key_combo_down(
@@ -1342,10 +1401,9 @@ def _real_keybd_event(
 ) -> None:
     """Emit one voice shortcut edge through the legacy Win32 keyboard API.
 
-    Doubao registers its global voice shortcut as a virtual-key shortcut.  The
-    upstream RC003 bridge uses ``keybd_event`` with the virtual key populated;
-    sending the same edge as a scan-code-only ``SendInput`` event is accepted
-    by Windows but is not recognized reliably by Doubao.
+    The upstream RC003 bridge uses ``keybd_event`` with the virtual key
+    populated; a scan-code-only ``SendInput`` event is accepted by Windows
+    but is not recognized reliably by every target.
     """
 
     _require_live_input_allowed()
@@ -1395,9 +1453,8 @@ def voice_backend_name() -> str:
 def _real_voice_event(vk: int, key_up: bool) -> None:
     """Emit a marked voice edge through the legacy ``keybd_event`` path.
 
-    The optional compatibility hook clears the injected flag only for the
-    right-Alt target. Other user-configured combinations remain normal
-    injected key sequences.
+    Only right Alt takes this path; the hook must acknowledge its exact
+    ticket.
     """
 
     global _voice_backend
@@ -1465,13 +1522,11 @@ def _real_voice_event(vk: int, key_up: bool) -> None:
         except Exception:
             pass  # A diagnostic sink cannot change input ownership or cleanup.
     try:
-        confirmation = voice_key_physicalizer_windows.begin_marked_voice_event(
-            key_up
-        )
+        confirmation = voice_key_physicalizer_windows.begin_marked_voice_event(key_up)
     except voice_key_physicalizer_windows.VoiceKeyPhysicalizerUnavailableError as exc:
         record(False, "physicalizer_unavailable")
         raise Win32InputUnavailableError(
-            "marked right-Alt physicalizer is unavailable"
+            "marked voice key physicalizer is unavailable"
         ) from exc
     try:
         _real_keybd_event(
@@ -1513,9 +1568,9 @@ def _real_voice_event(vk: int, key_up: bool) -> None:
             health_invalidated=health_invalidated,
         )
         raise InputCleanupIncompleteError(
-            "marked right-Alt edge was not confirmed by the physicalizer hook"
+            "marked voice edge was not confirmed by the physicalizer hook"
         )
-    if key_up:
+    if key_up and int(vk) == win32_keys.VK_CODES["ralt"]:
         try:
             _ensure_right_alt_release_completed(vk, confirmation)
         except InputCleanupIncompleteError:
@@ -1530,7 +1585,7 @@ def _real_voice_event(vk: int, key_up: bool) -> None:
         True,
         (
             "release_postcondition_confirmed"
-            if key_up
+            if key_up and int(vk) == win32_keys.VK_CODES["ralt"]
             else "local_hook_and_downstream_completed"
         ),
         confirmation.marker,
@@ -1558,165 +1613,6 @@ def _best_effort_voice_up(
         except Exception:
             complete = False
     return complete
-
-
-def send_wetype_voice_key_combo_down(
-    tokens: Sequence[str],
-    *,
-    _sender: Optional[RawSender] = None,
-    _key_down_query: Optional[PhysicalKeyDownQuery] = None,
-    _sleep: Callable[[float], None] = time.sleep,
-) -> None:
-    """Press WeType's held shortcut one wVk edge at a time, 80 ms apart."""
-
-    vk_codes = win32_keys.resolve_vk_codes(tokens)
-    reconciled_lwin = False
-    if _sender is None and _key_down_query is None:
-        _ensure_tracked_hold_available(vk_codes)
-        if win32_keys.VK_CODES["lwin"] in vk_codes:
-            reconciled_lwin = _reconcile_stale_wetype_lwin_owner()
-    preflight_query = _physical_query_for_sender(
-        _sender is not None,
-        _key_down_query,
-        before_injection=True,
-    )
-    release_query = _physical_query_for_sender(
-        _sender is not None,
-        _key_down_query,
-    )
-    if preflight_query is not None:
-        _ensure_keys_not_physically_down(vk_codes, preflight_query)
-    sender = _sender or _real_send_virtual_key_input_batch
-    delivered: List[int] = []
-    for index, vk in enumerate(vk_codes):
-        if index:
-            try:
-                _sleep(_WETYPE_VOICE_EDGE_GAP_SECONDS)
-            except BaseException as exc:
-                if not _best_effort_release(
-                    list(reversed(delivered)), sender, release_query
-                ):
-                    raise InputCleanupIncompleteError(
-                        "WeType voice key-down delay was interrupted and cleanup failed"
-                    ) from exc
-                raise
-        if preflight_query is not None:
-            try:
-                _ensure_keys_not_physically_down((vk,), preflight_query)
-                if (
-                    reconciled_lwin
-                    and vk == win32_keys.VK_CODES["lwin"]
-                    and not _verified_lwin_is_up()
-                ):
-                    raise Win32InputUnavailableError(
-                        "left Win release could not be safely confirmed"
-                    )
-            except (PhysicalKeyInUseError, Win32InputUnavailableError) as exc:
-                if delivered and not _best_effort_release(
-                    list(reversed(delivered)), sender, release_query
-                ):
-                    raise InputCleanupIncompleteError(
-                        "WeType voice physical key changed and delivered keys "
-                        "could not be released"
-                    ) from exc
-                raise
-        try:
-            sent = sender([(vk, False)])
-        except Win32InputUnavailableError as exc:
-            if delivered and not _best_effort_release(
-                list(reversed(delivered)), sender, release_query
-            ):
-                raise InputCleanupIncompleteError(
-                    "WeType voice backend became unavailable and delivered keys "
-                    "could not be released"
-                ) from exc
-            raise
-        except Exception as exc:
-            cleanup_complete = _best_effort_release(
-                list(reversed([*delivered, vk])), sender, release_query
-            )
-            error_type = _delivery_error_type(cleanup_complete)
-            raise error_type(
-                f"WeType voice key-down delivery failed: {exc}"
-            ) from exc
-        if sent != 1:
-            cleanup_complete = _best_effort_release(
-                list(reversed(delivered)), sender, release_query
-            )
-            error_type = _delivery_error_type(cleanup_complete)
-            raise error_type(
-                "SendInput did not deliver one WeType voice key-down edge; "
-                "rollback attempted"
-            )
-        delivered.append(vk)
-
-
-def send_wetype_voice_key_combo_up(
-    tokens: Sequence[str],
-    *,
-    _sender: Optional[RawSender] = None,
-    _key_down_query: Optional[PhysicalKeyDownQuery] = None,
-    _sleep: Callable[[float], None] = time.sleep,
-) -> None:
-    """Release WeType's held shortcut in reverse order, 80 ms apart."""
-
-    sender = _sender or _real_send_virtual_key_input_batch
-    resolved_vk_codes = win32_keys.resolve_vk_codes(tokens)
-    vk_codes = list(reversed(resolved_vk_codes))
-    key_down_query = _physical_query_for_sender(
-        _sender is not None,
-        _key_down_query,
-    )
-    physical_query_complete = True
-    for index, vk in enumerate(vk_codes):
-        if index:
-            try:
-                _sleep(_WETYPE_VOICE_EDGE_GAP_SECONDS)
-            except BaseException as exc:
-                if not _best_effort_release(vk_codes, sender, key_down_query):
-                    raise InputCleanupIncompleteError(
-                        "WeType voice key-up delay was interrupted and cleanup failed"
-                    ) from exc
-                raise
-        if key_down_query is not None:
-            try:
-                if key_down_query(vk):
-                    physical_query_complete = False
-                    continue
-            except Exception:
-                physical_query_complete = False
-                continue
-        try:
-            sent = sender([(vk, True)])
-        except Win32InputUnavailableError as exc:
-            if not _best_effort_release(vk_codes, sender, key_down_query):
-                raise InputCleanupIncompleteError(
-                    "WeType voice backend became unavailable and key-up could "
-                    "not be confirmed"
-                ) from exc
-            raise
-        except Exception as exc:
-            cleanup_complete = _best_effort_release(
-                vk_codes, sender, key_down_query
-            )
-            error_type = _delivery_error_type(cleanup_complete)
-            raise error_type(
-                f"WeType voice key-up delivery failed: {exc}"
-            ) from exc
-        if sent != 1:
-            cleanup_complete = _best_effort_release(
-                vk_codes, sender, key_down_query
-            )
-            error_type = _delivery_error_type(cleanup_complete)
-            raise error_type(
-                "SendInput did not deliver one WeType voice key-up edge; "
-                "best-effort release attempted"
-            )
-    if not physical_query_complete:
-        raise InputCleanupIncompleteError(
-            "some WeType voice key-ups were deferred because physical keyboard "
-            "state could not be confirmed"
-        )
 
 
 def _voice_physical_query_for_sender(
@@ -1857,6 +1753,28 @@ def send_voice_key_combo_up(
         ) from first_error
 
 
+def send_voice_key_combo_repeat(
+    tokens: Sequence[str],
+    *,
+    _sender: Optional[VoiceSender] = None,
+) -> None:
+    """Re-send the held key of a shortcut without releasing the chord.
+
+    Windows does not auto-repeat injected key-down events, so a remote hold
+    looks like one long key press unless its owner re-sends the key-down at the
+    typematic rate.  Only the final key repeats, exactly like a physical
+    keyboard holding a key while modifiers stay down.  No preflight check is
+    performed here: the previous key-down was injected by this same process and
+    would otherwise be mistaken for a physically held key.
+    """
+
+    vk_codes = win32_keys.resolve_vk_codes(tokens)
+    if not vk_codes:
+        return
+    sender = _sender or _real_voice_event
+    sender(vk_codes[-1], False)
+
+
 def send_voice_key_combo_tap(
     tokens: Sequence[str],
     *,
@@ -1987,3 +1905,85 @@ def send_volume_mute(*, _sender: Optional[RawSender] = None) -> None:
 
 def send_play_pause(*, _sender: Optional[RawSender] = None) -> None:
     _send_semantic_tap(("media_play_pause",), _sender=_sender)
+
+
+# --- Keyboard auto-repeat rate --------------------------------------------
+#
+# Windows applies its own typematic auto-repeat to keys held on a real
+# keyboard, but keys injected through SendInput never repeat on their own.
+# The RC003 gadget clears the keyboard usages of every report before Windows
+# translates it, so a held remote button has no native repeat to fall back on
+# and the app has to re-send the tap itself.  Mirroring the machine's own
+# repeat rate keeps a held remote button as smooth as a held physical key.
+_SPI_GETKEYBOARDSPEED = 0x000A
+# SystemParametersInfoW reports a 0..31 index; the documented curve runs from
+# 2.5 to 30 characters per second across that range.
+_KEYBOARD_SPEED_MIN_INDEX = 0
+_KEYBOARD_SPEED_MAX_INDEX = 31
+_KEYBOARD_SPEED_MIN_CPS = 2.5
+_KEYBOARD_SPEED_MAX_CPS = 30.0
+# Clamp into a band that is never slower than the previous fixed cadence and
+# never so fast that re-sent taps start queueing up.
+MIN_KEYBOARD_REPEAT_INTERVAL_SECONDS = 0.020
+MAX_KEYBOARD_REPEAT_INTERVAL_SECONDS = 0.065
+DEFAULT_KEYBOARD_REPEAT_INTERVAL_SECONDS = 0.065
+
+
+def _keyboard_repeat_interval_for_index(index: int) -> float:
+    """Convert an ``SPI_GETKEYBOARDSPEED`` index into a repeat interval."""
+
+    clamped = max(
+        _KEYBOARD_SPEED_MIN_INDEX,
+        min(_KEYBOARD_SPEED_MAX_INDEX, int(index)),
+    )
+    chars_per_second = _KEYBOARD_SPEED_MIN_CPS + clamped * (
+        _KEYBOARD_SPEED_MAX_CPS - _KEYBOARD_SPEED_MIN_CPS
+    ) / _KEYBOARD_SPEED_MAX_INDEX
+    return 1.0 / chars_per_second
+
+
+def _real_keyboard_repeat_interval() -> Optional[float]:
+    """Return the live keyboard auto-repeat interval, or ``None`` if unreadable."""
+
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.SystemParametersInfoW.argtypes = (
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.c_void_p,
+            wintypes.UINT,
+        )
+        user32.SystemParametersInfoW.restype = wintypes.BOOL
+        speed = wintypes.DWORD()
+        if not user32.SystemParametersInfoW(
+            _SPI_GETKEYBOARDSPEED, 0, ctypes.byref(speed), 0
+        ):
+            return None
+    except Exception:  # noqa: BLE001 - a missing/odd user32 just means "unknown"
+        return None
+    return _keyboard_repeat_interval_for_index(speed.value)
+
+
+def keyboard_repeat_interval(
+    *, _reader: Optional[Callable[[], Optional[float]]] = None
+) -> float:
+    """Return the interval to use when re-sending a held remote button.
+
+    Injected keys do not auto-repeat, so the app repeats them itself.  This
+    follows the user's own keyboard repeat rate (``SPI_GETKEYBOARDSPEED``) so a
+    held remote button feels like a held physical key, clamped to a sane range
+    and falling back to ``DEFAULT_KEYBOARD_REPEAT_INTERVAL_SECONDS`` whenever
+    the setting cannot be read (for example, off Windows).
+    """
+
+    reader = _reader or _real_keyboard_repeat_interval
+    try:
+        interval = reader()
+    except Exception:  # noqa: BLE001 - any failure means "use the default"
+        interval = None
+    if interval is None:
+        return DEFAULT_KEYBOARD_REPEAT_INTERVAL_SECONDS
+    return max(
+        MIN_KEYBOARD_REPEAT_INTERVAL_SECONDS,
+        min(MAX_KEYBOARD_REPEAT_INTERVAL_SECONDS, float(interval)),
+    )

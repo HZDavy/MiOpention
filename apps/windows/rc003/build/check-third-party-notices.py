@@ -18,6 +18,7 @@ _CORE_MARKERS = (
     "Microsoft runtime components",
     "RC003 product photo",
     "VB-CABLE",
+    "Interception",
 )
 
 

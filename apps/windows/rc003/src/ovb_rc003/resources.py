@@ -67,7 +67,7 @@ def _source_resource_root() -> Path:
 
 
 def _candidate_paths(profile: str = "xiaomi-rc003") -> Iterator[Path]:
-    filename = "Chromecast-remote-photo.png" if profile == "chromecast-remote" else _PHOTO_FILENAME
+    filename = _PHOTO_FILENAME
     frozen_root = getattr(sys, "_MEIPASS", None)
     if frozen_root:
         # Packaged (frozen) build: PyInstaller's bootloader sets this before

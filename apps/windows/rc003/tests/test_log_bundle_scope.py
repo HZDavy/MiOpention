@@ -25,7 +25,7 @@ def start(time, version='1.0.80'):
 
 def run(time, key, failed=False):
     record = dict(kind='hid_startup', step='attach', state='failed' if failed else 'success')
-    return line(time, f'Chromecast evidence run={key} seq=1 record={json.dumps(record)}')
+    return line(time, f'RC003 evidence run={key} seq=1 record={json.dumps(record)}')
 
 
 class LogBundleScopeTests(unittest.TestCase):

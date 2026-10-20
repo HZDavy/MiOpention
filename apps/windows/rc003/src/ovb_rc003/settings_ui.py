@@ -12,8 +12,9 @@ validation/save logic is a plain function (``_action_to_display``,
 ``_parse_endpoint_display``, ``describe_launch_result``,
 ``describe_log_open_result``) that tests call directly - see
    tests/test_settings_ui_helpers.py. Legacy voice values render as an
-   explicit disabled notice; new saves allow hold-to-talk only on the
-   physical microphone button.
+   explicit disabled notice; new saves allow up to
+   ``key_mapping.MAX_VOICE_SLOTS`` primary mappings to carry a voice action,
+   on any physical button.
 
 ``main()`` at the bottom of this module is the only place that touches Qt at
 all, and does so via a lazy import inside the function body - importing this
@@ -27,7 +28,7 @@ Qt is missing).
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Optional, Tuple
 
 from . import (
@@ -36,6 +37,7 @@ from . import (
     device_catalog,
     device_profile,
     hotkey,
+    injection_backend,
     key_mapping,
     logging_setup,
     product_identity,
@@ -73,6 +75,7 @@ _REFERENCE_ACTION_LABELS: Dict[key_mapping.ActionKind, str] = {
     key_mapping.ActionKind.OPEN_CODEX: "打开 Codex",
     key_mapping.ActionKind.OPEN_CLAUDE: "打开 Claude",
     key_mapping.ActionKind.OPEN_CMUX: "打开 cmux 终端",
+    # Keep saved mappings readable; this action is no longer a menu preset.
     key_mapping.ActionKind.OPEN_WECHAT: "打开微信",
     key_mapping.ActionKind.OPEN_CURSOR: "打开 Cursor",
     key_mapping.ActionKind.OPEN_SLACK: "打开 Slack",
@@ -85,6 +88,17 @@ _REFERENCE_ACTION_LABELS: Dict[key_mapping.ActionKind, str] = {
 _REFERENCE_ACTION_KINDS_BY_LABEL: Dict[str, key_mapping.ActionKind] = {
     label: action_kind for action_kind, label in _REFERENCE_ACTION_LABELS.items()
 }
+
+LONG_PRESS_ACTION_LABELS = {
+    key_mapping.ActionKind.MOUSE_LEFT_HOLD: "鼠标左键长按",
+    key_mapping.ActionKind.MOUSE_RIGHT_HOLD: "鼠标右键长按",
+    key_mapping.ActionKind.MOUSE_X1_HOLD: "鼠标 X1 长按",
+    key_mapping.ActionKind.MOUSE_X2_HOLD: "鼠标 X2 长按",
+}
+_REFERENCE_ACTION_LABELS.update(LONG_PRESS_ACTION_LABELS)
+_REFERENCE_ACTION_KINDS_BY_LABEL.update(
+    {label: kind for kind, label in LONG_PRESS_ACTION_LABELS.items()}
+)
 
 # Older display spellings remain accepted for editable fields and tests that
 # construct the UI model directly. Persisted bindings store semantic action
@@ -125,7 +139,7 @@ ACTION_OPTION_GROUPS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     (
         "启动应用",
         (
-            _OPEN_APPLICATION_DISPLAY, "打开 Claude", "打开 cmux 终端", "打开微信",
+            _OPEN_APPLICATION_DISPLAY, "打开 Claude", "打开 cmux 终端",
             "打开 Cursor", "打开 Slack", "打开企业微信", "打开网易云音乐",
             "打开 Chrome", "打开 Edge", "打开 Zed",
         ),
@@ -150,27 +164,45 @@ ACTION_OPTION_GROUP_STARTS = frozenset(
     for _group_title, group_options in ACTION_OPTION_GROUPS
     if group_options
 )
-
-_TRIGGER_MODE_LABELS = {
-    key_mapping.VoiceTriggerMode.HOLD: "按住说话",
-}
+ACTION_OPTION_GROUP_BY_LABEL.update(
+    {label: "鼠标长按" for label in LONG_PRESS_ACTION_LABELS.values()}
+)
+ACTION_OPTION_GROUP_STARTS |= {next(iter(LONG_PRESS_ACTION_LABELS.values()))}
 
 _CTRL_HOTKEY_TOKENS = frozenset({"ctrl", "lctrl", "rctrl"})
 _ALT_HOTKEY_TOKENS = frozenset({"alt", "lalt", "ralt"})
 
-
-def voice_hotkey_for_trigger_mode(trigger_mode: key_mapping.VoiceTriggerMode) -> str:
-    """Return the physical host shortcut paired with a voice trigger mode."""
-
-    return key_mapping.voice_hotkey_for_trigger_mode(trigger_mode)
-
 # Legacy generic voice text is still accepted so an older in-memory model can
 # be saved without being parsed as a keyboard chord. New rows only expose the
-# supported hold-to-talk action below.
+# supported hold-to-talk slots below.
 _VOICE_DISPLAY = "语音（使用专用组合键）"
-_VOICE_HOLD_DISPLAY = "按住说话"
 _REMOVED_VOICE_DISPLAY = "已停用：旧语音配置（请重新选择）"
-_PRIMARY_VOICE_DISPLAYS = (_VOICE_HOLD_DISPLAY,)
+
+# Up to key_mapping.MAX_VOICE_SLOTS physical buttons can be promoted to an
+# independent hold-to-talk lifecycle. Numbered labels let the buttons page and
+# the voice page refer to the same slot ("语音一"/"语音二"). The retired
+# "语音三" label stays resolvable so older files keep loading, but the mapping
+# dropdown only offers the live slots.
+_VOICE_SLOT_DISPLAYS: Dict[int, str] = {
+    1: "语音一",
+    2: "语音二",
+    3: "语音三",
+}
+_VOICE_SLOT_BY_DISPLAY: Dict[str, int] = {
+    label: slot for slot, label in _VOICE_SLOT_DISPLAYS.items()
+}
+# Spelling shipped by earlier releases; slot 1 stays readable so an untouched
+# in-memory model and previously saved dropdown text can still be persisted.
+_LEGACY_VOICE_SLOT_DISPLAYS: Dict[str, int] = {
+    "按住说话": 1,
+}
+# Kept as the slot-1 spelling for callers/tests that used the old constant.
+_VOICE_HOLD_DISPLAY = _VOICE_SLOT_DISPLAYS[1]
+_PRIMARY_VOICE_DISPLAYS = tuple(
+    _VOICE_SLOT_DISPLAYS[slot]
+    for slot in sorted(_VOICE_SLOT_DISPLAYS)
+    if slot <= key_mapping.MAX_VOICE_SLOTS
+)
 
 # Secondary gestures are optional.  Keep an explicit display value in the
 # editable ComboBox so Qt does not fall back to the first real preset (usually
@@ -207,6 +239,22 @@ class SettingsValidationError(Exception):
         self.message = message
 
 
+def voice_slot_display(slot: int) -> str:
+    """Return the numbered dropdown label for one hold-to-talk slot."""
+
+    return _VOICE_SLOT_DISPLAYS.get(int(slot), "")
+
+
+def voice_slot_for_display(text: str) -> Optional[int]:
+    """Resolve a dropdown label (including the legacy spelling) to a slot."""
+
+    clean = str(text).strip()
+    slot = _VOICE_SLOT_BY_DISPLAY.get(clean)
+    if slot is not None:
+        return slot
+    return _LEGACY_VOICE_SLOT_DISPLAYS.get(clean)
+
+
 def _action_to_display(action: key_mapping.ButtonAction) -> str:
     if action.kind == key_mapping.ActionKind.KEY_COMBO and action.keys in (("pageup",), ("page_up",)):
         return "PageUp"
@@ -222,8 +270,9 @@ def _action_to_display(action: key_mapping.ButtonAction) -> str:
         return _REMOVED_VOICE_DISPLAY
     if action.kind == key_mapping.ActionKind.VOICE_TOGGLE:
         return _REMOVED_VOICE_DISPLAY
-    if action.kind == key_mapping.ActionKind.VOICE_HOLD:
-        return _VOICE_HOLD_DISPLAY
+    voice_slot = key_mapping.voice_slot_for_action(action)
+    if voice_slot is not None:
+        return _VOICE_SLOT_DISPLAYS[voice_slot]
     if action.kind == key_mapping.ActionKind.QUICKER_URI:
         return action.uri
     reference_label = _REFERENCE_ACTION_LABELS.get(action.kind)
@@ -268,8 +317,11 @@ def _display_to_action(text: str) -> key_mapping.ButtonAction:
         return key_mapping.ButtonAction(key_mapping.ActionKind.DISABLED)
     if text == _VOICE_DISPLAY:
         return key_mapping.ButtonAction(key_mapping.ActionKind.VOICE)
-    if text == _VOICE_HOLD_DISPLAY:
-        return key_mapping.ButtonAction(key_mapping.ActionKind.VOICE_HOLD)
+    voice_slot = voice_slot_for_display(text)
+    if voice_slot is not None:
+        slot_action = key_mapping.voice_action_for_slot(voice_slot)
+        if slot_action is not None:
+            return slot_action
     if text == "系统音量 -":
         text = "系统音量 −"
     reference_kind = _REFERENCE_ACTION_KINDS_BY_LABEL.get(text)
@@ -362,13 +414,21 @@ def _validated_button_action(
     text: str,
     *,
     base_bindings: Optional[dict] = None,
+    inject_mode: str = key_mapping.DEFAULT_INJECT_MODE,
 ) -> Optional[key_mapping.ButtonAction]:
-    """Parse one editor field using the same rules as the final save."""
+    """Parse one editor field using the same rules as the final save.
+
+    ``inject_mode`` is the per-button backend the editor picked (SendInput or
+    Interception). It is stamped onto the parsed action so an unchanged text
+    field still remembers the user's choice instead of silently reverting to
+    the default backend.
+    """
 
     trigger_label = _BUTTON_TRIGGER_LABELS.get(trigger)
     if trigger_label is None:
         raise SettingsValidationError(button_id, f"不支持的按键操作：{trigger}")
 
+    mode = key_mapping.normalize_stored_inject_mode(inject_mode)
     clean_text = str(text).strip()
     if not clean_text:
         return None
@@ -393,7 +453,8 @@ def _validated_button_action(
             if action_text_matches_original(clean_text, original_text):
                 # Retain untouched legacy values, including keys no longer
                 # accepted for new input. The sender still rejects unsafe VKs.
-                return original
+                _ensure_interception_supports(button_id, trigger_label, original, mode)
+                return replace(original, inject_mode=mode)
 
     try:
         action = _display_to_action(clean_text)
@@ -402,18 +463,64 @@ def _validated_button_action(
         message = f"{trigger_label}：{detail}"
         raise SettingsValidationError(button_id, message) from exc
 
+    if action.kind in key_mapping.MOUSE_HOLD_BUTTONS and trigger != "long_press":
+        raise SettingsValidationError(button_id, "鼠标长按只能用于长按映射。")
     if key_mapping.is_voice_action(action):
         if trigger != key_mapping.ButtonTrigger.SINGLE_CLICK.value:
             raise SettingsValidationError(
                 button_id,
                 f"{trigger_label}：语音动作只能用于主映射，请选择普通动作或快捷键",
             )
-        if button_id != "mic":
-            raise SettingsValidationError(
-                button_id,
-                f"{trigger_label}：只有实体话筒键支持“按住说话”",
-            )
-    return action
+    _ensure_interception_supports(button_id, trigger_label, action, mode)
+    return replace(action, inject_mode=mode)
+
+
+def _ensure_interception_supports(
+    button_id: str,
+    trigger_label: str,
+    action: key_mapping.ButtonAction,
+    mode: str,
+) -> None:
+    """Reject Interception for an action it cannot reproduce.
+
+    Only actions that inject a key or a mouse button go through the backend.
+    Voice and "no action" are delivered by their own paths and keep whatever
+    backend is stored, but an action that has a dedicated host path of its own
+    (element navigation, quick links, open-app, mouse hold) has no
+    Interception equivalent at all, so the mode must not be selectable for it.
+    """
+
+    if mode != key_mapping.INJECT_MODE_INTERCEPTION:
+        return
+    if key_mapping.is_voice_action(action):
+        return
+    if action.kind == key_mapping.ActionKind.DISABLED:
+        return
+    if injection_backend.action_supported_by_interception(action):
+        return
+    if (
+        injection_backend.key_tokens_for_action(action) is None
+        and injection_backend.mouse_button_for_action(action) is None
+    ):
+        raise SettingsValidationError(
+            button_id,
+            f"{trigger_label}：该动作不是普通按键动作，无法使用 Interception（驱动级），请改用 SendInput",
+        )
+    raise SettingsValidationError(
+        button_id,
+        f"{trigger_label}：该按键无法通过 Interception 注入，请改用 SendInput",
+    )
+
+
+def _resolve_inject_mode(
+    button_inject_modes: Optional[Dict[str, str]], button_id: str
+) -> str:
+    """The backend chosen for one button, defaulting to SendInput."""
+
+    if not isinstance(button_inject_modes, dict):
+        return key_mapping.DEFAULT_INJECT_MODE
+    return key_mapping.normalize_stored_inject_mode(button_inject_modes.get(button_id))
+
 
 
 def button_action_validation_message(
@@ -422,11 +529,18 @@ def button_action_validation_message(
     text: str,
     *,
     base_bindings: Optional[dict] = None,
+    inject_mode: str = key_mapping.DEFAULT_INJECT_MODE,
 ) -> str:
     """Return a user-facing editor error, or an empty string when valid."""
 
     try:
-        _validated_button_action(button_id, trigger, text, base_bindings=base_bindings)
+        _validated_button_action(
+            button_id,
+            trigger,
+            text,
+            base_bindings=base_bindings,
+            inject_mode=inject_mode,
+        )
     except SettingsValidationError as exc:
         return exc.message
     return ""
@@ -450,19 +564,53 @@ def _parse_endpoint_display(text: str) -> Tuple[str, str]:
     return text, ""
 
 
+def _resolve_slot_hotkeys(
+    voice_slot_hotkeys: Optional[Dict[str, str]],
+    voice_hotkeys: Optional[Dict[str, str]],
+    hotkey_text: str,
+) -> Dict[int, str]:
+    """Coerce the per-slot shortcut inputs into ``{slot: hotkey_text}``.
+
+    ``voice_slot_hotkeys`` is the current contract. ``voice_hotkeys`` and the
+    scalar ``hotkey_text`` remain accepted so older callers (and the shared
+    hold-shortcut mirror) keep writing slot 1 unchanged. An empty slot 1 in
+    ``voice_slot_hotkeys`` means "not recorded yet" and falls back to that
+    shared mirror, matching :func:`config.voice_slot_hotkey`.
+    """
+
+    result: Dict[int, str] = {slot: "" for slot in _VOICE_SLOT_DISPLAYS}
+    if voice_slot_hotkeys is not None:
+        for slot in _VOICE_SLOT_DISPLAYS:
+            result[slot] = str(voice_slot_hotkeys.get(str(slot), "")).strip()
+        if not result[1]:
+            result[1] = _resolve_hold_shortcut(voice_hotkeys, hotkey_text)
+        return result
+    result[1] = _resolve_hold_shortcut(voice_hotkeys, hotkey_text)
+    return result
+
+
+def _resolve_hold_shortcut(
+    voice_hotkeys: Optional[Dict[str, str]], hotkey_text: str
+) -> str:
+    if voice_hotkeys is not None:
+        return str(voice_hotkeys.get("hold", "")).strip()
+    return str(hotkey_text).strip()
+
+
 def build_save_model(
     *,
     button_display_map: Dict[str, str],
     secondary_display_map: Optional[Dict[str, Dict[str, str]]] = None,
     display_note_map: Optional[Dict[str, Dict[str, str]]] = None,
     hotkey_text: str,
-    trigger_mode: key_mapping.VoiceTriggerMode,
     endpoint_display_text: str,
     base_config: dict,
     base_bindings: dict,
     selected_device_profile: str = device_catalog.RC003_ID,
     voice_hotkeys: Optional[Dict[str, str]] = None,
+    voice_slot_hotkeys: Optional[Dict[str, str]] = None,
     validate_voice_hotkeys: bool = True,
+    button_inject_modes: Optional[Dict[str, str]] = None,
 ) -> Tuple[dict, dict]:
     """Pure validation+build step for "Save"/"Restore defaults", with no Tk
     dependency at all - directly unit tested without constructing any
@@ -472,67 +620,63 @@ def build_save_model(
 
     from . import remote_layout
     allowed_buttons = set(remote_layout.button_order(selected_device_profile))
-    trigger_mode = key_mapping.VoiceTriggerMode.HOLD
-    mode_hotkeys = {
-        "hold": key_mapping.voice_hotkey_for_trigger_mode(trigger_mode)
-    }
-    if voice_hotkeys is None:
-        mode_hotkeys["hold"] = hotkey_text.strip()
-    else:
-        mode_hotkeys["hold"] = str(voice_hotkeys.get("hold", "")).strip()
+    slot_hotkeys = _resolve_slot_hotkeys(
+        voice_slot_hotkeys, voice_hotkeys, hotkey_text
+    )
+    mode_hotkeys = {"hold": slot_hotkeys.get(1, "")}
 
     bindings: Dict[str, dict] = {}
-    voice_binding: Optional[Tuple[str, key_mapping.VoiceTriggerMode]] = None
+    voice_slot_bindings: Dict[int, str] = {}
     for button_id, text in button_display_map.items():
-        if selected_device_profile == device_catalog.CHROMECAST_ID and button_id not in allowed_buttons:
-            raise SettingsValidationError(button_id, "该按键不属于当前遥控器。")
         action = _validated_button_action(
             button_id,
             key_mapping.ButtonTrigger.SINGLE_CLICK.value,
             text,
             base_bindings=base_bindings,
+            inject_mode=_resolve_inject_mode(button_inject_modes, button_id),
         )
         if action is None:
             continue
-        if (selected_device_profile == device_catalog.CHROMECAST_ID and button_id == "mic"
-                and action.kind != key_mapping.ActionKind.VOICE_HOLD):
-            raise SettingsValidationError(button_id, "Assistant 暂时保留为语音专用键。")
-        voice_mode = key_mapping.voice_trigger_mode_for_action(
-            action,
-            legacy_mode=trigger_mode,
-        )
-        if voice_mode is not None:
-            voice_binding = (button_id, voice_mode)
-            action = key_mapping.voice_action_for_trigger_mode(
-                key_mapping.VoiceTriggerMode.HOLD
-            )
+        voice_slot = key_mapping.voice_slot_for_action(action)
+        if voice_slot is not None:
+            occupant = voice_slot_bindings.get(voice_slot)
+            if occupant is not None and occupant != button_id:
+                raise SettingsValidationError(
+                    button_id,
+                    f"{_VOICE_SLOT_DISPLAYS[voice_slot]}已分配给按键“{occupant}”，"
+                    "每个语音标号只能对应一个按键",
+                )
+            slot_action = key_mapping.voice_action_for_slot(voice_slot)
+            if slot_action is None:
+                raise SettingsValidationError(button_id, "语音标号无效，请重新选择。")
+            voice_slot_bindings[voice_slot] = button_id
+            # 保留用户在编辑器里选的注入后端，否则语音键重开后会退回默认。
+            action = replace(slot_action, inject_mode=action.inject_mode)
         bindings[button_id] = action.to_dict()
 
-    active_mode = key_mapping.VoiceTriggerMode.HOLD
-    active_hotkey_text = mode_hotkeys["hold"]
-    if validate_voice_hotkeys and voice_binding is not None and not active_hotkey_text:
-        raise SettingsValidationError(
-            voice_binding[0],
-            f"请先录入{_TRIGGER_MODE_LABELS[active_mode]}的语音快捷键",
-        )
-
-    for mode in (key_mapping.VoiceTriggerMode.HOLD,):
-        candidate = mode_hotkeys["hold"]
-        if not validate_voice_hotkeys or not candidate:
-            continue
-        try:
-            parsed_hotkey = hotkey.HotkeySpec.parse(candidate)
-            win32_keys.resolve_vk_codes(
-                tuple(parsed_hotkey.modifiers) + (parsed_hotkey.key,)
-            )
-        except hotkey.HotkeyParseError as exc:
-            raise SettingsValidationError(
-                None, f"{_TRIGGER_MODE_LABELS[mode]}快捷键：{exc}"
-            ) from exc
-        except win32_keys.UnknownKeyTokenError as exc:
-            raise SettingsValidationError(
-                None, f"{_TRIGGER_MODE_LABELS[mode]}快捷键：{exc}"
-            ) from exc
+    # An empty slot means "not recorded yet": it is a valid saved state, and the
+    # runtime simply refuses to inject that slot's chord until the user records
+    # one (see RC003App._prepare_voice_mapping_locked). Only the recorded values
+    # are validated here.
+    if validate_voice_hotkeys:
+        for slot in sorted(slot_hotkeys):
+            candidate = slot_hotkeys[slot]
+            if not candidate:
+                continue
+            try:
+                parsed_hotkey = hotkey.HotkeySpec.parse(candidate)
+                win32_keys.resolve_vk_codes(
+                    tuple(parsed_hotkey.modifiers) + (parsed_hotkey.key,)
+                )
+            except hotkey.HotkeyParseError as exc:
+                raise SettingsValidationError(
+                    None, f"{_VOICE_SLOT_DISPLAYS[slot]}快捷键：{exc}"
+                ) from exc
+            except win32_keys.UnknownKeyTokenError as exc:
+                raise SettingsValidationError(
+                    None, f"{_VOICE_SLOT_DISPLAYS[slot]}快捷键：{exc}"
+                ) from exc
+    active_hotkey_text = slot_hotkeys.get(1, "")
 
     if secondary_display_map is None:
         raw_secondary = base_bindings.get("secondary_bindings", {})
@@ -542,7 +686,7 @@ def build_save_model(
         for button_id, trigger_map in secondary_bindings.items():
             if not isinstance(trigger_map, dict):
                 continue
-            for raw_action in trigger_map.values():
+            for trigger_name, raw_action in trigger_map.items():
                 try:
                     action = key_mapping.ButtonAction.from_dict(raw_action)
                 except (KeyError, TypeError, ValueError) as exc:
@@ -552,6 +696,8 @@ def build_save_model(
                     ) from exc
                 if action.kind == key_mapping.ActionKind.DISABLED:
                     continue
+                if action.kind in key_mapping.MOUSE_HOLD_BUTTONS and trigger_name != "long_press":
+                    raise SettingsValidationError(button_id, "鼠标长按只能用于长按映射。")
                 if key_mapping.is_voice_action(action):
                     raise SettingsValidationError(
                         button_id,
@@ -568,13 +714,12 @@ def build_save_model(
                     trigger_name,
                     text,
                     base_bindings=base_bindings,
+                    inject_mode=_resolve_inject_mode(button_inject_modes, button_id),
                 )
                 if action is None:
                     continue
                 if action.kind == key_mapping.ActionKind.DISABLED:
                     continue
-                if selected_device_profile == device_catalog.CHROMECAST_ID and button_id == "mic":
-                    raise SettingsValidationError(button_id, "Assistant 暂不开放普通双击和长按映射。")
                 secondary_bindings.setdefault(button_id, {})[trigger_name] = action.to_dict()
 
     if display_note_map is None:
@@ -621,7 +766,13 @@ def build_save_model(
     )
     new_config["voice_hotkey"] = active_hotkey_text
     new_config["voice_hotkeys"] = mode_hotkeys
-    new_config["voice_trigger_mode"] = active_mode.value
+    new_config["voice_slot_hotkeys"] = {
+        str(slot): slot_hotkeys.get(slot, "")
+        for slot in sorted(_VOICE_SLOT_DISPLAYS)
+    }
+    # The per-provider trigger-mode selector is gone in schema 18; drop the
+    # legacy key instead of pinning it to a value.
+    new_config.pop("voice_trigger_mode", None)
     new_config.pop("voice_release_finish_tap_enabled", None)
     new_config["output_endpoint_name"] = endpoint_name
     new_config["output_endpoint_host_api"] = endpoint_host_api
@@ -645,7 +796,6 @@ class DefaultDisplayState:
     secondary_display_map: Dict[str, Dict[str, str]]
     hotkey_text: str
     voice_hotkeys: Dict[str, str]
-    trigger_mode_label: str
 
 
 def default_display_state(profile: str = "xiaomi-rc003") -> DefaultDisplayState:
@@ -663,17 +813,12 @@ def default_display_state(profile: str = "xiaomi-rc003") -> DefaultDisplayState:
         }
         for button_id in remote_layout.button_order(profile)
     }
-    voice_hotkeys = {
-        "hold": key_mapping.voice_hotkey_for_trigger_mode(
-            key_mapping.VoiceTriggerMode.HOLD
-        )
-    }
+    voice_hotkeys = {"hold": ""}
     return DefaultDisplayState(
         button_display_map=button_display_map,
         secondary_display_map=secondary_display_map,
         hotkey_text=voice_hotkeys["hold"],
         voice_hotkeys=voice_hotkeys,
-        trigger_mode_label=_TRIGGER_MODE_LABELS[key_mapping.VoiceTriggerMode.HOLD],
     )
 
 

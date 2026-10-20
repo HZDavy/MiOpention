@@ -2,16 +2,6 @@
 
 Release status: APPROVED
 
-## Chromecast product photo
-
-- File: `Resources/Chromecast-remote-photo.png`
-- Origin: user-supplied JANN.library image selected for the Chromecast mapping page on 2026-09-16
-- Import: copied without pixel changes; SHA-256 `72F0350E9CAFD91F2D13C7AA8618FBD5E6C89F27EFFDB46D74EDEDDB093F9712`
-- Copyright owner: the repository maintainer, confirmed on 2026-09-24
-- Permission: the owner authorized public redistribution of this unchanged image
-  with Remote Mic on 2026-09-24; no broader reuse or modification license is
-  implied by this record
-
 ## Windows application icons
 
 - Files: `apps/windows/rc003/src/ovb_rc003/assets/icons/remote-mic-connected.svg`,
@@ -58,8 +48,7 @@ do not imply inclusion in, sponsorship of, or endorsement of this project.
 
 ## Homepage interface screenshots
 
-- Files: `docs/screenshots/google-buttons.jpg`,
-  `docs/screenshots/xiaomi-buttons.jpg`,
+- Files: `docs/screenshots/xiaomi-buttons.jpg`,
   `docs/screenshots/device-overview.jpg`, and
   `docs/screenshots/voice-overview.jpg`
 - Origin: application screenshots supplied by the repository maintainer on
@@ -69,14 +58,10 @@ do not imply inclusion in, sponsorship of, or endorsement of this project.
 - Permission: the maintainer expressly authorized publication in this
   repository's README; this entry does not assign a license to unrelated uses
 
-## Homepage remote comparison and QQ code
+## Homepage QQ code
 
-- File: `docs/images/remote-comparison.png`
-- Origin: the side-by-side remote photograph and illustrations supplied by the
-  repository maintainer on 2026-09-24 for the public GitHub homepage
-- Modification: copied unchanged from the supplied PNG
-- Permission: publication in this repository's README as requested by the
-  maintainer; visible device and store names do not imply endorsement
 - File: `docs/images/qq-group-89641716.png`
+- Origin: the QR poster supplied by the repository maintainer on 2026-09-24 for
+  the public GitHub homepage
 - Modification: cropped the existing poster to its QR square and white quiet
   zone; every pixel inside the retained rectangle is unchanged

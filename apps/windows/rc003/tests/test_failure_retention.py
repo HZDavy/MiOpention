@@ -5,7 +5,6 @@ from pathlib import Path
 import queue
 import tempfile
 import threading
-from types import SimpleNamespace
 import unittest
 from unittest import mock
 import zipfile
@@ -82,33 +81,6 @@ class RetentionTests(unittest.TestCase):
 
 
 class IntegrationTests(unittest.TestCase):
-    def test_voice_and_google_explicit_failure_markers_work_with_trace_disabled(self):
-        from ovb_rc003 import app, chromecast_client
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            logs = root / 'logs'
-            logs.mkdir()
-            handler = logging_setup.EvidenceFileHandler(logs/'app.log', encoding='utf-8')
-            logger = logging.Logger('test-failure-entry')
-            logger.addHandler(handler)
-            owner = SimpleNamespace(_runtime_status_lock=threading.Lock(), _logger=logger,
-                                    _publish_runtime_status=mock.Mock(),
-                                    _diagnostic_trace=trace.DiagnosticTrace(root, enabled=False))
-            try:
-                app.RC003App._set_runtime_voice_result(owner, 'host_start_failed', provider='wetype')
-                client = chromecast_client.Client('a'*64, mode='run', on_edge=lambda _: None)
-                with mock.patch.object(chromecast_client.logging, 'getLogger', return_value=logger), \
-                        mock.patch.object(chromecast_client.diagnostics, 'request'):
-                    client._observe_diagnostic(dict(stage='capture', phase='failed', reason='capture_failed'))
-                self.assertTrue(handler._report_writer.flush())
-                report = json.loads((logs/trace.REPORT_FILENAME).read_bytes())
-                self.assertEqual({i['failure_key'] for i in report['incidents']},
-                                 {'voice:wetype:host_start_failed', 'chromecast:capture:capture_failed'})
-                self.assertFalse((logs/trace.TRACE_FILENAME).exists())
-            finally:
-                owner._diagnostic_trace.close()
-                handler.close()
-
     def test_failed_archive_flush_is_visible_in_export_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

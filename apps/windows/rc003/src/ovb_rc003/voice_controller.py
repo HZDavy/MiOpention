@@ -1,16 +1,17 @@
-"""Pure hold-to-talk state machine for the RC003 voice shortcut.
+"""Host-shortcut session ownership for the RC003 voice shortcut.
 
 The RC003 device autonomously tells the host when its own physical mic button
 is pressed (ATVV control opcode 0x08) and when its audio stream stops
-(opcode 0x00) - see atvv_session.py. This module emits logical start/stop
-edges for the physical hold gesture. It performs no I/O itself, so it's
-fully unit testable; app.py translates those edges into the selected
-provider's host shortcut protocol.
+(opcode 0x00) - see atvv_session.py. This module owns the outstanding host
+shortcut session: it reports whether a key-down is still owed a key-up. It
+performs no I/O itself, so it's fully unit testable; app.py turns the reported
+edges into real host key events.
 
-- The controller reports key-down on mic-button-press and key-up on physical
-  release. Every supported provider receives those hold edges directly. The
-  device's AUDIO_STOP remains a fallback for machines that expose no release
-  edge.
+- The controller reports key-down when the mic opens and key-up when the
+  session closes. Both the short-press latch gesture and the long-press hold
+  gesture are expressed as that same pair of edges (see voice_gesture.py for
+  the press/release decision logic). The device's AUDIO_STOP remains a
+  fallback for machines that expose no release edge.
 - Cleanup is provable: reset() reports whether KEY_UP is still owed and never
   leaves the controller thinking a session is active.
 
@@ -21,8 +22,6 @@ from __future__ import annotations
 from enum import Enum
 from typing import Optional
 
-from .key_mapping import VoiceTriggerMode
-
 
 class VoiceHostAction(str, Enum):
     KEY_DOWN = "key_down"
@@ -30,10 +29,7 @@ class VoiceHostAction(str, Enum):
 
 
 class VoiceController:
-    def __init__(self, trigger_mode: VoiceTriggerMode = VoiceTriggerMode.HOLD) -> None:
-        if trigger_mode != VoiceTriggerMode.HOLD:
-            raise ValueError("RC003 voice controller supports hold-to-talk only")
-        self.trigger_mode = VoiceTriggerMode.HOLD
+    def __init__(self) -> None:
         self._holding = False
 
     @property
@@ -44,7 +40,7 @@ class VoiceController:
 
     @property
     def active(self) -> bool:
-        """Whether a hold-to-talk session is open."""
+        """Whether a host shortcut session is open."""
 
         return self._holding
 
@@ -64,7 +60,7 @@ class VoiceController:
         return self.on_mic_button_released()
 
     def on_mic_button_released(self) -> Optional[VoiceHostAction]:
-        """Release an outstanding HOLD shortcut on the physical button-up.
+        """Release an outstanding host shortcut on the physical button-up.
 
         Releasing here prevents Ctrl/Alt/Win from remaining logically down if
         the BLE control channel never reports AUDIO_STOP. Repeating the call
@@ -98,8 +94,8 @@ class VoiceController:
         actually attempted to deliver the closing action. If it fails
         (``win32_input.send_key_combo_up`` now raises instead of swallowing
         that - see win32_input.py), the controller must go back to thinking
-        the session is still owed, not silently "closed": a failed HOLD-mode
-        KEY_UP should not stop the caller from retrying the release, and a
+        the session is still owed, not silently "closed": a failed KEY_UP
+        should not stop the caller from retrying the release.
         A caller passes exactly the closing ``VoiceHostAction`` that failed.
         """
 

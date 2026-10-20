@@ -291,10 +291,8 @@ class InProcessBridgeHandleTests(unittest.TestCase):
 
         self.assertEqual(calls, [1])
 
-    def test_in_process_worker_forwards_the_voice_program_startup_choice(self):
-        handle = bridge_launcher._InProcessBridgeHandle(
-            launch_voice_program_on_start=False
-        )
+    def test_in_process_worker_starts_bridge_without_a_voice_program_choice(self):
+        handle = bridge_launcher._InProcessBridgeHandle()
 
         with mock.patch.object(
             bridge_launcher.single_instance,
@@ -307,7 +305,6 @@ class InProcessBridgeHandleTests(unittest.TestCase):
             on_runtime_ready=handle.bind_stop,
             on_reconnect_ready=handle.bind_reconnect,
             on_settings_reload_ready=handle.bind_settings_reload,
-            launch_voice_program_on_start=False,
         )
         self.assertEqual(handle.poll(), 0)
 

@@ -142,15 +142,15 @@ def ensure_reload_capable_host(pid: int, dll_path: Path, *, selected_key: str | 
     """Return fresh/loaded/restarted/restart_required without injecting twice."""
     paths = loaded_gadget_paths(pid)
     if not paths:
-        # Google's timed-out LoadLibrary can finish after the module snapshot.
+        # A timed-out LoadLibrary can finish after the module snapshot.
         # Both routes use the same helper mutex, so honor its durable marker.
         try:
-            from . import chromecast_gadget_windows as google
-            if google.pending_injection_for_host(pid):
-                _LOGGER.warning("HID runtime reload blocked: Google injection still uncertain")
+            from . import gadget_windows
+            if gadget_windows.pending_injection_for_host(pid):
+                _LOGGER.warning("HID runtime reload blocked: gadget injection still uncertain")
                 return "restart_required"
         except Exception:
-            _LOGGER.warning("HID runtime reload blocked: Google marker unreadable")
+            _LOGGER.warning("HID runtime reload blocked: gadget marker unreadable")
             return "restart_required"
         return "fresh"
     canonical = lambda path: os.path.normcase(os.path.abspath(path))

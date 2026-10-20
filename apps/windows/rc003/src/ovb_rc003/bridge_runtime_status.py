@@ -54,10 +54,9 @@ FAILED_HID_TAP_STATES = frozenset(
         "stopped",
     }
 )
-READY_RAW_INPUT_STATES = frozenset({"ready", "chromecast_ready"})
+READY_RAW_INPUT_STATES = frozenset({"ready"})
 READY_HID_TAP_STATES = frozenset({"attached_waiting_for_hid_io", "ready"})
 RC003_PROFILE = "xiaomi-rc003"
-CHROMECAST_PROFILE = "chromecast-remote"
 VOICE_RUNTIME_NOT_TESTED = "not_tested"
 VOICE_RUNTIME_ACTIVE = "active"
 VOICE_RUNTIME_MIC_CONFIRMED = "mic_confirmed"
@@ -66,6 +65,7 @@ VOICE_RUNTIME_FINISHING = "finishing"
 VOICE_RUNTIME_SUCCESS = "success"
 VOICE_RUNTIME_OUTPUT_OPEN_FAILED = "output_open_failed"
 VOICE_RUNTIME_HOST_START_FAILED = "host_start_failed"
+VOICE_RUNTIME_HOST_UNCONFIRMED = "host_unconfirmed"
 VOICE_RUNTIME_AUDIO_EMPTY = "audio_empty"
 VOICE_RUNTIME_HOST_STOP_FAILED = "host_stop_failed"
 
@@ -236,12 +236,9 @@ def button_receiver_usable(
 
     RC003 interception is usable as soon as the acknowledged HID lease is
     armed. The first report still passes through the normal report/source
-    validation in ``app.py``; it is not a setup action. Chromecast has its own
-    receiver and must not inherit RC003 helper requirements.
+    validation in ``app.py``; it is not a setup action.
     """
 
-    if profile == CHROMECAST_PROFILE:
-        return raw_input_state == "chromecast_ready"
     if profile != RC003_PROFILE:
         return False
     return (

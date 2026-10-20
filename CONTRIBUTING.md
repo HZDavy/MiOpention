@@ -1,6 +1,6 @@
 # 参与贡献
 
-感谢参与无线麦 Windows 版。这个仓库只维护小米蓝牙遥控器 2 Pro（RC003）的 Windows
+感谢参与MiOpention+ Windows 版。这个仓库只维护小米蓝牙遥控器 2 Pro（RC003）的 Windows
 客户端；macOS、其它遥控器和独立 OrthoFocus 项目有各自的维护边界。
 
 ## 报告问题
