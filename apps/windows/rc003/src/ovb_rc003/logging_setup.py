@@ -307,7 +307,14 @@ class EvidenceFileHandler(RotatingFileHandler):
 def flush_application_logs(directory: Path) -> bool:
     directory = directory.resolve()
     with _async_handlers_lock:
-        handlers = [h for h in _async_handlers if Path(h.baseFilename).parent == directory]
+        # Compare canonical paths: a runner whose TEMP is opened through an
+        # 8.3 short name would otherwise never match the handler's base file,
+        # silently reporting "everything flushed" while nothing was checked.
+        handlers = [
+            h
+            for h in _async_handlers
+            if Path(h.baseFilename).parent.resolve() == directory
+        ]
     return all([handler.flush_pending() for handler in handlers])
 
 

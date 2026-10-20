@@ -621,12 +621,19 @@ jobs:
           if (Test-Path $releaseDir) { Remove-Item $releaseDir -Recurse -Force }
           New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
 
+          # Re-derive the two inputs this block needs so it stays runnable on
+          # its own (the packaging replay tests execute exactly this slice).
+          $rc003Root = (Resolve-Path ".").Path
+          $version = (Get-Content -Raw src\ovb_rc003\VERSION).Trim()
+
           # Build the per-user Inno Setup installer and publish it as the
           # primary release asset (the portable staging above stays a build
           # self-check, not the downloadable package).
-          $iscc = ""
-          $isccCommand = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-          if ($null -ne $isccCommand) { $iscc = $isccCommand.Source }
+          $iscc = $env:RC003_ISCC_PATH
+          if (-not $iscc) {
+            $isccCommand = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+            if ($null -ne $isccCommand) { $iscc = $isccCommand.Source }
+          }
           if (-not $iscc) { $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" }
           if (-not (Test-Path $iscc)) {
             Write-Error "Inno Setup 6 (ISCC.exe) is required to build the installer"

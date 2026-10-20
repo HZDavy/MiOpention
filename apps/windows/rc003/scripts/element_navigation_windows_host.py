@@ -27,6 +27,29 @@ from element_navigation_command_windows import (
 )
 
 
+def _make_console_encoding_safe() -> None:
+    """Never let a legacy console codepage crash the diagnostics host.
+
+    This host prints Chinese progress/diagnostic lines. When stdout is a pipe
+    on a machine whose ANSI codepage cannot represent them (an English-locale
+    Windows CI runner, for example) ``print`` raises UnicodeEncodeError and
+    the whole navigation session dies. Replacing the unencodable characters
+    keeps the diagnostics flowing.
+    """
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+_make_console_encoding_safe()
+
+
 class _NavigationDiagnostics:
     """Optional, bounded metadata sink; never export UIA objects or their text."""
 

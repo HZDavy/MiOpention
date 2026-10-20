@@ -543,6 +543,16 @@ class SettingsControllerTests(unittest.TestCase):
             return_value=True,
         )
         self._hid_helper_self_elevate_patch.start()
+        # A CI runner's token is usually elevated; pin the default to a
+        # standard account so helper prompts/repair visibility never depends
+        # on the machine running the suite. Elevated-path tests override this
+        # with their own nested patch.
+        self._hid_helper_process_elevated_patch = mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_process_elevated",
+            return_value=False,
+        )
+        self._hid_helper_process_elevated_patch.start()
         self._hid_helper_consumer_patch = mock.patch.object(
             qt_settings_app.hid_helper_consumers,
             "current_consumer_is_registered",
@@ -560,6 +570,7 @@ class SettingsControllerTests(unittest.TestCase):
             controller._mapping_auto_save_scheduled = False
             self.Controller.shutdownBackgroundTasks(controller)
         self._hid_helper_consumer_patch.stop()
+        self._hid_helper_process_elevated_patch.stop()
         self._hid_helper_self_elevate_patch.stop()
         self._hid_helper_offer_patch.stop()
         self._startup_rebind_patch.stop()
@@ -10400,6 +10411,20 @@ m.single_instance.bridge_instance_running = lambda: False
 m.windows_diagnostics.run_diagnostics = lambda **_kwargs: (
     m.windows_diagnostics.DiagnosticsReport(checks=())
 )
+# Voice-page layout must not depend on which sound devices the machine
+# running the probe happens to expose: a bare CI runner has no VB-CABLE, so
+# the "pick the recommended endpoint" control would collapse and every
+# column assertion below would drift. Pin one deterministic CABLE playback
+# endpoint (unique on the preferred host API, so selection cannot be
+# ambiguous) before the controller reads the device list.
+m.audio_output.enumerate_output_endpoints = lambda: [
+    m.audio_output.AudioEndpoint(
+        name="CABLE Input (VB-Audio Virtual Cable)", host_api="Windows WASAPI"
+    ),
+    m.audio_output.AudioEndpoint(
+        name="Speakers (High Definition Audio)", host_api="MME"
+    ),
+]
 model = ButtonMappingModel()
 controller = SettingsController(model)
 diagnostics_controller = DiagnosticsController(controller, m.config.config_root())

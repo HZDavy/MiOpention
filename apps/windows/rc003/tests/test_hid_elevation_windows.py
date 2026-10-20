@@ -1224,26 +1224,30 @@ class InstalledHelperTests(unittest.TestCase):
 
     def test_legacy_distribution_keeps_bundled_helper_under_internal(self):
         with tempfile.TemporaryDirectory() as raw:
-            executable = Path(raw) / "RemoteMicRC003.exe"
+            # bundled_helper_path() canonicalizes the executable location, so
+            # the expectation must be canonicalized too: a runner whose TEMP
+            # is reached through an 8.3 short name (RUNNER~1) would otherwise
+            # compare a long path against a short one.
+            root = Path(raw).resolve()
+            executable = root / "RemoteMicRC003.exe"
             self.assertEqual(
                 hid_elevation_windows.bundled_helper_path(
                     frozen=True,
                     executable=str(executable),
                 ),
-                Path(raw) / "_internal" / hid_elevation_windows.HELPER_EXE_NAME,
+                root / "_internal" / hid_elevation_windows.HELPER_EXE_NAME,
             )
 
     def test_versioned_distribution_uses_english_runtime_directory(self):
         with tempfile.TemporaryDirectory() as raw:
-            executable = (
-                Path(raw) / "MiOpention 1.0.51-candidate.51.exe"
-            )
+            root = Path(raw).resolve()
+            executable = root / "MiOpention 1.0.51-candidate.51.exe"
             self.assertEqual(
                 hid_elevation_windows.bundled_helper_path(
                     frozen=True,
                     executable=str(executable),
                 ),
-                Path(raw) / "app" / hid_elevation_windows.HELPER_EXE_NAME,
+                root / "app" / hid_elevation_windows.HELPER_EXE_NAME,
             )
 
     def test_unknown_frozen_executable_does_not_offer_a_helper(self):

@@ -3109,25 +3109,48 @@ class PortableReleasePackagingReplayTests(unittest.TestCase):
             capture_output=True, encoding="utf-8", errors="replace", timeout=20,
         )
 
-    def test_real_ci_manifest_round_trip_preserves_chinese_and_excludes_installer(self):
+    def test_real_ci_manifest_round_trip_hashes_the_staged_installer(self):
         text = _CI_PATH.read_text(encoding="utf-8")
         start = text.index('          $releaseDir =')
         end = text.index('      # Upload the single preflighted', start)
         script = "\n".join(line[10:] for line in text[start:end].splitlines())
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            name = "MiOpention-Windows-0.2.0-candidate.31-免安装.zip"
-            package = root / name
-            package.write_bytes(b"synthetic ZIP for packaging-only verification")
+            version = "0.0.1-test"
+            version_file = root / "src/ovb_rc003/VERSION"
+            version_file.parent.mkdir(parents=True)
+            version_file.write_text(version + "\n", encoding="utf-8")
+            installer_name = f"MiOpentionSetup-{version}-unsigned.exe"
+            # Stand-in for ISCC.exe: the packaging slice under test only ever
+            # needs the compiler to produce the versioned installer file.
+            fake_iscc = root / "fake-iscc.cmd"
+            fake_iscc.write_text(
+                "@echo off\r\n"
+                "if not exist \"dist\\installer\" mkdir \"dist\\installer\"\r\n"
+                f"echo synthetic installer> \"dist\\installer\\{installer_name}\"\r\n"
+                "exit /b 0\r\n",
+                encoding="ascii",
+            )
             release = root / "apps/windows/rc003/dist/release"
             release.mkdir(parents=True)
             (release / "stale-installer.exe").write_bytes(b"stale")
-            result = self._run('$zipPath = "' + name + '"\n' + script, directory, GITHUB_WORKSPACE=directory)
+            result = self._run(
+                script,
+                directory,
+                GITHUB_WORKSPACE=directory,
+                RC003_ISCC_PATH=str(fake_iscc),
+            )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertEqual({p.name for p in release.iterdir()}, {name, "SHA256SUMS.txt"})
+            self.assertEqual(
+                {p.name for p in release.iterdir()},
+                {installer_name, "SHA256SUMS.txt"},
+            )
+            staged = (release / installer_name).read_bytes()
             manifest = (release / "SHA256SUMS.txt").read_text(encoding="utf-8-sig").strip()
-            self.assertEqual(manifest, hashlib.sha256(package.read_bytes()).hexdigest() + "  " + name)
-            self.assertEqual((release / name).read_bytes(), package.read_bytes())
+            self.assertEqual(
+                manifest,
+                hashlib.sha256(staged).hexdigest() + "  " + installer_name,
+            )
 
     def test_real_ci_rejects_mismatched_tag_before_release_build(self):
         text = _CI_PATH.read_text(encoding="utf-8")

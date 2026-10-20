@@ -142,7 +142,27 @@ APPLICATION_HANDOFF_REJECTED_EXIT_NOTICE = (
 )
 
 
+def _make_console_encoding_safe() -> None:
+    """Never let a legacy console codepage crash a text-only code path.
+
+    ``print`` raises UnicodeEncodeError when stdout is a pipe whose encoding
+    cannot represent the Chinese help text (a bare English-locale Windows
+    runner, for example). Replacing the unencodable characters keeps
+    ``--help`` working instead of aborting with a traceback.
+    """
+
+    stream = getattr(sys, "stdout", None)
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is None:
+        return
+    try:
+        reconfigure(errors="replace")
+    except (ValueError, OSError):
+        pass
+
+
 def _print_help() -> None:
+    _make_console_encoding_safe()
     print(
         f"{product_identity.DISPLAY_NAME} - 小米遥控器2 Pro Windows 客户端 "
         f"{__version__}"

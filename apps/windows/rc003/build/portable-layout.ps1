@@ -247,7 +247,19 @@ function Assert-RC003PortableZip {
         )
         $stagingFiles = @(
             Get-ChildItem -LiteralPath $stagingRoot -Force -File -Recurse | ForEach-Object {
-                $relativePath = $_.FullName.Substring($stagingRoot.Length).TrimStart(
+                # Resolve-Path canonicalizes 8.3 short names (RUNNER~1), while
+                # Get-ChildItem echoes whatever spelling it was given; cutting
+                # the prefix by length would then slice into the relative path
+                # and produce a bogus ZIP entry name. Fall back to the
+                # canonical file path whenever the two spellings disagree.
+                $filePath = $_.FullName
+                if (-not $filePath.StartsWith(
+                    $stagingRoot,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )) {
+                    $filePath = (Resolve-Path -LiteralPath $filePath).Path
+                }
+                $relativePath = $filePath.Substring($stagingRoot.Length).TrimStart(
                     $pathSeparators
                 ).Replace([System.IO.Path]::DirectorySeparatorChar, [char]47)
                 [pscustomobject]@{
